@@ -2519,7 +2519,8 @@ mod tests {
         let opts = opentake_engine::GuitarProImport { set_tempo: false, ..Default::default() };
         let created = engine.lock().unwrap().import_guitar_pro(&fixture, &opts).unwrap();
         engine.lock().unwrap().seek(at).unwrap();
-        harness.state_mut().selected_track = created.first().copied();
+        let pick: usize = std::env::var("OPENTAKE_SCREENSHOT_TRACK").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        harness.state_mut().selected_track = created.get(pick).or(created.first()).copied();
         harness.state_mut().bottom = Some(BottomTab::Tab);
         harness.state_mut().view.px_per_sec = 90.0;
         for _ in 0..4 {

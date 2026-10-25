@@ -577,13 +577,17 @@ fn draw_staff(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], r
     for k in 0..5 {
         painter.hline(Rangef::new(gutter.max - 46.0, gutter.max), y_of(bottom_step + 2 * k), Stroke::new(1.0, theme::TEXT_FAINT));
     }
-    if theme::has_music_font() {
-        let (glyph, y) = if bass { ("\u{1D122}", y_of(bottom_step + 6)) } else { ("\u{1D11E}", y_of(bottom_step + 2)) };
-        painter.text(pos2(clef_x, y), Align2::CENTER_CENTER, glyph, FontId::proportional(h * 9.0), theme::TEXT_DIM);
-    } else {
+    // Clef extents relative to their reference line, in staff spaces (SMuFL metrics):
+    // the G clef curls around the second line, the F clef's dots straddle the fourth.
+    let space = 2.0 * h;
+    let (glyph, line, above, below) = if bass { ("\u{1D122}", y_of(bottom_step + 6), 1.05, 2.54) } else { ("\u{1D11E}", y_of(bottom_step + 2), 4.39, 2.63) };
+    let (clef_top, clef_bottom) = (line - above * space, line + below * space);
+    if !(theme::has_music_font() && draw_glyph_fitted(painter, glyph, clef_x, clef_top, clef_bottom, theme::TEXT_DIM)) {
         painter.text(pos2(clef_x, middle), Align2::CENTER_CENTER, if bass { "F" } else { "G" }, FontId::proportional(h * 4.0), theme::TEXT_DIM);
     }
-    painter.text(pos2(clef_x, y_bottom + h * 4.0), Align2::CENTER_CENTER, "8", FontId::proportional(h * 2.2), theme::TEXT_FAINT);
+    // "8" under the clef: written an octave above where it sounds.
+    let eight_y = clef_bottom.max(y_bottom) + h * 1.8;
+    painter.text(pos2(clef_x, eight_y), Align2::CENTER_CENTER, "8", FontId::proportional(h * 2.2), theme::TEXT_FAINT);
 
     let content = Rect::from_x_y_ranges(ctx.content.x_range(), rect.y_range());
     let p = painter.with_clip_rect(content);
@@ -611,6 +615,27 @@ fn draw_staff(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], r
             }
         }
     }
+}
+
+/// Ink bounds of a galley's first visible glyph, relative to the galley's top-left.
+fn ink_rect(galley: &egui::Galley) -> Option<Rect> {
+    let row = galley.rows.first()?;
+    let glyph = row.glyphs.iter().find(|g| !g.uv_rect.is_nothing())?;
+    Some(Rect::from_min_size(row.pos + glyph.pos.to_vec2() + glyph.uv_rect.offset, glyph.uv_rect.size))
+}
+
+/// Draw a single glyph scaled so its visible shape spans `top..bottom`, centred on `cx`.
+/// Positions by the glyph's actual ink, not the font's line box, so it sits exactly on the
+/// staff whatever the font's metrics. Returns false if the font can't draw it.
+fn draw_glyph_fitted(p: &Painter, glyph: &str, cx: f32, top: f32, bottom: f32, color: Color32) -> bool {
+    const PROBE: f32 = 64.0;
+    let probe = p.layout_no_wrap(glyph.to_owned(), FontId::proportional(PROBE), color);
+    let Some(ink) = ink_rect(&probe).filter(|r| r.height() > 1.0) else { return false };
+    let size = PROBE * (bottom - top) / ink.height();
+    let galley = p.layout_no_wrap(glyph.to_owned(), FontId::proportional(size), color);
+    let Some(ink) = ink_rect(&galley) else { return false };
+    p.galley(pos2(cx - ink.center().x, top - ink.top()), galley, color);
+    true
 }
 
 /// A sharp sign centred on `at`, sized for half-space `h`.
