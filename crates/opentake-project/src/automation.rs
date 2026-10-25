@@ -1,7 +1,7 @@
-//! Automation: envelopes that move a track's fader, pan, mute or a plug-in parameter over
-//! time. Values are normalized 0..1 — the fader's travel for volume (so a curve feels like
-//! moving the fader), left..right for pan, on/off for mute, the plug-in's own normalized
-//! value for parameters.
+//! Automation: envelopes that move a track's fader, pan, mute, a send level or a plug-in
+//! parameter over time. Values are normalized 0..1 — the fader's travel for volume and send
+//! levels (so a curve feels like moving the fader), left..right for pan, on/off for mute,
+//! the plug-in's own normalized value for parameters.
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,8 @@ pub enum AutomationTarget {
     /// A plug-in parameter: the slot's persistent id (`PluginSlot::id`, which survives
     /// reordering, undo and saving) and the parameter id.
     Param { slot: u32, param: u32 },
+    /// A send's level, on the fader's scale: the send's id within the track (`AuxSend::id`).
+    Send { send: u32 },
 }
 
 impl AutomationTarget {
@@ -53,7 +55,7 @@ impl AutomationTarget {
     /// mute: 0/1, parameters: unchanged).
     pub fn to_units(self, v: f32) -> f32 {
         match self {
-            AutomationTarget::Volume => gain_to_db(pos_to_gain(v)),
+            AutomationTarget::Volume | AutomationTarget::Send { .. } => gain_to_db(pos_to_gain(v)),
             AutomationTarget::Pan => v * 2.0 - 1.0,
             AutomationTarget::Mute => (v >= 0.5) as u8 as f32,
             AutomationTarget::Param { .. } => v,
@@ -62,7 +64,7 @@ impl AutomationTarget {
 
     pub fn from_units(self, u: f32) -> f32 {
         match self {
-            AutomationTarget::Volume => gain_to_pos(db_to_gain(u)),
+            AutomationTarget::Volume | AutomationTarget::Send { .. } => gain_to_pos(db_to_gain(u)),
             AutomationTarget::Pan => (u.clamp(-1.0, 1.0) + 1.0) / 2.0,
             _ => u.clamp(0.0, 1.0),
         }
@@ -71,7 +73,7 @@ impl AutomationTarget {
     /// The value as text (parameters as a percentage; the engine knows their own display).
     pub fn format(self, v: f32) -> String {
         match self {
-            AutomationTarget::Volume => {
+            AutomationTarget::Volume | AutomationTarget::Send { .. } => {
                 let db = self.to_units(v);
                 if db <= FADER_MIN_DB { "-∞ dB".into() } else { format!("{db:+.1} dB") }
             }

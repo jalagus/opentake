@@ -23,6 +23,9 @@ const EVENT_CAPACITY: usize = 1024;
 const LIVE_CAPACITY: usize = 128;
 /// Longest plug-in delay that's compensated per track (samples, a power of two).
 const MAX_COMP: usize = 16_384;
+/// Longest compensation delay: a block is written to the delay line before sends tap it, so
+/// a tap must stay a block clear of the samples being overwritten.
+const MAX_DELAY: usize = MAX_COMP - MAX_BLOCK;
 /// Track id addressing the master bus in plug-in commands.
 pub const MASTER: u64 = u64::MAX;
 /// `SharedState::io_latency` before anything was measured.
@@ -158,6 +161,30 @@ pub enum EnvTarget {
     Pan,
     Mute,
     Param { instance: u64, id: u32 },
+    /// A send's level (`SendRt::id`).
+    Send { id: u32 },
+}
+
+/// A send to a bus, built off-thread.
+pub struct SendRt {
+    /// Id within the track (what automation names).
+    pub id: u32,
+    /// The bus track (id) it feeds.
+    pub bus: u64,
+    pub gain: f32,
+    pub pre_fader: bool,
+    pub mute: bool,
+    /// Resolved on the audio thread: the bus's index, the delay that lines this path up
+    /// with everything else reaching the bus, and the gains the last block ended on.
+    dest: Option<usize>,
+    delay: usize,
+    gains: Option<[f32; 2]>,
+}
+
+impl SendRt {
+    pub fn new(id: u32, bus: u64, gain: f32, pre_fader: bool, mute: bool) -> Self {
+        Self { id, bus, gain, pre_fader, mute, dest: None, delay: 0, gains: None }
+    }
 }
 
 /// An automation envelope, built off-thread (points sorted, in seconds).
@@ -213,6 +240,10 @@ pub struct TrackRt {
     /// ended on, which the next one ramps from.
     pub automation: Vec<EnvelopeRt>,
     gains: Option<[f32; 2]>,
+    /// Sends to buses, tapped off the compensation delay line (see `process_block`).
+    pub sends: Vec<SendRt>,
+    /// Feeds a soloed bus (solo bookkeeping in `rebuild_routing`).
+    feeds_solo: bool,
 }
 
 impl TrackRt {
@@ -241,6 +272,8 @@ impl TrackRt {
             audible: true,
             automation: Vec::new(),
             gains: None,
+            sends: Vec::new(),
+            feeds_solo: false,
         }
     }
 
@@ -287,6 +320,8 @@ pub enum Command {
     /// The order to process tracks in (ids): every track before the buses it feeds. Tracks
     /// left out are processed first (plain tracks) or last (buses).
     SetRouting(Box<Vec<u64>>),
+    /// Replace a track's sends.
+    SetSends { track: u64, sends: Box<Vec<SendRt>> },
     /// Replace a track's (or with `MASTER`, the master's) automation envelopes.
     SetAutomation { track: u64, lanes: Box<Vec<EnvelopeRt>> },
     /// Audition a note on an instrument track (velocity 0 = off).
@@ -309,6 +344,7 @@ pub enum Garbage {
     Ids(Box<Vec<u64>>),
     TempoMap(Box<TempoMap>),
     Automation(Box<Vec<EnvelopeRt>>),
+    Sends(Box<Vec<SendRt>>),
     /// A finished latency probe's capture.
     Probe(Box<Vec<f32>>),
 }
@@ -509,9 +545,9 @@ impl Mixer {
 
     /// Plug-in delay compensation. Each track's output arrives `arrival` samples late: its
     /// own chain, plus for a bus the slowest of its inputs. Everything summed at a bus or the
-    /// master is delayed to match the slowest arrival there, so every path ends up as long
-    /// as the slowest one; tracks read the timeline that far ahead (plus the master chain)
-    /// and the output lines up with the playhead.
+    /// master (outputs and sends alike) is delayed to match the slowest arrival there, so
+    /// every path ends up as long as the slowest one; tracks read the timeline that far ahead
+    /// (plus the master chain) and the output lines up with the playhead.
     fn update_latency(&mut self) {
         if self.routing_dirty {
             self.rebuild_routing();
@@ -532,20 +568,30 @@ impl Mixer {
                 Some(d) => self.tracks[d].in_latency = self.tracks[d].in_latency.max(arrival),
                 None => master = master.max(arrival),
             }
+            for k in 0..self.tracks[ti].sends.len() {
+                if let Some(d) = self.tracks[ti].sends[k].dest {
+                    self.tracks[d].in_latency = self.tracks[d].in_latency.max(arrival);
+                }
+            }
         }
         for &ti in &self.order {
             let target = self.tracks[ti].dest.map_or(master, |d| self.tracks[d].in_latency);
             let t = &mut self.tracks[ti];
-            t.delay = target.saturating_sub(t.arrival).min(MAX_COMP - 1);
+            t.delay = target.saturating_sub(t.arrival).min(MAX_DELAY);
+            for k in 0..self.tracks[ti].sends.len() {
+                let target = self.tracks[ti].sends[k].dest.map_or(0, |d| self.tracks[d].in_latency);
+                let delay = target.saturating_sub(self.tracks[ti].arrival).min(MAX_DELAY);
+                self.tracks[ti].sends[k].delay = delay;
+            }
         }
         self.master_arrival = master;
         self.lookahead = (master + chain(&self.master_plugins)) as u64;
         self.shared.latency.store(self.lookahead as u32, Ordering::Relaxed);
     }
 
-    /// Resolve the routing to track indices after the tracks, their outputs or solos changed:
-    /// the processing order (plain tracks missing from it first, buses missing from it last),
-    /// each track's destination, and who's audible. Allocation-free.
+    /// Resolve the routing to track indices after the tracks, their outputs, sends or solos
+    /// changed: the processing order (plain tracks missing from it first, buses missing from
+    /// it last), each track's and send's destination, and who's audible. Allocation-free.
     fn rebuild_routing(&mut self) {
         self.routing_dirty = false;
         let n = self.tracks.len();
@@ -569,33 +615,45 @@ impl Mixer {
         for i in 0..n {
             let out = self.tracks[i].params.output;
             self.tracks[i].dest = (out != MASTER).then(|| self.tracks.iter().position(|t| t.id == out && t.bus)).flatten().filter(|&d| d != i);
+            for k in 0..self.tracks[i].sends.len() {
+                let bus = self.tracks[i].sends[k].bus;
+                self.tracks[i].sends[k].dest = self.tracks.iter().position(|t| t.id == bus && t.bus).filter(|&d| d != i);
+            }
         }
-        // Solo: a soloed track keeps its buses audible, a soloed bus keeps its sources. Routes
-        // are walked at most `n` steps, so a (never sent) loop can't hang the audio thread.
+        // Solo: a soloed track keeps the buses it feeds (through outputs and sends) audible,
+        // and a soloed bus keeps what feeds it. In processing order (senders before receivers)
+        // one pass each way covers whole chains.
         let any_solo = self.tracks.iter().any(|t| t.params.solo);
-        for i in 0..n {
-            let solo = self.tracks[i].params.solo;
-            let (mut at, mut steps, mut feeds_solo) = (self.tracks[i].dest, 0, false);
-            while let (Some(b), true) = (at, steps < n) {
-                feeds_solo |= self.tracks[b].params.solo;
-                at = self.tracks[b].dest;
-                steps += 1;
-            }
-            self.tracks[i].audible = solo || feeds_solo;
+        for t in &mut self.tracks {
+            t.audible = t.params.solo;
+            t.feeds_solo = false;
         }
-        for i in 0..n {
-            if !self.tracks[i].params.solo {
-                continue;
+        for k in 0..self.order.len() {
+            let i = self.order[k];
+            if self.tracks[i].audible {
+                self.for_each_target(i, |t| t.audible = true);
             }
-            let (mut at, mut steps) = (self.tracks[i].dest, 0);
-            while let (Some(b), true) = (at, steps < n) {
-                self.tracks[b].audible = true;
-                at = self.tracks[b].dest;
-                steps += 1;
-            }
+        }
+        for k in (0..self.order.len()).rev() {
+            let i = self.order[k];
+            let mut feeds = false;
+            self.for_each_target(i, |t| feeds |= t.params.solo || t.feeds_solo);
+            self.tracks[i].feeds_solo = feeds;
         }
         for t in &mut self.tracks {
-            t.audible = !t.params.mute && (!any_solo || t.audible);
+            t.audible = !t.params.mute && (!any_solo || t.audible || t.feeds_solo);
+        }
+    }
+
+    /// Run `f` on every bus track `i` feeds (its output and its sends' buses).
+    fn for_each_target(&mut self, i: usize, mut f: impl FnMut(&mut TrackRt)) {
+        if let Some(d) = self.tracks[i].dest {
+            f(&mut self.tracks[d]);
+        }
+        for k in 0..self.tracks[i].sends.len() {
+            if let Some(d) = self.tracks[i].sends[k].dest {
+                f(&mut self.tracks[d]);
+            }
         }
     }
 
@@ -815,6 +873,17 @@ impl Mixer {
                         std::mem::swap(current, &mut *lanes);
                     }
                     self.discard(Garbage::Automation(lanes));
+                }
+                Command::SetSends { track, mut sends } => {
+                    self.routing_dirty = true;
+                    if let Some(t) = self.track_mut(track) {
+                        std::mem::swap(&mut t.sends, &mut *sends);
+                        // A level change keeps ramping from where the send was.
+                        for new in t.sends.iter_mut() {
+                            new.gains = sends.iter().find(|old| old.id == new.id).and_then(|old| old.gains);
+                        }
+                    }
+                    self.discard(Garbage::Sends(sends));
                 }
                 Command::LiveNote { track, pitch, velocity } => {
                     if let Some(t) = self.track_mut(track) {
@@ -1038,8 +1107,9 @@ impl Mixer {
             }
 
             // Line the track up with the slowest one reaching the same place (plug-in delay
-            // compensation).
+            // compensation). The delay line keeps the undelayed signal for the sends.
             let delay = track.delay;
+            let w0 = track.comp_write;
             {
                 let [cl, cr] = &mut track.comp;
                 let mut w = track.comp_write;
@@ -1082,6 +1152,26 @@ impl Mixer {
             for ch in 0..2 {
                 for i in 0..n {
                     dst[ch][i] += src[ch][i];
+                }
+            }
+            // Sends tap the delay line, each at the delay that lines it up with the bus it
+            // feeds, and ramp their gain (level, plus the fader and pan when post-fader).
+            for k in 0..self.tracks[ti].sends.len() {
+                let t = &mut *self.tracks[ti];
+                let Some(d) = t.sends[k].dest else { continue };
+                let g1 = send_gains(&t.params, &t.automation, &t.sends[k], clock.at(clock.end, t.arrival + t.sends[k].delay));
+                let send = &mut t.sends[k];
+                let g0 = send.gains.replace(g1).unwrap_or(g1);
+                if g0 == [0.0; 2] && g1 == [0.0; 2] {
+                    continue;
+                }
+                let delay = send.delay;
+                let (src, dst) = pair_mut(&mut self.tracks, ti, d);
+                for ch in 0..2 {
+                    for i in 0..n {
+                        let read = (w0 + i + MAX_COMP - delay) & (MAX_COMP - 1);
+                        dst.buf[ch][i] += src.comp[ch][read] * (g0[ch] + (g1[ch] - g0[ch]) * (i + 1) as f32 / n as f32);
+                    }
                 }
             }
         }
@@ -1248,10 +1338,38 @@ fn fader_gains(p: &TrackParams, envs: &[EnvelopeRt], secs: f64) -> [f32; 2] {
             EnvTarget::Volume => volume = pos_to_gain(env.at(secs)),
             EnvTarget::Pan => pan = env.at(secs) * 2.0 - 1.0,
             EnvTarget::Mute => mute = env.at(secs) >= 0.5,
-            EnvTarget::Param { .. } => {}
+            EnvTarget::Param { .. } | EnvTarget::Send { .. } => {}
         }
     }
     if mute { [0.0; 2] } else { pan_gains(volume, pan).into() }
+}
+
+/// Left/right gains of a send at `secs`: its level (or envelope), times the fader and pan
+/// when post-fader. Pre-fader it ignores them, but a muted track still sends nothing.
+fn send_gains(p: &TrackParams, envs: &[EnvelopeRt], send: &SendRt, secs: f64) -> [f32; 2] {
+    if send.mute {
+        return [0.0; 2];
+    }
+    let level = envs.iter().find(|e| e.target == EnvTarget::Send { id: send.id }).map_or(send.gain, |e| pos_to_gain(e.at(secs)));
+    let tap = if !send.pre_fader {
+        fader_gains(p, envs, secs)
+    } else if envs.iter().any(|e| e.target == EnvTarget::Mute && e.at(secs) >= 0.5) {
+        [0.0; 2]
+    } else {
+        [1.0; 2]
+    };
+    tap.map(|g| g * level)
+}
+
+/// Track `a` to read from and track `b` to add into (`a != b`).
+fn pair_mut(tracks: &mut [Box<TrackRt>], a: usize, b: usize) -> (&TrackRt, &mut TrackRt) {
+    if a < b {
+        let (x, y) = tracks.split_at_mut(b);
+        (&x[a], &mut y[0])
+    } else {
+        let (x, y) = tracks.split_at_mut(a);
+        (&y[0], &mut x[b])
+    }
 }
 
 struct Probe {
@@ -1743,6 +1861,82 @@ mod tests {
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].0 - 470, 1000);
         assert!((hits[0].1 - 0.75).abs() < 1e-6);
+    }
+
+    fn sends(tx: &mut Producer<Command>, track: u64, sends: Vec<SendRt>) {
+        tx.push(Command::SetSends { track, sends: Box::new(sends) }).ok();
+    }
+
+    #[test]
+    fn sends_tap_before_or_after_the_fader() {
+        let (mut m, mut tx, _g, _s) = mixer();
+        // Track 1 (fader 0.5) to the master, with a send at 0.5 to bus 3 (x2 effect).
+        let track = TrackParams { monitor: true, volume: 0.5, ..params() };
+        tx.push(Command::AddTrack(Box::new(TrackRt::new(1, track)))).ok();
+        tx.push(Command::AddTrack(Box::new(TrackRt::new_bus(3, params())))).ok();
+        chain(&mut tx, 3, 9, Box::new(Gain(2.0)));
+        sends(&mut tx, 1, vec![SendRt::new(1, 3, 0.5, false, false)]);
+        assert!((level(&mut m) - 0.1).abs() < 1e-6, "post-fader: 0.05 dry + 0.05 * 0.5 * 2");
+        sends(&mut tx, 1, vec![SendRt::new(1, 3, 0.5, true, false)]);
+        assert!((level(&mut m) - 0.15).abs() < 1e-6, "pre-fader: 0.05 + 0.1 * 0.5 * 2");
+        sends(&mut tx, 1, vec![SendRt::new(1, 3, 0.5, true, true)]);
+        assert!((level(&mut m) - 0.05).abs() < 1e-6, "muted send");
+        sends(&mut tx, 1, vec![SendRt::new(1, 3, 0.5, true, false)]);
+        tx.push(Command::SetTrack { track: 1, params: TrackParams { mute: true, ..track } }).ok();
+        assert_eq!(level(&mut m), 0.0, "a muted track sends nothing, pre-fader or not");
+        // Send level automation (silent from the start) overrides the level.
+        tx.push(Command::SetTrack { track: 1, params: track }).ok();
+        tx.push(Command::SetAutomation { track: 1, lanes: Box::new(vec![env(EnvTarget::Send { id: 1 }, &[(0, 0.0, opentake_project::Curve::Linear)])]) }).ok();
+        level(&mut m);
+        assert!((level(&mut m) - 0.05).abs() < 1e-6, "automated send level");
+    }
+
+    #[test]
+    fn solo_keeps_the_buses_a_track_sends_to() {
+        let (mut m, mut tx, _g, _s) = mixer();
+        // Tracks 1 and 2 to the master, both sending to bus 3 at unity.
+        let monitor = TrackParams { monitor: true, ..params() };
+        for id in [1, 2] {
+            tx.push(Command::AddTrack(Box::new(TrackRt::new(id, monitor)))).ok();
+            sends(&mut tx, id, vec![SendRt::new(1, 3, 1.0, false, false)]);
+        }
+        tx.push(Command::AddTrack(Box::new(TrackRt::new_bus(3, params())))).ok();
+        assert!((level(&mut m) - 0.4).abs() < 1e-6);
+        tx.push(Command::SetTrack { track: 1, params: TrackParams { solo: true, ..monitor } }).ok();
+        assert!((level(&mut m) - 0.2).abs() < 1e-6, "track 1 dry and through the bus it sends to");
+        tx.push(Command::SetTrack { track: 1, params: monitor }).ok();
+        tx.push(Command::SetTrack { track: 3, params: TrackParams { solo: true, ..params() } }).ok();
+        assert!((level(&mut m) - 0.4).abs() < 1e-6, "a soloed bus keeps the tracks sending to it");
+    }
+
+    #[test]
+    fn plugin_delay_is_compensated_through_sends() {
+        let (mut m, mut tx, _g, shared) = mixer();
+        let mut impulse = vec![0.0f32; 4];
+        impulse[0] = 0.25;
+        let data = Arc::new(AudioData { channels: vec![impulse], sample_rate: 48_000 });
+        // 1 (120) to the master, 2 (dry) to bus 5 (80); both send at 0.5 to bus 3 (300), 2
+        // pre-fader. The master has 50.
+        for (id, output) in [(1, MASTER), (2, 5)] {
+            tx.push(Command::AddTrack(Box::new(TrackRt::new(id, TrackParams { output, ..params() })))).ok();
+            tx.push(Command::AddClip { track: id, clip: ClipRt { start: 1000, len: 4, offset: 0, gain: 1.0, mute: false, data: data.clone(), fades: ClipFades::NONE } }).ok();
+        }
+        sends(&mut tx, 1, vec![SendRt::new(1, 3, 0.5, false, false)]);
+        sends(&mut tx, 2, vec![SendRt::new(1, 3, 0.5, true, false)]);
+        tx.push(Command::AddTrack(Box::new(TrackRt::new_bus(3, params())))).ok();
+        tx.push(Command::AddTrack(Box::new(TrackRt::new_bus(5, params())))).ok();
+        chain(&mut tx, 1, 10, Box::new(Latent::new(120)));
+        chain(&mut tx, 3, 11, Box::new(Latent::new(300)));
+        chain(&mut tx, 5, 12, Box::new(Latent::new(80)));
+        chain(&mut tx, MASTER, 13, Box::new(Latent::new(50)));
+        tx.push(Command::Play).ok();
+        let out = run(&mut m, 10);
+        // Slowest path: track 1 through the reverb bus (120 + 300), plus the master's 50.
+        assert_eq!(shared.latency.load(Ordering::Relaxed), 470);
+        let hits: Vec<(usize, f32)> = out.iter().enumerate().filter(|(_, v)| v.abs() > 1e-6).map(|(i, v)| (i, *v)).collect();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].0 - 470, 1000);
+        assert!((hits[0].1 - 0.75).abs() < 1e-6, "two dry paths and both sends");
     }
 
     #[test]

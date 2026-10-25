@@ -3,7 +3,8 @@
 //! Supported: tempo/time signature, sample rate, tracks (name, volume, pan, mute,
 //! solo, record arm, input, monitoring), audio items (position, length, source
 //! offset, gain, mute, file, fades), FX chain references (VST2/VST3/CLAP, bypass,
-//! opaque state), buses (as receives; folders import as buses) and volume, pan and mute
+//! opaque state), buses (as receives; folders import as buses), sends (receives with their
+//! volume, mute and pre/post-fader mode) and volume, pan and mute
 //! automation (`VOLENV2`/`PANENV2`/`MUTEENV`; volume envelopes in Reaper's fader scaling
 //! are skipped). Plug-in parameter envelopes (`PARMENV`) aren't carried over: Reaper
 //! numbers parameters by position, which needs the plug-in loaded. Everything else in the
@@ -18,6 +19,7 @@ use thiserror::Error;
 use crate::automation::{AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, Curve, gain_to_pos, pos_to_gain};
 use crate::fade::{Fade, FadeCurve};
 use crate::model::{Clip, PluginFormat, PluginSlot, Project, Track};
+use crate::sends::AuxSend;
 use tree::{Entry, Node};
 
 #[derive(Debug, Error)]
@@ -104,7 +106,9 @@ pub fn from_str(text: &str, base_dir: &Path) -> Result<Project, RppError> {
 
 /// Buses: a track without items or instrument that receives (`AUXRECV`) from tracks whose
 /// master send is off, or a folder parent without them, becomes a bus its sources feed
-/// (outputs as track indices, see `Project::outputs_from_indices`). Other sends are ignored.
+/// (outputs as track indices, see `Project::outputs_from_indices`). Of a source's receives,
+/// a unity post-fader one is preferred as its output (that's how buses are saved); its other
+/// receives into such tracks become sends. Sidechain receives (to channels 3+) are ignored.
 fn import_routing(nodes: &[&Node], tracks: &mut [Track]) {
     let can_bus = |t: &Track| t.clips.is_empty() && t.instrument.is_none();
     let mut parents: Vec<usize> = Vec::new();
@@ -119,14 +123,38 @@ fn import_routing(nodes: &[&Node], tracks: &mut [Track]) {
             _ => {}
         }
     }
+    // (source, destination, as a send)
+    let mut receives: Vec<(usize, usize, AuxSend)> = Vec::new();
     for (dst, node) in nodes.iter().enumerate() {
         for line in node.lines().filter(|l| l.key() == "AUXRECV") {
-            let Some(src) = line.tokens().get(1).and_then(|s| s.parse::<usize>().ok()).filter(|&s| s < tracks.len() && s != dst) else { continue };
-            if nodes[src].value::<u8>("MAINSEND", 0) == Some(0) && tracks[src].output.is_none() && can_bus(&tracks[dst]) {
-                tracks[dst].bus = true;
-                tracks[src].output = Some(dst as u64);
+            let tokens = line.tokens();
+            let field = |i: usize| tokens.get(i).and_then(|s| s.parse::<f64>().ok());
+            let Some(src) = field(1).map(|s| s as usize).filter(|&s| s < tracks.len() && s != dst) else { continue };
+            if !can_bus(&tracks[dst]) || field(8).is_some_and(|c| c < 0.0) || field(9).is_some_and(|c| c > 0.0) {
+                continue;
             }
+            // Modes: 0 post-fader, 1 pre-FX, 3 pre-fader (post-FX); pre-FX is taken as pre-fader.
+            let send = AuxSend { level: field(3).unwrap_or(1.0) as f32, pre_fader: field(2).is_some_and(|m| m != 0.0), mute: field(5).is_some_and(|m| m != 0.0), ..AuxSend::new(dst as u64) };
+            receives.push((src, dst, send));
         }
+    }
+    let unity = |s: &AuxSend| s.level == 1.0 && !s.pre_fader && !s.mute;
+    for unity_only in [true, false] {
+        receives.retain(|(src, dst, send)| {
+            let output = nodes[*src].value::<u8>("MAINSEND", 0) == Some(0) && tracks[*src].output.is_none() && (unity(send) || !unity_only);
+            if output {
+                tracks[*dst].bus = true;
+                tracks[*src].output = Some(*dst as u64);
+            }
+            !output
+        });
+    }
+    for (src, dst, mut send) in receives {
+        tracks[dst].bus = true;
+        if (send.level - 1.0).abs() < 1e-6 {
+            send.level = 1.0; // see `export_track`
+        }
+        tracks[src].sends.push(send);
     }
 }
 
@@ -311,8 +339,8 @@ fn find_source_file(source: &Node) -> Option<String> {
 }
 
 /// Serialize to RPP text. Media paths under `base_dir` are written relative to it. Track
-/// outputs are track indices (see `Project::outputs_to_indices`); a bus becomes a track that
-/// receives from its sources, whose master send is off.
+/// outputs and sends are track indices (see `Project::outputs_to_indices`); a bus becomes a
+/// track that receives from its sources (whose master send is off) and from sends.
 pub fn to_string(project: &Project, base_dir: &Path) -> String {
     let mut root = Node::new("REAPER_PROJECT").with_params(&["0.1", "7.0/OpenTake", "0"]);
     let (num, den) = project.time_signature;
@@ -338,13 +366,23 @@ pub fn to_string(project: &Project, base_dir: &Path) -> String {
         root.push_chunk(env);
     }
     for (i, track) in project.tracks.iter().enumerate() {
-        let sources: Vec<usize> = (0..project.tracks.len()).filter(|&s| project.tracks[s].output == Some(i as u64)).collect();
-        root.push_chunk(export_track(track, base_dir, &sources));
+        // Outputs are post-fader receives at unity; sends keep their level, mute and mode.
+        let outputs = project.tracks.iter().enumerate().filter(|(_, s)| s.output == Some(i as u64)).map(|(s, _)| (s, AuxSend::new(i as u64)));
+        // A unity post-fader send from a track that feeds a bus is written a hair above unity,
+        // so loading doesn't take it for the track's output.
+        let sends = project.tracks.iter().enumerate().flat_map(|(s, t)| {
+            t.sends.iter().filter(|x| x.bus == i as u64).map(move |x| {
+                let ambiguous = t.output.is_some() && x.level == 1.0 && !x.pre_fader && !x.mute;
+                (s, AuxSend { level: if ambiguous { 1.0 + f32::EPSILON } else { x.level }, ..x.clone() })
+            })
+        });
+        let receives: Vec<(usize, AuxSend)> = outputs.chain(sends).collect();
+        root.push_chunk(export_track(track, base_dir, &receives));
     }
     tree::write(&root)
 }
 
-fn export_track(track: &Track, base_dir: &Path, sources: &[usize]) -> Node {
+fn export_track(track: &Track, base_dir: &Path, receives: &[(usize, AuxSend)]) -> Node {
     let mut node = Node::new("TRACK");
     node.push_line(&["NAME", &track.name]);
     node.push_line(&["VOLPAN", &fmt_f32(track.volume), &fmt_f32(track.pan), "-1", "-1", "1"]);
@@ -360,9 +398,10 @@ fn export_track(track: &Track, base_dir: &Path, sources: &[usize]) -> Node {
     if track.output.is_some() {
         node.push_line(&["MAINSEND", "0", "0"]);
     }
-    // Post-fader receives at unity, stereo.
-    for src in sources {
-        node.push_line(&["AUXRECV", &src.to_string(), "0", "1", "0", "0", "0", "0", "0", "0", "-1:U", "0", "-1", "''"]);
+    // Stereo receives; mode 3 is pre-fader (post-FX), 0 post-fader.
+    for (src, send) in receives {
+        let mode = if send.pre_fader { "3" } else { "0" };
+        node.push_line(&["AUXRECV", &src.to_string(), mode, &fmt_f32(send.level), "0", bool01(send.mute), "0", "0", "0", "0", "-1:U", "0", "-1", "''"]);
     }
 
     // Instrument first (as Reaper does); built-in plugins can't be represented.
@@ -606,6 +645,29 @@ mod tests {
         let p = from_str(folder, Path::new("/proj")).unwrap();
         assert!(p.tracks[0].bus);
         assert_eq!(p.tracks.iter().map(|t| t.output).collect::<Vec<_>>(), vec![None, Some(0), Some(0), None]);
+    }
+
+    #[test]
+    fn sends_round_trip_as_receives_with_level_and_mode() {
+        let base = Path::new("/proj");
+        let mut p = from_str(SAMPLE, base).unwrap();
+        p.tracks.push(Track::new_bus("Verb"));
+        p.tracks.push(Track::new_bus("Group"));
+        let verb = p.tracks.len() as u64 - 2;
+        // Track 0 goes to the group bus (listed after the reverb) and sends to the reverb, at
+        // unity too: the output still wins as the post-fader unity receive.
+        p.tracks[0].output = Some(verb + 1);
+        p.tracks[0].sends.push(AuxSend::new(verb));
+        p.tracks[verb as usize + 1].sends.push(AuxSend { level: 0.5, pre_fader: true, mute: true, ..AuxSend::new(verb) });
+        let text = to_string(&p, base);
+        assert!(text.contains(&format!("AUXRECV {} 3 0.5 0 1", verb + 1)), "{text}");
+        let back = from_str(&text, base).unwrap();
+        assert_eq!(back.tracks, p.tracks);
+        // A Reaper send from a track that keeps its master send, pre-FX at -6 dB.
+        let reaper = "<REAPER_PROJECT 0.1\n<TRACK\nNAME Vox\n>\n<TRACK\nNAME Verb\nAUXRECV 0 1 0.5 0 0 0 0 0 0 -1:U 0 -1 ''\nAUXRECV 0 0 1 0 0 0 0 2 2 -1:U 0 -1 ''\n>\n>\n";
+        let p = from_str(reaper, base).unwrap();
+        assert!(p.tracks[1].bus && p.tracks[0].output.is_none());
+        assert_eq!(p.tracks[0].sends, vec![AuxSend { level: 0.5, pre_fader: true, ..AuxSend::new(1) }], "the sidechain receive is ignored");
     }
 
     #[test]

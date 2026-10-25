@@ -76,8 +76,9 @@ impl Engine {
         let mut result = f(self);
         self.history.depth -= 1;
         if result.is_ok() {
-            // New plug-ins get their automation ids; lanes of removed ones go with them.
+            // New plug-ins (and sends) get their automation ids; lanes of removed ones go with them.
             self.project.assign_slot_ids();
+            self.project.assign_send_ids();
             self.project.prune_automation();
         }
         // Bus tracks only mix: whatever path an edit took, it can't give one regions or input.
@@ -235,6 +236,9 @@ impl Engine {
                     if chain_signature(o) != chain_signature(t) {
                         self.sync_chain(i)?;
                     }
+                    if o.sends != t.sends {
+                        self.sync_sends(i)?;
+                    }
                     if o.automation != t.automation {
                         self.sync_automation(Some(i))?;
                     }
@@ -244,7 +248,7 @@ impl Engine {
         if added || old_ids != new_ids {
             self.send(Command::ReorderTracks(Box::new(new_ids)))?;
         }
-        let outputs = |p: &Project| p.tracks.iter().map(|t| t.output).collect::<Vec<_>>();
+        let outputs = |p: &Project| p.tracks.iter().map(|t| (t.output, t.sends.iter().map(|s| s.bus).collect::<Vec<_>>())).collect::<Vec<_>>();
         if added || old_ids != self.project.tracks.iter().map(|t| t.id).collect::<Vec<_>>() || outputs(&old) != outputs(&self.project) {
             self.sync_routing()?;
         }

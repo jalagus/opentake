@@ -19,7 +19,7 @@ you watch the changes appear live — and undo anything you don't like.
 - 🎙️ Multitrack recording from any audio interface (CoreAudio, WASAPI, ALSA/JACK via cpal), latency-compensated with a built-in loopback measurement
 - 🎹 Instrument tracks, piano roll, a built-in synth and GM drum kit; VST3 instruments and effects, plus Audio Units on macOS
 - 🎛️ Built-in EQ, compressor, multiband compressor, limiter, delay and reverb on any track or the master bus; plug-in delay compensation
-- 🔀 Buses: route tracks into a bus and process the group with its own effects and fader
+- 🔀 Buses and sends: route tracks into a bus, or send them pre/post-fader to a shared reverb or delay bus
 - 📈 Automation of volume, pan, mute and any plug-in parameter, in lanes under each track, with Read, Touch and Latch modes
 - ⏱️ Project tempo map (tempo and time-signature changes), metronome with count-in
 - 🔁 Cycle recording: loop a section and record take after take, then pick the one that plays
@@ -27,7 +27,7 @@ you watch the changes appear live — and undo anything you don't like.
   fades, crossfades and click-free merging of regions
 - 🎚️ Full mixer, metronome, undo/redo for everything
 - 💾 Export the mix and stems to WAV or FLAC, faster than real time
-- 🤖 MCP server (stdio or HTTP) with 80 tools — the agent and you share one session
+- 🤖 MCP server (stdio or HTTP) with 83 tools — the agent and you share one session
 - 📂 Its own `.otp` project files (double-click to open), Reaper `.rpp` and DAWproject (Bitwig, Studio One, Cubase) projects
 - 🔀 Imports Ableton Live sets (`.als`), Ardour sessions, and Logic Pro projects exported as Final Cut Pro XML
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
@@ -124,10 +124,14 @@ agent.
   Plug-in latency is compensated automatically.
 - **Buses**: Track → New Bus (or Create Bus from Selection), then pick a track's Output in
   the inspector or mixer; effects on the bus process the whole group.
+- **Sends**: the Sends slots under a strip's Audio FX feed buses besides the output. Click the
+  empty slot for a bus, a new bus or **New Reverb Send**; each send has its bus (click to change
+  it, or No Send), a level knob (double-click: 0 dB), Pre (pre-fader) and M (mute). A bus strip
+  counts the tracks and sends feeding it. Send levels can be automated like the fader.
 - **Automation**: the **A** button in a track header (or **A** for all tracks, View → Show
   Automation, or the track's context menu) shows its automation lanes right under it; the **A**
   on the Stereo Out strip (or View → Show Master Automation) shows the master's below the tracks. Pick what a
-  lane moves (volume, pan, mute or any plug-in parameter) in its header, click to add points
+  lane moves (volume, pan, mute, a send level or any plug-in parameter) in its header, click to add points
   (snapped), drag them (Shift: fine), double-click or ⌫ to delete; right-click a point for its
   curve (linear, hold, smooth, fast start/end). In Read, faders and knobs follow the lane; moved
   while stopped they set the point at the playhead. Touch and Latch record control moves while
@@ -197,7 +201,7 @@ of the tool calls behind them):
 `get_status`, `list_audio_devices`, `start_audio`, `stop_audio`, `undo`, `redo`, `get_history`,
 `get_project`, `get_midi_notes`, `analyze_mix`, `export_audio`, `new_project`, `load_project`, `save_project`, `set_tempo`, `set_tempo_map`, `get_tempo_map`, `convert_time`,
 `set_master_volume`, `set_metronome`, `set_auto_input_monitoring`, `set_count_in`, `set_loop`,
-`add_track`, `add_bus`, `move_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `set_clip_gain`, `normalize_clip`, `set_clip_pitch_stretch`, `set_clip_fades`, `crossfade_clips`, `merge_clips`, `remove_clip`,
+`add_track`, `add_bus`, `add_send`, `update_send`, `remove_send`, `move_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `set_clip_gain`, `normalize_clip`, `set_clip_pitch_stretch`, `set_clip_fades`, `crossfade_clips`, `merge_clips`, `remove_clip`,
 `play`, `stop`, `seek`, `record`,
 `scan_plugins`, `insert_plugin`, `remove_plugin`, `insert_master_plugin`, `remove_master_plugin`, `set_plugin_bypass`,
 `list_plugin_params`, `set_plugin_param` (`"eq"` inserts the built-in EQ; `master: true` addresses the master bus),
@@ -228,14 +232,15 @@ Recording: arm a track (`update_track` with `armed: true` and `input_channel`), 
 `.json` files from earlier versions still open).
 Supported: tempo/time signature and the tempo map (tempo envelope), sample rate, master volume, loop range (`LOOP`/`SELECTION`), track name/volume/pan/mute/solo/
 record-arm/input/monitoring, audio items (position, length, source offset, gain, mute,
-play rate / pitch, fades (`FADEIN`/`FADEOUT`, shapes mapped to the nearest), media file), FX chain references and buses (written as receives; folders and receives
-from tracks with the master send off import as buses), and volume/pan/mute envelopes
+play rate / pitch, fades (`FADEIN`/`FADEOUT`, shapes mapped to the nearest), media file), FX chain references, buses (written as receives; folders and receives
+from tracks with the master send off import as buses), sends (receives with their volume, mute
+and mode: post-fader, or pre-fader; Reaper's pre-FX loads as pre-fader), and volume/pan/mute envelopes
 (`VOLENV2`/`PANENV2`/`MUTEENV`). VST3 plugins in a Reaper project are matched by
 bundle file name and class id/name and loaded if installed; Audio Units by their
 type/subtype/manufacturer codes or name.
 
 Not (yet) supported: plug-in parameter envelopes (`PARMENV`, which number parameters by
-position), fader-scaled volume envelopes, MIDI items, sends, takes beyond the
+position), fader-scaled volume envelopes, send envelopes, MIDI items, takes beyond the
 first, and Reaper's opaque plugin state blobs. Those are kept in the model and written
 back on export, but they aren't applied to the loaded plugin.
 
@@ -297,12 +302,12 @@ automation other than tempo, sends/returns and fades aren't imported.
 - Regions: automatic crossfades only cover partial overlaps (a region lying inside another just
   adds to it), and merged regions bake their fades in. Fade curves are mapped to Reaper's
   nearest shapes, and fades aren't imported from other DAWs.
-- Buses: no sends yet (each track feeds one bus or the master); stems export what reaches the
-  master (a bus is one stem, its sources are inside it).
+- Buses: stems export what reaches the master: a bus is one stem with its sources and what
+  sends bring to it inside, and a track's stem is its dry signal. Pre-fader sends ignore the
+  fader and pan but not the track's mute; sends can't be reordered.
 - Automation: plug-in parameters change once per 64-sample block (fader, pan and mute ramp
   within it), so changes land within ~1.3 ms of their point; plug-in editor windows don't follow
-  automated values; no automation of
-  sends (there are none) or of region gain, and Touch/Latch only record from the GUI.
+  automated values; no automation of region gain, and Touch/Latch only record from the GUI.
 
 ## Development
 

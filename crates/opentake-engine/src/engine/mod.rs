@@ -20,6 +20,7 @@ mod plugins;
 mod recording;
 mod regions;
 mod routing;
+mod sends;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -53,6 +54,7 @@ pub use midi::MidiClipUpdate;
 pub use midi_file::{MidiFileImport, MidiFileSummary, MidiFileTrackInfo, gm_program_name, inspect as inspect_midi_file, is_midi_file_path};
 pub use plugins::SlotRef;
 pub use regions::{RegionData, RegionKind, RegionRef};
+pub use sends::SendUpdate;
 
 const SILENCE_DB: f32 = -120.0;
 
@@ -547,6 +549,7 @@ impl Engine {
             }
         }
         self.live_chain.insert(id, rt.plugins.iter().map(|p| p.instance).collect());
+        rt.sends = self.send_rts(index);
         rt.automation = self.envelopes(Some(index));
         self.live_automation.insert(id, rt.automation.iter().map(|e| e.target).collect());
         Ok(rt)
@@ -1119,6 +1122,7 @@ impl Engine {
         }
         project.outputs_from_indices();
         project.assign_slot_ids();
+        project.assign_send_ids();
         project.prune_automation();
 
         if guitarpro::upgrade_song_tempo(&mut project) {

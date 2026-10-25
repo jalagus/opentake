@@ -33,7 +33,8 @@ pub struct ExportOptions {
     pub sample_rate: u32,
     /// Where to write the full mix (the format's extension is added when missing).
     pub mix_path: Option<PathBuf>,
-    /// Folder for one file per track (audible tracks reaching the master; a bus is one stem).
+    /// Folder for one file per track (audible tracks reaching the master; a bus is one stem,
+    /// with what its inputs and the sends to it bring in).
     pub stems_dir: Option<PathBuf>,
     /// Range in seconds; `None` = the whole song.
     pub range: Option<(f64, f64)>,
@@ -110,7 +111,8 @@ impl MixJob {
         };
         let name = self.project_name().to_string();
         // Stems are what reaches the master (tracks routed there, and buses as one stem with
-        // their effects), so together they make up the mix; tracks feeding a bus are in its stem.
+        // their effects), so together they make up the mix; tracks feeding a bus are in its stem,
+        // and so is what sends bring to it (a track's stem is its dry signal).
         let to_master: Vec<bool> = (0..self.project.tracks.len()).map(|i| self.project.output_of(i).is_none()).collect();
         let rendered = self.render(from, to, options.tail_secs);
         let sr = rendered.sample_rate;

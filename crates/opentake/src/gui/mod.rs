@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use opentake_engine::project::{AutomationLane, AutomationMode, AutomationTarget, Curve, Note, Project};
-use opentake_engine::{AudioConfig, AutomationParam, DeviceList, Engine, EngineStatus, HistoryInfo, LaneOwner, ParamView, RegionData, SlotRef, TrackUpdate, Waveform};
+use opentake_engine::{AudioConfig, AutomationParam, DeviceList, Engine, EngineStatus, HistoryInfo, LaneOwner, ParamView, RegionData, SendUpdate, SlotRef, TrackUpdate, Waveform};
 use opentake_vst3::ScannedPlugin;
 use eframe::egui;
 use egui::{Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
@@ -157,6 +157,13 @@ pub(crate) enum Action {
     AddBus(Vec<usize>),
     /// Route a track to a bus (by index) or the master (`None`).
     SetOutput(usize, Option<usize>),
+    /// Send from a track to a bus (track indices); change or remove a send.
+    AddSend(usize, usize),
+    UpdateSend(usize, usize, SendUpdate),
+    RemoveSend(usize, usize),
+    /// A new bus fed by a new send (or, with `send`, an existing one moved there); `reverb`
+    /// names it "Reverb" and puts the built-in reverb on it.
+    SendToNewBus { track: usize, send: Option<usize>, reverb: bool },
     RemoveTrack(usize),
     UpdateTrack(usize, TrackUpdate),
     AddClip { track: Option<usize>, file: PathBuf, position: f64 },
@@ -600,6 +607,22 @@ impl DawApp {
                 self.selected_track = Some(if tracks.is_empty() { e.add_bus(&name)? } else { e.create_bus_from(&tracks, &name)? });
             }
             Action::SetOutput(t, to) => e.set_track_output(t, to)?,
+            Action::AddSend(t, bus) => {
+                e.add_send(t, bus, 1.0, false)?;
+            }
+            Action::UpdateSend(t, k, u) => {
+                e.update_send(t, k, u)?;
+            }
+            Action::RemoveSend(t, k) => {
+                e.remove_send(t, k)?;
+            }
+            Action::SendToNewBus { track, send, reverb } => {
+                let name = if reverb { "Reverb".to_string() } else { format!("Bus {}", e.project().tracks.iter().filter(|t| t.bus).count() + 1) };
+                match send {
+                    Some(k) => e.move_send_to_new_bus(track, k, &name)?,
+                    None => e.send_to_new_bus(track, &name, reverb.then_some("reverb"), 1.0, false)?.0,
+                };
+            }
             Action::RemoveTrack(t) => {
                 e.remove_track(t)?;
                 self.reset_selection(None);
@@ -1923,7 +1946,7 @@ impl DawApp {
         ui.separator();
 
         let strip_w = (ui.available_width() - 8.0) / 2.0;
-        let layout = mixer::StripLayout { width: strip_w, fx_height: FX_AREA_H };
+        let layout = mixer::StripLayout { width: strip_w, fx_height: FX_AREA_H, sends_height: mixer::SENDS_H };
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.allocate_ui_with_layout(vec2(strip_w, ui.available_height()), Layout::top_down(Align::Center), |ui| match selected {
@@ -3269,6 +3292,44 @@ mod tests {
     }
 
     #[test]
+    fn sends_in_the_channel_strip() {
+        let (mut harness, engine) = harness_with_track();
+        engine.lock().unwrap().add_bus("Verb").unwrap();
+        let sends = |e: &SharedEngine| e.lock().unwrap().project().tracks[0].sends.clone();
+        click(&mut harness, "Guitar");
+        click(&mut harness, "Add Send");
+        harness.get_by_role_and_label(egui::Role::Button, "Verb").click();
+        harness.step();
+        harness.step();
+        assert_eq!(engine.lock().unwrap().project().send_dest(0, 0), Some(1));
+        click(&mut harness, "Send 1 Pre-Fader");
+        click(&mut harness, "Send 1 Mute");
+        let s = &sends(&engine)[0];
+        assert!(s.pre_fader && s.mute);
+
+        // The knob: drag down to lower the level, double-click for 0 dB.
+        let knob = harness.get_by_label("Send 1 Level").rect();
+        drag(&mut harness, knob.center(), knob.center() + egui::vec2(0.0, 30.0));
+        assert!(sends(&engine)[0].level < 0.5, "{}", sends(&engine)[0].level);
+        assert_eq!(engine.lock().unwrap().history_info().undo_steps[..2], ["Send Level", "Send Mute"], "a drag is one step");
+        double_click_at(&mut harness, knob.center());
+        assert!((sends(&engine)[0].level - 1.0).abs() < 1e-4);
+
+        // No Send removes it; New Reverb Send makes a "Reverb" bus fed by a new send.
+        click(&mut harness, "Send 1: Verb");
+        click(&mut harness, "No Send");
+        assert!(sends(&engine).is_empty());
+        click(&mut harness, "Add Send");
+        click(&mut harness, "New Reverb Send");
+        let p = engine.lock().unwrap().project().clone();
+        assert_eq!((p.tracks[2].name.as_str(), p.send_dest(0, 0)), ("Reverb", Some(2)));
+        // The bus's strip counts the send feeding it.
+        harness.state_mut().selected_track = Some(2);
+        harness.step();
+        assert!(harness.query_by_label("1 send").is_some());
+    }
+
+    #[test]
     fn tracks_delete_with_header_button_and_keys() {
         let (mut harness, engine) = harness_with_track();
         for name in ["Bass", "Keys", "Vox"] {
@@ -3589,6 +3650,10 @@ mod tests {
             }
             e.insert_clip(v, folder).unwrap();
             e.create_bus_from(&[1, 2], "Music Bus").unwrap();
+            // A shared reverb fed by sends (the built-in reverb when there is one).
+            let (verb, _) = e.send_to_new_bus(v, "Reverb", Some("reverb"), 0.4, false).unwrap();
+            e.add_send(keys, verb, 0.25, false).unwrap();
+            e.add_send(1, verb, 0.15, true).unwrap();
             // A volume ride on the bass, shown under its track.
             {
                 use opentake_engine::project::automation::{AutomationPoint, AutomationTarget, Curve, gain_to_pos};

@@ -1,7 +1,7 @@
 //! Channel strips (used by the inspector and the full mixer) and the mixer panel.
 
 use opentake_engine::SlotRef;
-use opentake_engine::TrackUpdate;
+use opentake_engine::{SendUpdate, TrackUpdate};
 use opentake_engine::project::automation::{gain_to_pos, pos_to_gain};
 use opentake_engine::project::{AutomationTarget, Track};
 use eframe::egui;
@@ -16,12 +16,14 @@ pub struct StripLayout {
     pub width: f32,
     /// Height reserved for the Audio FX slot list.
     pub fx_height: f32,
+    /// Height reserved for the Sends list.
+    pub sends_height: f32,
 }
 
 /// Full mixer: one strip per track, Stereo Out pinned on the right.
 pub fn mixer_panel(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
     const STRIP: f32 = 104.0;
-    let layout = StripLayout { width: STRIP, fx_height: 72.0 };
+    let layout = StripLayout { width: STRIP, fx_height: 72.0, sends_height: SENDS_H };
     let full = ui.available_rect_before_wrap();
     let master_w = STRIP + 20.0;
     let tracks_rect = Rect::from_min_max(full.min, egui::pos2(full.right() - master_w, full.bottom()));
@@ -96,14 +98,15 @@ pub fn track_strip(app: &mut DawApp, ui: &mut egui::Ui, t: usize, track: &Track,
 
     if track.bus {
         widgets::section(ui, "Input");
-        let n = snap.project.sources_of(t).len();
-        let text = match n {
-            0 => "No inputs".to_string(),
-            1 => "1 track".to_string(),
-            n => format!("{n} tracks"),
+        let plural = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+        let text = match (snap.project.sources_of(t).len(), snap.project.send_sources_of(t).len()) {
+            (0, 0) => "No inputs".to_string(),
+            (n, 0) => plural(n, "track"),
+            (0, s) => plural(s, "send"),
+            (n, s) => format!("{n} trk · {}", plural(s, "send")),
         };
         ui.add_sized([w, 20.0], egui::Label::new(RichText::new(text).color(theme::TEXT_DIM)))
-            .on_hover_text("Tracks routed to this bus (set their Output)");
+            .on_hover_text("Tracks routed to this bus (set their Output) and sends to it");
     } else if let Some(inst) = &track.instrument {
         widgets::section(ui, "Instrument");
         slot_pill(app, ui, t, SlotRef::Instrument, &inst.name, inst.bypass, w, &snap.instruments);
@@ -129,6 +132,7 @@ pub fn track_strip(app: &mut DawApp, ui: &mut egui::Ui, t: usize, track: &Track,
             add_fx_button(app, ui, t, w, snap);
         });
     });
+    sends_section(app, ui, t, track, snap, layout);
     widgets::section(ui, "Output");
     output_button(app, ui, t, snap, w);
 
@@ -181,6 +185,111 @@ pub fn track_strip(app: &mut DawApp, ui: &mut egui::Ui, t: usize, track: &Track,
     }
 }
 
+/// Rows of the Sends list (two show without scrolling).
+pub const SENDS_H: f32 = 43.0;
+
+/// Logic's sends under the inserts: one row per send (bus, level knob, pre/post, mute) and
+/// an empty slot that adds one.
+fn sends_section(app: &mut DawApp, ui: &mut egui::Ui, t: usize, track: &Track, snap: &Snapshot, layout: StripLayout) {
+    widgets::section(ui, "Sends");
+    let w = layout.width;
+    let (rect, _) = ui.allocate_exact_size(vec2(w, layout.sends_height), Sense::hover());
+    ui.scope_builder(UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Min)), |ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
+        egui::ScrollArea::vertical().id_salt(("sends", t)).auto_shrink([false, false]).show(ui, |ui| {
+            for k in 0..track.sends.len() {
+                send_row(app, ui, t, k, track, snap, w);
+            }
+            add_send_button(app, ui, t, snap, w);
+        });
+    });
+}
+
+fn send_row(app: &mut DawApp, ui: &mut egui::Ui, t: usize, k: usize, track: &Track, snap: &Snapshot, w: f32) {
+    let project = &snap.project;
+    let send = &track.sends[k];
+    let dest = project.send_dest(t, k).map_or("—", |b| project.tracks[b].name.as_str());
+    let (rect, _) = ui.allocate_exact_size(vec2(w - 2.0, 20.0), Sense::hover());
+    ui.painter().rect_filled(rect, 4.0, theme::BG_CONTROL);
+    ui.scope_builder(UiBuilder::new().max_rect(rect.shrink2(vec2(2.0, 1.0))).layout(Layout::left_to_right(Align::Center)), |ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let n = k + 1;
+        // Destination: pick another bus, a new one, or no send.
+        let color = if send.mute { theme::TEXT_FAINT } else { theme::BUS };
+        let name_w = (ui.available_width() - 18.0 - 26.0 - 16.0 - 6.0).max(16.0);
+        let label = egui::Label::new(RichText::new(dest).size(10.5).color(color)).truncate().sense(Sense::click());
+        let resp = ui.add_sized([name_w, 18.0], label);
+        widgets::label(&resp, egui::Role::Button, &format!("Send {n}: {dest}"));
+        let resp = resp.on_hover_text("Send destination (click to change)");
+        egui::Popup::menu(&resp).show(|ui| {
+            ui.set_min_width(160.0);
+            for b in (0..project.tracks.len()).filter(|&b| b == project.send_dest(t, k).unwrap_or(usize::MAX) || project.can_send(t, b)) {
+                if ui.add(egui::Button::new(&project.tracks[b].name).selected(Some(b) == project.send_dest(t, k))).clicked() {
+                    app.act(Action::UpdateSend(t, k, SendUpdate { bus: Some(b), ..Default::default() }));
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button("New Bus").clicked() {
+                app.act(Action::SendToNewBus { track: t, send: Some(k), reverb: false });
+                ui.close();
+            }
+            if ui.button("No Send").clicked() {
+                app.act(Action::RemoveSend(t, k));
+                ui.close();
+            }
+        });
+        // Level on the fader's scale; automated sends follow their lane.
+        let target = AutomationTarget::Send { send: send.id };
+        let level = track.automated(target, snap.status.position_secs).map_or(send.level, pos_to_gain);
+        let mut pos = gain_to_pos(level);
+        let r = widgets::knob(ui, &mut pos, 0.0, 1.0, gain_to_pos(1.0), false, 18.0, &format!("Send {n} Level"));
+        let r = r.on_hover_text(format!("Send level {} dB (double-click: 0 dB)", widgets::format_db(pos_to_gain(pos))));
+        if r.changed() {
+            app.control(&track.automation, Some(t), target, pos, Action::UpdateSend(t, k, SendUpdate { level: Some(pos_to_gain(pos)), ..Default::default() }));
+        }
+        if r.drag_stopped() {
+            app.act(Action::ReleaseControl { owner: Some(t), target });
+        }
+        let tip = if send.pre_fader { "Pre-fader (click for post-fader)" } else { "Post-fader (click for pre-fader)" };
+        if widgets::chip(ui, send.pre_fader, "Pre", theme::ACCENT, &format!("Send {n} Pre-Fader"), vec2(26.0, 16.0)).on_hover_text(tip).clicked() {
+            app.act(Action::UpdateSend(t, k, SendUpdate { pre_fader: Some(!send.pre_fader), ..Default::default() }));
+        }
+        if widgets::chip(ui, send.mute, "M", theme::MUTE, &format!("Send {n} Mute"), vec2(16.0, 16.0)).clicked() {
+            app.act(Action::UpdateSend(t, k, SendUpdate { mute: Some(!send.mute), ..Default::default() }));
+        }
+    });
+}
+
+/// Empty send slot: send to a bus, a new bus, or a new bus with the built-in reverb.
+fn add_send_button(app: &mut DawApp, ui: &mut egui::Ui, t: usize, snap: &Snapshot, w: f32) {
+    let project = &snap.project;
+    let (rect, resp) = ui.allocate_exact_size(vec2(w - 2.0, 20.0), Sense::click());
+    let stroke = Stroke::new(1.0, if resp.hovered() { theme::TEXT_DIM } else { theme::HAIRLINE });
+    ui.painter().rect_stroke(rect, 4.0, stroke, StrokeKind::Inside);
+    widgets::draw_icon(ui.painter(), Icon::Plus, rect.center(), 4.0, theme::TEXT_DIM);
+    widgets::label(&resp, egui::Role::Button, "Add Send");
+    let resp = resp.on_hover_text("Send to a bus (e.g. a shared reverb)");
+    egui::Popup::menu(&resp).show(|ui| {
+        ui.set_min_width(180.0);
+        for b in (0..project.tracks.len()).filter(|&b| project.can_send(t, b)) {
+            if ui.button(&project.tracks[b].name).clicked() {
+                app.act(Action::AddSend(t, b));
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui.button("New Bus").clicked() {
+            app.act(Action::SendToNewBus { track: t, send: None, reverb: false });
+            ui.close();
+        }
+        if ui.button("New Reverb Send").clicked() {
+            app.act(Action::SendToNewBus { track: t, send: None, reverb: true });
+            ui.close();
+        }
+    });
+}
+
 /// The track's output (Stereo Out or a bus); click to route it elsewhere or to a new bus.
 fn output_button(app: &mut DawApp, ui: &mut egui::Ui, t: usize, snap: &Snapshot, w: f32) {
     let project = &snap.project;
@@ -224,6 +333,9 @@ pub fn master_strip(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot, layout
             add_fx_button(app, ui, MASTER_UI, w, snap);
         });
     });
+    // Where track strips have their sends, so the faders line up.
+    widgets::section(ui, "");
+    ui.allocate_exact_size(vec2(w, layout.sends_height), Sense::hover());
     ui.allocate_exact_size(vec2(w, 34.0), Sense::hover());
     let lanes = &snap.project.master_automation;
     let mut gain = opentake_engine::project::automated(lanes, AutomationTarget::Volume, snap.status.position_secs).map_or(snap.project.master_volume, pos_to_gain);

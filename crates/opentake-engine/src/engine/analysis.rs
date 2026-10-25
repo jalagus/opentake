@@ -3,7 +3,7 @@
 //! and effect (built-ins created fresh, VST3s as new instances), so the live audio thread is
 //! never touched. [`MixJob::render`] then renders without the lock: MIDI through the
 //! instruments, audio regions, effect chains (with plug-in delay compensation), faders,
-//! pans, buses, the master and all their automation. Analysis measures the result (peak, BS.1770 loudness, energy per
+//! pans, buses and sends, the master and all their automation. Analysis measures the result (peak, BS.1770 loudness, energy per
 //! band, phone-speaker translation); export writes it to files (see `export.rs`).
 
 use std::sync::Arc;
@@ -202,6 +202,8 @@ impl MixJob {
             for (id, fx) in &mut p.effects {
                 process_stereo(fx.as_mut(), &param_lanes(&track.automation, *id), &mut l, &mut r, &map, start, sr);
             }
+            // Pre-fader sends tap the signal here, post-fader ones after the fader.
+            let pre_fader = track.sends.iter().any(|s| s.pre_fader && !s.mute).then(|| [l.clone(), r.clone()]);
             apply_fader(&mut l, &mut r, start, sr, |t| {
                 let volume = automated(&track.automation, AutomationTarget::Volume, t).map_or(track.volume, pos_to_gain);
                 let pan = automated(&track.automation, AutomationTarget::Pan, t).map_or(track.pan, |v| v * 2.0 - 1.0);
@@ -216,6 +218,24 @@ impl MixJob {
                 for k in 0..len {
                     dst[0][k] += l[k];
                     dst[1][k] += r[k];
+                }
+                for (k, send) in track.sends.iter().enumerate().filter(|(_, s)| !s.mute) {
+                    let Some(b) = self.project.send_dest(i, k) else { continue };
+                    let [mut wl, mut wr] = match (&pre_fader, send.pre_fader) {
+                        (Some(tap), true) => tap.clone(),
+                        _ => [l.clone(), r.clone()],
+                    };
+                    apply_fader(&mut wl, &mut wr, start, sr, |t| {
+                        let level = automated(&track.automation, AutomationTarget::Send { send: send.id }, t).map_or(send.level, pos_to_gain);
+                        // Pre-fader skips the fader, but not the track's mute.
+                        let muted = send.pre_fader && automated(&track.automation, AutomationTarget::Mute, t).is_some_and(|v| v >= 0.5);
+                        if muted { (0.0, 0.0) } else { (level, level) }
+                    });
+                    let dst = bus_in[b].get_or_insert_with(silence);
+                    for k in 0..len {
+                        dst[0][k] += wl[k];
+                        dst[1][k] += wr[k];
+                    }
                 }
             }
             outs[i] = Some([l, r]);

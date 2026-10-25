@@ -107,8 +107,8 @@ impl Engine {
         self.owner_slots(owner).into_iter().find(|(_, s)| s.id == slot).map(|(r, _)| r)
     }
 
-    /// Everything that can be automated: volume, pan and mute (master: volume), then every
-    /// writable parameter of each plug-in.
+    /// Everything that can be automated: volume, pan and mute (master: volume), send levels,
+    /// then every writable parameter of each plug-in.
     pub fn automation_params(&self, owner: LaneOwner) -> Result<Vec<AutomationParam>> {
         self.lanes_ref(owner)?;
         let group = if owner.is_some() { "Track" } else { "Master" };
@@ -117,6 +117,12 @@ impl Engine {
             None => &[(AutomationTarget::Volume, "Volume")],
         };
         let mut list: Vec<AutomationParam> = basics.iter().map(|&(target, name)| AutomationParam { target, name: name.into(), group: group.into(), slot: None }).collect();
+        if let Some(t) = owner {
+            for s in &self.project.tracks[t].sends {
+                let target = AutomationTarget::Send { send: s.id };
+                list.push(AutomationParam { target, name: self.send_name(t, s.id).unwrap_or_default(), group: "Sends".into(), slot: None });
+            }
+        }
         for (which, slot) in self.owner_slots(owner) {
             let Ok(params) = self.slot_params_static(owner.unwrap_or(0), which) else { continue };
             let plugin = short_name(&slot.name);
@@ -130,6 +136,9 @@ impl Engine {
 
     /// A lane target's name, e.g. "Volume" or "OpenTake Compressor: Threshold".
     pub fn target_name(&self, owner: LaneOwner, target: AutomationTarget) -> String {
+        if let (Some(t), AutomationTarget::Send { send }) = (owner, target) {
+            return self.send_name(t, send).unwrap_or_else(|_| "Send".into());
+        }
         let AutomationTarget::Param { param, .. } = target else {
             return format!("{target:?}");
         };
@@ -151,7 +160,8 @@ impl Engine {
 
     fn check_target(&self, owner: LaneOwner, target: AutomationTarget) -> Result<()> {
         match (owner, target) {
-            (None, AutomationTarget::Pan | AutomationTarget::Mute) => bail!("the master bus automates its volume and plug-ins"),
+            (None, AutomationTarget::Pan | AutomationTarget::Mute | AutomationTarget::Send { .. }) => bail!("the master bus automates its volume and plug-ins"),
+            (Some(t), AutomationTarget::Send { send }) => self.send_name(t, send).map(drop),
             (_, AutomationTarget::Param { param, .. }) => {
                 let which = self.target_slot(owner, target).ok_or_else(|| anyhow!("no such plug-in slot"))?;
                 let params = self.slot_params_static(owner.unwrap_or(0), which)?;
@@ -345,6 +355,7 @@ impl Engine {
                     AutomationTarget::Volume => EnvTarget::Volume,
                     AutomationTarget::Pan => EnvTarget::Pan,
                     AutomationTarget::Mute => EnvTarget::Mute,
+                    AutomationTarget::Send { send } => EnvTarget::Send { id: send },
                     AutomationTarget::Param { slot, param } => {
                         let (_, s) = slots.iter().find(|(_, s)| s.id == slot && s.instance != 0)?;
                         EnvTarget::Param { instance: s.instance, id: param }
@@ -460,6 +471,12 @@ impl Engine {
                 }
                 let (id, params) = (track.id, track_params(track));
                 self.send(Command::SetTrack { track: id, params })
+            }
+            (Some(t), AutomationTarget::Send { send }) => {
+                if let Some(s) = self.project.tracks[t].sends.iter_mut().find(|s| s.id == send) {
+                    s.level = pos_to_gain(value);
+                }
+                self.sync_sends(t)
             }
             (None, AutomationTarget::Volume) => {
                 self.project.master_volume = pos_to_gain(value);

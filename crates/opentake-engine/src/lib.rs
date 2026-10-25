@@ -21,5 +21,5 @@ pub use engine::{MidiFileImport, MidiFileSummary, inspect_midi_file, is_midi_fil
 pub use engine::{GuitarProImport, GuitarProSummary, PROJECT_EXTENSION, inspect_guitar_pro, is_project_path};
 pub use engine::{AudioFormat, ExportOptions, ExportReport, ExportedFile, LevelReport, MixJob, MixReport, SAMPLE_RATES};
 pub use engine::{CLIP_GAIN_DB, CROSSFADE_SECS, FadeUpdate, JOIN_SECS, FlexJob, FlexRender, MAX_SEMITONES, PitchStretch, STRETCH_RANGE};
-pub use engine::{Engine, EngineStatus, HistoryInfo, MidiClipUpdate, ParamView, RegionData, RegionKind, RegionRef, SlotRef, TrackUpdate, Waveform};
+pub use engine::{Engine, EngineStatus, HistoryInfo, MidiClipUpdate, ParamView, RegionData, RegionKind, RegionRef, SendUpdate, SlotRef, TrackUpdate, Waveform};
 pub use engine::{AudioUnitInfo, AutomationParam, LaneOwner};

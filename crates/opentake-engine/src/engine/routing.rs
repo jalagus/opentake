@@ -14,7 +14,7 @@ impl Engine {
         self.record("New Bus", None, |e| e.add_bus_impl(name))
     }
 
-    fn add_bus_impl(&mut self, name: &str) -> Result<usize> {
+    pub(super) fn add_bus_impl(&mut self, name: &str) -> Result<usize> {
         let mut track = Track::new_bus(name);
         track.id = self.next_id();
         self.project.tracks.push(track);
@@ -74,16 +74,17 @@ impl Engine {
         })
     }
 
-    /// Before deleting bus `index`: whatever fed it goes where the bus went.
+    /// Before deleting bus `index`: whatever fed it goes where the bus went; sends to it go.
     pub(super) fn unroute_bus(&mut self, index: usize) -> Result<()> {
         let output = self.project.output_of(index);
         for s in self.project.sources_of(index) {
             self.set_output_impl(s, output)?;
         }
-        Ok(())
+        self.drop_sends_to(index)
     }
 
-    /// Tell the audio thread the processing order (every track before the buses it feeds).
+    /// Tell the audio thread the processing order (every track before the buses it feeds,
+    /// through its output or sends).
     pub(super) fn sync_routing(&mut self) -> Result<()> {
         if self.audio.is_none() {
             return Ok(());

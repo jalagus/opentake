@@ -2170,6 +2170,10 @@ fn lane_area(app: &mut DawApp, ui: &mut egui::Ui, host: LaneHost, li: usize, lan
             AutomationTarget::Pan => (host.pan + 1.0) / 2.0,
             AutomationTarget::Mute => host.mute as u8 as f32,
             AutomationTarget::Param { .. } => 0.5,
+            AutomationTarget::Send { send } => {
+                let level = owner.and_then(|t| project.tracks.get(t)?.sends.iter().find(|s| s.id == send)).map_or(1.0, |s| s.level);
+                gain_to_pos(level)
+            }
         };
         painter.hline(rect.x_range(), y_of(v), Stroke::new(1.0, theme::with_alpha(ink, 90)));
         painter.text(rect.left_center() + vec2(10.0, 0.0), Align2::LEFT_CENTER, "Click to add automation points", FontId::proportional(11.0), theme::TEXT_FAINT);

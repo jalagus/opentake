@@ -11,9 +11,11 @@ pub mod guitarpro;
 pub mod import;
 pub mod model;
 pub mod rpp;
+pub mod sends;
 pub mod tempo;
 
 pub use automation::{AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, Curve};
 pub use fade::{Fade, FadeCurve, effective_fades};
 pub use model::*;
+pub use sends::{AuxSend, MAX_SEND_GAIN};
 pub use tempo::{BarLine, Grid, MusicalPos, TempoChange, TempoMap, TempoSegment};

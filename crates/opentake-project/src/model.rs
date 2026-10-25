@@ -149,6 +149,9 @@ pub struct Track {
     /// saved (see [`Project::outputs_from_indices`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<u64>,
+    /// Sends to buses (see `sends.rs`), in addition to the output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sends: Vec<crate::sends::AuxSend>,
     /// Automation lanes (fader, pan, mute, plug-in parameters).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub automation: Vec<AutomationLane>,
@@ -174,6 +177,7 @@ impl Track {
             plugins: Vec::new(),
             bus: false,
             output: None,
+            sends: Vec::new(),
             automation: Vec::new(),
             show_automation: false,
             id: 0,
@@ -226,14 +230,16 @@ impl Project {
         }
     }
 
-    /// Drop lanes that point at a plug-in slot their track (or the master) no longer has, or
-    /// at what a bus or the master can't move. Returns whether anything was removed.
+    /// Drop lanes that point at a plug-in slot or send their track (or the master) no longer
+    /// has, or at what a bus or the master can't move. Returns whether anything was removed.
     pub fn prune_automation(&mut self) -> bool {
         let before = self.tracks.iter().map(|t| t.automation.len()).sum::<usize>() + self.master_automation.len();
         for t in &mut self.tracks {
             let ids: Vec<u32> = t.slots().map(|s| s.id).collect();
+            let sends: Vec<u32> = t.sends.iter().map(|s| s.id).collect();
             t.automation.retain(|l| match l.target {
                 AutomationTarget::Param { slot, .. } => ids.contains(&slot),
+                AutomationTarget::Send { send } => sends.contains(&send),
                 _ => true,
             });
         }
@@ -247,7 +253,8 @@ impl Project {
     }
 }
 
-/// Routing: tracks feed the master or a bus; buses can feed further buses, never in a loop.
+/// Routing: tracks feed the master or a bus (and buses through sends); buses can feed further
+/// buses, never in a loop.
 impl Project {
     pub fn track_by_id(&self, id: u64) -> Option<usize> {
         self.tracks.iter().position(|t| t.id == id)
@@ -273,10 +280,10 @@ impl Project {
     }
 
     /// Whether track `index` may feed `to` (a bus index, `None` = master): `to` must be a bus
-    /// that isn't the track itself or fed by it.
+    /// that isn't the track itself or fed by it (through outputs or sends).
     pub fn can_route(&self, index: usize, to: Option<usize>) -> bool {
         let Some(to) = to else { return true };
-        to != index && self.tracks.get(to).is_some_and(|t| t.bus) && !self.route(to).contains(&index)
+        to != index && self.tracks.get(to).is_some_and(|t| t.bus) && !self.feeds(to, index)
     }
 
     /// Tracks feeding bus `index` directly.
@@ -284,34 +291,51 @@ impl Project {
         (0..self.tracks.len()).filter(|&i| self.output_of(i) == Some(index)).collect()
     }
 
-    /// Mixing order: every track before the buses it feeds (plain tracks first).
+    /// Mixing order: every track before the buses it feeds through its output or sends
+    /// (plain tracks first, then buses as soon as everything feeding them is in).
     pub fn processing_order(&self) -> Vec<usize> {
-        let mut order: Vec<usize> = (0..self.tracks.len()).filter(|&i| !self.tracks[i].bus).collect();
-        let mut buses: Vec<usize> = (0..self.tracks.len()).filter(|&i| self.tracks[i].bus).collect();
-        // A bus further from the master comes first (its route is longer than its output's).
-        buses.sort_by_key(|&b| std::cmp::Reverse(self.route(b).len()));
-        order.extend(buses);
+        let n = self.tracks.len();
+        let targets: Vec<Vec<usize>> = (0..n).map(|i| self.targets(i)).collect();
+        let mut placed: Vec<bool> = self.tracks.iter().map(|t| !t.bus).collect();
+        let mut order: Vec<usize> = (0..n).filter(|&i| placed[i]).collect();
+        while order.len() < n {
+            let before = order.len();
+            for b in 0..n {
+                if !placed[b] && (0..n).all(|i| placed[i] || !targets[i].contains(&b)) {
+                    placed[b] = true;
+                    order.push(b);
+                }
+            }
+            if order.len() == before {
+                // A loop (never made by edits): the rest in list order.
+                order.extend((0..n).filter(|&i| !placed[i]));
+            }
+        }
         order
     }
 
-    /// Which tracks reach the output: not muted, and when anything is soloed, soloed, on the
-    /// route of a soloed track (its buses), or feeding a soloed bus.
+    /// Which tracks reach the output: not muted, and when anything is soloed, soloed, fed
+    /// (through outputs or sends) by a soloed track, or feeding a soloed bus.
     pub fn audible(&self) -> Vec<bool> {
+        let order = self.processing_order();
+        let targets: Vec<Vec<usize>> = (0..self.tracks.len()).map(|i| self.targets(i)).collect();
         let mut soloed: Vec<bool> = self.tracks.iter().map(|t| t.solo).collect();
-        for i in 0..self.tracks.len() {
-            let route = self.route(i);
-            if self.tracks[i].solo {
-                route.iter().for_each(|&b| soloed[b] = true);
-            } else if route.iter().any(|&b| self.tracks[b].solo) {
-                soloed[i] = true;
+        for &i in &order {
+            if soloed[i] {
+                targets[i].iter().for_each(|&b| soloed[b] = true);
             }
         }
+        let mut feeds_solo = vec![false; self.tracks.len()];
+        for &i in order.iter().rev() {
+            feeds_solo[i] = targets[i].iter().any(|&b| self.tracks[b].solo || feeds_solo[b]);
+        }
         let any_solo = self.tracks.iter().any(|t| t.solo);
-        self.tracks.iter().zip(soloed).map(|(t, s)| !t.mute && (!any_solo || s)).collect()
+        (0..self.tracks.len()).map(|i| !self.tracks[i].mute && (!any_solo || soloed[i] || feeds_solo[i])).collect()
     }
 
-    /// Outputs from track indices (as files store them) to session ids; invalid ones (not a
-    /// bus, or a loop) go to the master. Call once the tracks have their ids.
+    /// Outputs (and sends) from track indices (as files store them) to session ids; invalid
+    /// outputs (not a bus, or a loop) go to the master, invalid sends go. Call once the
+    /// tracks have their ids.
     pub fn outputs_from_indices(&mut self) {
         let ids: Vec<(u64, bool)> = self.tracks.iter().map(|t| (t.id, t.bus)).collect();
         for (i, t) in self.tracks.iter_mut().enumerate() {
@@ -322,10 +346,12 @@ impl Project {
                 self.tracks[i].output = None;
             }
         }
+        self.sends_from_indices();
     }
 
-    /// Outputs from session ids to track indices, for saving.
+    /// Outputs (and sends) from session ids to track indices, for saving.
     pub fn outputs_to_indices(&mut self) {
+        self.sends_to_indices();
         let outputs: Vec<Option<usize>> = (0..self.tracks.len()).map(|i| self.output_of(i)).collect();
         for (t, o) in self.tracks.iter_mut().zip(outputs) {
             t.output = o.map(|o| o as u64);

@@ -66,6 +66,11 @@ fn builtin_effect_for(query: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// Whether `query` names one of OpenTake's built-in effects.
+pub(super) fn is_builtin_effect(query: &str) -> bool {
+    builtin_effect_for(query).is_some()
+}
+
 /// A fresh pooled instance for a built-in effect path.
 fn builtin_effect_instance(path: &str) -> Option<Loaded> {
     Some(match path {

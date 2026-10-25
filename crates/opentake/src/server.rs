@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use opentake_engine::project::{AutomationMode, AutomationPoint, AutomationTarget, Curve, Note};
-use opentake_engine::{AudioConfig, Engine, MidiClipUpdate, SlotRef, TrackUpdate};
+use opentake_engine::{AudioConfig, Engine, MidiClipUpdate, SendUpdate, SlotRef, TrackUpdate};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
@@ -37,15 +37,17 @@ bars/beats. Effects: insert_plugin with \"eq\", \"comp\", \"multiband\", \"limit
 insert_master_plugin puts effects on the master bus (address them with master: true); VST3 and, on macOS, Audio Unit plug-ins work too (scan_plugins lists them). Plug-in delay \
 (e.g. the limiter's look-ahead) is compensated automatically. Buses: add_bus (with tracks to group them) \
 creates a bus track; update_track output routes a track to a bus index or \"master\"; effects on the bus \
-(insert_plugin with its index) process the whole group. get_project shows each track's kind and output.
+(insert_plugin with its index) process the whole group. Sends feed buses besides the output, at their own \
+level, pre- or post-fader: add_send (without bus it makes a \"Reverb\" bus with the built-in reverb), \
+update_send, remove_send. get_project shows each track's kind, output and sends.
 
 Regions: set_clip_fades gives an audio region fade-in/out curves; overlapping regions on a track \
 crossfade automatically, and crossfade_clips makes a short crossfade between two neighbours. \
 merge_clips joins regions into one new audio file without clicks at the joins.
 
 Automation: list_automation_params shows what a track (or master: true) can automate — volume, \
-pan, mute and every plug-in parameter; add_automation_lane makes a lane, set_automation_points \
-draws it (times in seconds; values normalized 0..1, or db for volume and pan -1..1), \
+pan, mute, send levels and every plug-in parameter; add_automation_lane makes a lane, set_automation_points \
+draws it (times in seconds; values normalized 0..1, or db for volume and sends, pan -1..1), \
 get_automation reads lanes back. Lanes play in mode \"read\" and are shown under the track in the \
 GUI; analyze_mix and export_audio render them.
 
@@ -164,9 +166,53 @@ fn project_json(project: &opentake_engine::project::Project, include_notes: bool
             t["kind"] = json!(if track.bus { "bus" } else if track.is_instrument() { "instrument" } else { "audio" });
             t["output"] = project.output_of(i).map_or(json!("master"), |b| json!(b));
             t.as_object_mut().map(|o| o.remove("bus"));
+            if !track.sends.is_empty() {
+                t["sends"] = json!((0..track.sends.len()).map(|k| send_json(project, i, k)).collect::<Vec<_>>());
+            }
         }
     }
     v
+}
+
+/// A send as agents see it: bus by index, level in dB.
+fn send_json(project: &opentake_engine::project::Project, track: usize, k: usize) -> serde_json::Value {
+    let s = &project.tracks[track].sends[k];
+    let db = if s.level > 0.0 { ((20.0 * s.level.log10()) * 10.0).round() / 10.0 } else { -144.0 };
+    json!({ "send": k, "bus": project.send_dest(track, k), "level_db": db, "pre_fader": s.pre_fader, "mute": s.mute })
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AddSendArgs {
+    pub track: usize,
+    /// Bus track index. Leave out to create a new bus for it (new_bus_name, default "Reverb").
+    pub bus: Option<usize>,
+    /// Send level in dB (default 0; max +6).
+    pub level_db: Option<f32>,
+    /// Tap before the fader and pan (default: after).
+    #[serde(default)]
+    pub pre_fader: bool,
+    /// Name of the new bus when bus is left out.
+    pub new_bus_name: Option<String>,
+    /// Built-in effect for the new bus (default "reverb"; "none" for no effect).
+    pub new_bus_effect: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateSendArgs {
+    pub track: usize,
+    /// Send index on the track (as in get_project).
+    pub send: usize,
+    /// Another bus track index.
+    pub bus: Option<usize>,
+    pub level_db: Option<f32>,
+    pub pre_fader: Option<bool>,
+    pub mute: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SendArgs {
+    pub track: usize,
+    pub send: usize,
 }
 
 /// A track output: a bus track's index or "master".
@@ -704,8 +750,10 @@ pub struct AutomationOwnerArgs {
 /// What a lane automates.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AutomationTargetArgs {
-    /// "volume", "pan", "mute" (tracks only) or "plugin".
+    /// "volume", "pan", "mute", "send" (tracks only) or "plugin".
     pub parameter: String,
+    /// For "send": the send index (as in get_project).
+    pub send: Option<usize>,
     /// For "plugin": the effect slot (as in get_project; with master: true, the master's).
     pub slot: Option<usize>,
     /// For "plugin": the track's instrument instead of an effect slot.
@@ -737,7 +785,7 @@ pub struct PointArg {
     pub time: f64,
     /// Normalized 0..1 (volume: fader travel; pan: 0 left, 0.5 centre, 1 right; mute: 1 muted).
     pub value: Option<f32>,
-    /// Volume lanes: the level in dB instead of value.
+    /// Volume and send lanes: the level in dB instead of value.
     pub db: Option<f32>,
     /// Pan lanes: -1 (left) .. 1 (right) instead of value.
     pub pan: Option<f32>,
@@ -797,6 +845,7 @@ fn target_json(e: &Engine, owner: Option<usize>, t: AutomationTarget) -> serde_j
         (AutomationTarget::Param { param, .. }, Some(SlotRef::Instrument)) => json!({ "parameter": "plugin", "instrument": true, "param_id": param }),
         (AutomationTarget::Param { param, .. }, Some(SlotRef::Effect(s) | SlotRef::Master(s))) => json!({ "parameter": "plugin", "slot": s, "param_id": param }),
         (AutomationTarget::Param { param, .. }, None) => json!({ "parameter": "plugin", "param_id": param }),
+        (AutomationTarget::Send { send }, _) => json!({ "parameter": "send", "send": owner.and_then(|t| e.project().tracks.get(t)?.sends.iter().position(|s| s.id == send)) }),
         (other, _) => json!({ "parameter": format!("{other:?}").to_lowercase() }),
     }
 }
@@ -806,6 +855,11 @@ fn resolve_target(e: &Engine, owner: Option<usize>, a: &AutomationTargetArgs) ->
         "volume" => AutomationTarget::Volume,
         "pan" => AutomationTarget::Pan,
         "mute" => AutomationTarget::Mute,
+        "send" => {
+            let (Some(t), Some(k)) = (owner, a.send) else { anyhow::bail!("give the track's send index") };
+            let s = e.project().tracks.get(t).and_then(|t| t.sends.get(k)).ok_or_else(|| anyhow::anyhow!("track {t} has no send {k}"))?;
+            AutomationTarget::Send { send: s.id }
+        }
         "plugin" | "param" | "parameter" => {
             let param = a.param_id.ok_or_else(|| anyhow::anyhow!("give param_id for a plug-in parameter"))?;
             let which = match (owner, a.instrument, a.slot) {
@@ -816,7 +870,7 @@ fn resolve_target(e: &Engine, owner: Option<usize>, a: &AutomationTargetArgs) ->
             };
             e.param_target(owner, which, param)?
         }
-        other => anyhow::bail!("parameter must be volume, pan, mute or plugin, not '{other}'"),
+        other => anyhow::bail!("parameter must be volume, pan, mute, send or plugin, not '{other}'"),
     })
 }
 
@@ -1142,6 +1196,38 @@ impl DawServer {
         .await
     }
 
+    #[tool(description = "Add a send from a track (or bus) to a bus, e.g. several tracks into one reverb bus. Without bus, creates a new bus (default \"Reverb\" with the built-in reverb). Returns the send and bus indices. Undoable.")]
+    async fn add_send(&self, Parameters(a): Parameters<AddSendArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let level = db_to_gain(a.level_db.unwrap_or(0.0));
+            let (bus, send) = match a.bus {
+                Some(bus) => (bus, e.add_send(a.track, bus, level, a.pre_fader)?),
+                None => {
+                    let effect = a.new_bus_effect.unwrap_or_else(|| "reverb".into());
+                    let effect = (effect != "none").then_some(effect.as_str());
+                    e.send_to_new_bus(a.track, a.new_bus_name.as_deref().unwrap_or("Reverb"), effect, level, a.pre_fader)?
+                }
+            };
+            Ok(json!({ "track": a.track, "send": send, "bus": bus, "bus_effects": e.project().tracks[bus].plugins.len() }))
+        })
+        .await
+    }
+
+    #[tool(description = "Change a send: bus, level (dB), pre/post-fader, mute. Undoable.")]
+    async fn update_send(&self, Parameters(a): Parameters<UpdateSendArgs>) -> ToolResult {
+        let update = SendUpdate { bus: a.bus, level: a.level_db.map(db_to_gain), pre_fader: a.pre_fader, mute: a.mute };
+        self.with_engine(move |e| {
+            e.update_send(a.track, a.send, update)?;
+            Ok(send_json(e.project(), a.track, a.send))
+        })
+        .await
+    }
+
+    #[tool(description = "Remove a send (later sends' indices shift down). Undoable.")]
+    async fn remove_send(&self, Parameters(a): Parameters<SendArgs>) -> ToolResult {
+        self.with_engine(move |e| e.remove_send(a.track, a.send).map(|_| "ok")).await
+    }
+
     #[tool(description = "Change track settings: name, volume (dB), pan, mute, solo, record arm, input monitoring, input channel, output (a bus track index or \"master\").")]
     async fn update_track(&self, Parameters(a): Parameters<UpdateTrackArgs>) -> ToolResult {
         let update = TrackUpdate {
@@ -1456,7 +1542,7 @@ impl DawServer {
         .await
     }
 
-    #[tool(description = "What a track (or master: true) can automate: volume, pan, mute and each plug-in parameter, with the target to pass to add_automation_lane.")]
+    #[tool(description = "What a track (or master: true) can automate: volume, pan, mute, send levels and each plug-in parameter, with the target to pass to add_automation_lane.")]
     async fn list_automation_params(&self, Parameters(a): Parameters<AutomationOwnerArgs>) -> ToolResult {
         self.with_engine(move |e| {
             let owner = a.owner();
@@ -1475,7 +1561,7 @@ impl DawServer {
         .await
     }
 
-    #[tool(description = "Add an automation lane (shown under the track) for volume, pan, mute or a plug-in parameter; returns its index (an existing lane for the same target is reused). Draw it with set_automation_points. Undoable.")]
+    #[tool(description = "Add an automation lane (shown under the track) for volume, pan, mute, a send level or a plug-in parameter; returns its index (an existing lane for the same target is reused). Draw it with set_automation_points. Undoable.")]
     async fn add_automation_lane(&self, Parameters(a): Parameters<AddLaneArgs>) -> ToolResult {
         self.with_engine(move |e| {
             let owner = a.owner.owner();
@@ -1495,7 +1581,7 @@ impl DawServer {
             for p in &a.points {
                 let value = match (p.value, p.db, p.pan, target) {
                     (Some(v), ..) => v,
-                    (None, Some(db), _, AutomationTarget::Volume) => target.from_units(db),
+                    (None, Some(db), _, AutomationTarget::Volume | AutomationTarget::Send { .. }) => target.from_units(db),
                     (None, _, Some(pan), AutomationTarget::Pan) => target.from_units(pan),
                     _ => anyhow::bail!("point at {} s needs a value (or db for volume, pan for pan lanes)", p.time),
                 };
@@ -1617,5 +1703,20 @@ mod compact_tests {
         assert_eq!(arg.output.unwrap().bus().unwrap(), None);
         let arg: UpdateTrackArgs = serde_json::from_value(json!({ "track": 0, "output": 1 })).unwrap();
         assert_eq!(arg.output.unwrap().bus().unwrap(), Some(1));
+    }
+
+    #[test]
+    fn project_json_lists_sends_and_send_lanes_resolve() {
+        let mut e = Engine::new();
+        e.add_track("Gtr").unwrap();
+        let (bus, _) = e.send_to_new_bus(0, "Reverb", Some("reverb"), db_to_gain(-6.0), true).unwrap();
+        let v = project_json(e.project(), false);
+        assert_eq!(v["tracks"][0]["sends"], json!([{ "send": 0, "bus": bus, "level_db": -6.0, "pre_fader": true, "mute": false }]));
+        assert!(v["tracks"][1].get("sends").is_none());
+        let args: AddLaneArgs = serde_json::from_value(json!({ "track": 0, "parameter": "send", "send": 0 })).unwrap();
+        let target = resolve_target(&e, Some(0), &args.target).unwrap();
+        let lane = e.add_lane(Some(0), target).unwrap();
+        assert_eq!(lane_json(&e, Some(0), lane).unwrap()["target"], json!({ "parameter": "send", "send": 0 }));
+        assert_eq!(lane_json(&e, Some(0), lane).unwrap()["name"], json!("Send to Reverb"));
     }
 }
