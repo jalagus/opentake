@@ -84,139 +84,35 @@ cargo build --release
 
 Options: `--project song.rpp` (open on start), `--no-input` (output only), `--no-mcp` (GUI without
 MCP server), `--http ADDR`, `--start-audio` (headless), `--plugin-path DIR` (repeatable).
-Logs go to stderr; set `RUST_LOG=debug` for more.
+Logs go to stderr; set `RUST_LOG=debug` for more. Settings (VST3 scan folders, recent projects)
+live in `~/Library/Application Support/OpenTake/settings.json` (the platform config dir
+elsewhere); set `OPENTAKE_CONFIG_DIR` to keep them somewhere else.
 
 ### GUI
 
-A dark, Logic Pro–inspired interface. The GUI and the MCP server share one engine in one
-process, so anything an agent does (adding tracks, inserting plugins, moving regions,
-recording) appears live in the window and vice versa.
+![OpenTake: arrangement with tracks, regions, cycle range and the mixer](assets/screenshots/arrange.png)
 
-- **Project files**: OpenTake saves `.otp` files (OpenTake Project; JSON inside). On macOS
-  the app registers the type, so double-clicking an `.otp` (or using Open With on a `.gp` or
-  `.rpp`) opens it in OpenTake; on other systems use Open With, or `opentake song.otp`.
-- **Recent projects**: the app reopens the last project on start (unless `--project` is
-  given) and lists recent projects under File → Open Recent (with Clear Menu). Projects
-  opened or saved by an agent are added too; missing files drop off the list.
-- **Menus**: on macOS, native menus in the system menu bar — File (New ⌘N, Open ⌘O, Open Recent,
-  Save ⌘S, Save As ⇧⌘S, Import Audio ⇧⌘I), Edit (Undo ⌘Z, Redo ⇧⌘Z, Copy / Paste / Duplicate ⌘D Region,
-  Split at Playhead ⌘T, Delete Region, Snap to Grid ⌘G), Track (New Audio Track ⌥⌘N, Delete), Transport,
-  View, Audio (Settings ⌘,), Plug-ins, Window and Help (how to connect an agent). On other
-  platforms the same menus appear as an in-window menu bar.
-- **Control bar**: inspector toggle on the left; a centered Logic-style transport (go to
-  start, back/forward one bar, stop, play, record), an LCD with bar·beat·division, clock
-  time, tempo and signature at the playhead (drag the tempo to change that section, Shift =
-  fine) — its light pulses on each beat —
-  and the metronome button; audio status, MCP status and audio settings on the right.
-- **Metronome**: click with an accented downbeat that follows the tempo map.
-  Toggle with the button next to the LCD, Transport → Metronome or **K**; right-click the
-  button for its volume and the **count-in** (off, 1, 2 or 4 bars before recording, and
-  optionally before playback — also in the Transport menu). The count-in clicks even with
-  the metronome off, and the display shows COUNT-IN. The click isn't recorded and doesn't
-  go through the master fader; settings are saved with the project.
-- **Tempo map**: the **Tempo** row under the ruler shows the tempo changes. Drag a section
-  up/down to change its tempo (Shift = fine), drag a change sideways to move it, double-click
-  to add one, right-click to type a tempo, set a time signature, add or delete changes. Bars,
-  the grid, snapping, the metronome and plug-ins follow it; time-signature changes appear in
-  the ruler. Region and note times stay in seconds.
-- **Playback** stops by itself after the last region (not while recording or cycling).
-- **Tracks**: numbered headers with the track colour, Logic-style **M S R I** buttons
-  (mute, solo, record enable, input monitoring), a volume fader (double-click = 0 dB),
-  a pan knob (drag vertically, double-click = center) and a level meter.
-- **Regions**: track-coloured regions with waveforms. Click to select, Shift-click to add,
-  or drag a rectangle on empty lane space to select several (across tracks). Dragging
-  moves every selected region (also across tracks), drag a left/right edge to trim (the
-  audio stays in place), ⌫ deletes the selection.
-  **⌘-drag** drops copies and leaves the originals; ⌘C / ⌘V copy the selection and paste
-  it at the playhead (keeping its layout across tracks); ⌘D duplicates it right after itself.
-- **Cycle (loop)**: drag in the top strip of the ruler to set the cycle range (it turns
-  cycling on), drag the yellow bar to move it or its edges to resize, click it to toggle.
-  The Cycle button in the transport and **C** toggle it too (a 4-bar range is created at the
-  playhead if none exists). Playback wraps sample-accurately; cycling pauses while recording.
-  Split with the scissors tool (click where to cut), ⌘T (split at the playhead) or
-  right-click → Split Here / Split at Playhead. Click the ruler or a lane to move the
-  playhead. Zoom horizontally with the slider at the right end of the ruler, ⌘→ / ⌘←,
-  ⌘ + scroll or a pinch; Z zooms to fit the selected regions (or the whole song);
-  horizontal scroll pans. The piano roll and tablature share the same zoom and scroll, so
-  they always line up with the arrangement. Drop WAV files onto a lane, or onto the empty
-  area to create a track. Delete a track with the × in its header (on hover), right-click →
-  Delete Track, ⌘⌫, or ⌫ when no regions are selected.
-- **Snap**: Off, Smart (follows zoom), Bar, Beat, 1/8, 1/16, 1/32 — applies to moving,
-  trimming, splitting and the playhead; the grid shows the active resolution. ⌘G toggles
-  snapping, hold Alt to bypass it temporarily.
-- New projects start with one empty audio track.
-- **Inspector** (I): channel strips for the selected track and Stereo Out — input (or
-  instrument), Audio FX slots (power = bypass, click name = open plug-in window, × = remove,
-  + = add the built-in EQ or a scanned VST3), pan, dB/peak readouts, fader and stereo meter.
-  Stereo Out has its own Audio FX slots for the master bus.
-- **EQ** (built-in **OpenTake EQ**): low cut, low shelf, two bells, high shelf, high cut and
-  output gain. Every band has a Q (how tight: bell width, shelf knee, cut resonance) and the
-  cuts have a 12/24/48 dB/oct slope. Its window shows the response curve over a live
-  analyzer of the audio going in (grey) and coming out (teal): drag a band's point to set
-  frequency and gain, scroll on it for Q, double-click it to switch the band on/off; knobs
-  below for exact values. Each drag is one undo step.
-- **Compressor** (built-in **OpenTake Compressor**): threshold, ratio, knee, attack, release,
-  makeup and mix (for parallel compression). The editor shows the transfer curve with the
-  current level on it, and input, gain-reduction and output meters.
-- **Limiter** (built-in **OpenTake Limiter**): a brickwall limiter with 1.5 ms look-ahead —
-  gain, ceiling (peaks never go above it) and release. Put it last on the master to set the
-  final loudness without clipping.
-- **Delay** (built-in **OpenTake Delay**): time in ms or synced to the tempo map (1/32 to 1/1,
-  dotted and triplet), feedback, mix, low and high cuts on the repeats, ping-pong.
-- **Export Audio** (File → Export Audio…, ⇧⌘E): the full mix and/or one stem per audible track,
-  as WAV (16-bit with dither, 24-bit or 32-bit float) or FLAC (16/24-bit), at 44.1–192 kHz,
-  for the whole song or the cycle range, with a tail for delay repeats. It renders offline in
-  the background (a 4-minute song with stems takes a few seconds) with every instrument,
-  effect, fader and master setting, VST3s included. Stems go in a "<name> - Stems" folder next
-  to the mix file; the status bar reports when it's done and warns about clipping.
-- **Plug-in delay compensation**: plug-ins that delay audio (the limiter's look-ahead, VST3s
-  that report latency) are compensated automatically — tracks and the master stay in time
-  with each other and the playhead, also across cycle loops. The status bar shows the delay
-  being compensated; live input monitoring is delayed by that much.
-- **Mixer** (X): every track's channel strip side by side, Stereo Out pinned on the right,
-  in the editor area below the tracks.
-- **Instrument tracks & MIDI**: create one from the "+" above the track list or
-  Track → New Instrument Track… (the built-in **OpenTake Synth** or any VST3 instrument).
-  Double-click an instrument lane to create a one-bar MIDI region; MIDI regions move, copy,
-  split, resize (end edge) and delete like audio regions. Right-click the instrument slot to
-  change instruments.
-- **Guitar Pro import**: File → Import Guitar Pro… (or drop a `.gp` file on the window).
-  Pick the tracks to import and the instrument (built-in synth or any VST3 instrument, with a
-  separate choice for drums — they use the General MIDI drum map and default to the built-in
-  **OpenTake Drums** kit, a small synthesised GM kit for previewing drum parts). Each Guitar Pro track
-  becomes an instrument track with one MIDI region; repeats and alternate endings, tempo
-  changes, ties, tuplets, triplet feel, let ring, tremolo picking, grace notes and strums are
-  applied. The song's tempo map (tempo and time-signature changes) can be adopted as the
-  project's, so the bars, grid and metronome match the song. One undo step. If you don't
-  adopt it, the song's tempo still shows in the tablature view and in the transport display
-  (orange "SONG TEMPO") while the song plays.
-- **Tablature** (T, or View → Tablature): the imported tabs and/or standard notation (choose
-  Tab, Notes or Notes + Tab), under the arrangement and drawn on the same timeline, so you can
-  read along while you record or play. Notation is written an octave up (treble 8vb, or bass
-  clef for basses) and spaced by time like the tab. Bars, sections, time
-  signatures and fret numbers line up with the regions and scroll and zoom with them; the
-  notes under the playhead light up. Pick the guitar/bass track at the top, click to move the
-  playhead. It opens by itself after a Guitar Pro import. Notes you edit in the piano roll
-  are placed on the lowest playable fret. **A− / A+** change the size and **Paper** shows it
-  as dark ink on a white page; both are remembered.
-- **Piano roll** (P, or double-click a MIDI region): double-click to add a note, drag to
-  move (time and pitch), drag the right edge to resize, Shift-click to multi-select,
-  drag a rectangle on empty space to select several, ⌘-drag to copy notes, ⌫ deletes notes,
-  click the keyboard to audition; velocity and Quantize in the toolbar.
-- **Undo / Redo** (⌘Z / ⇧⌘Z): every edit — including ones made by an agent over MCP — is
-  undoable; the Edit menu names the step ("Undo Move Region"). Fader drags count as one step.
-- **Plug-in windows**: floating windows with the plug-in's parameters.
-- **Plug-in Manager** (Plug-ins → Plug-in Manager…, or from the Add effect popup): add or
-  remove VST3 scan folders, restore the defaults, rescan, and see found plug-ins and
-  bundles that failed to load. Folders are saved in
-  `~/Library/Application Support/OpenTake/settings.json` (platform config dir elsewhere);
-  `--plugin-path` adds folders for a single run. Set `OPENTAKE_CONFIG_DIR` to keep settings
-  (scan folders, recent projects) somewhere else.
-- **Shortcuts**: Space = play/stop, R = record, C = cycle, K = metronome, Home = go to start, I = inspector,
-  X = mixer, P = piano roll, T = tablature, Z = zoom to fit, ⌘→ / ⌘← = zoom in / out,
-  ⌘⌫ = delete track, ⌘Z / ⇧⌘Z = undo / redo,
-  ⌘C / ⌘V / ⌘D = copy / paste / duplicate region, ⌘T = split, ⌘G = snap, ⌫ = delete
-  region, Esc = pointer tool. (⌘C/⌘V act on regions only while no text field is focused.)
+<p>
+  <img src="assets/screenshots/tablature.png" alt="Guitar Pro import shown as notation and tablature under the arrangement" width="49%">
+  <img src="assets/screenshots/eq.png" alt="The built-in EQ with its live analyzer on the master bus" width="49%">
+</p>
+
+A dark, Logic Pro–inspired interface. The GUI and the MCP server share one engine, so
+whatever an agent does appears live in the window, and everything you do is visible to the
+agent.
+
+- **Record and arrange**: audio and instrument tracks; move, trim, split, copy and loop regions
+  with snapping; tempo and time-signature changes; a metronome with count-in.
+- **MIDI**: a built-in synth and drum kit or any VST3 instrument, edited in the piano roll.
+- **Guitar Pro import**: drop a `.gp` file to get one instrument track per part, the song's
+  tempo map, and tablature or notation that scrolls along with the arrangement (**T**).
+- **Mix**: an inspector and a mixer (**I**, **X**), plus built-in EQ, compressor, limiter and
+  delay alongside VST3 effects. Plug-in latency is compensated automatically.
+- **Export**: the mix and stems as WAV or FLAC (File → Export Audio…, ⇧⌘E).
+- **Undo everything**: ⌘Z / ⇧⌘Z, including edits made by an agent.
+
+Projects save as `.otp` (JSON), and the last one reopens on start. Space plays, R records and
+C toggles the cycle; the menus list every other shortcut.
 
 ### Connect an agent
 
@@ -307,7 +203,7 @@ back on export, but they aren't applied to the loaded plugin.
 
 ```sh
 cargo test                     # unit tests + headless GUI interaction tests (egui_kittest)
-OPENTAKE_SCREENSHOT=/tmp/ui.png cargo test -p opentake render_screenshot -- --ignored   # render the GUI to a PNG
+OPENTAKE_SCREENSHOT=/tmp/ui.png cargo test -p opentake render_screenshot -- --ignored   # render the GUI to PNGs (README screenshots)
 ```
 
 ## License

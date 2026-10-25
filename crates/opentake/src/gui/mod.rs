@@ -2792,11 +2792,8 @@ mod tests {
             e.split_clip(1, 0, 3.27).unwrap();
             e.trim_clip(1, 1, Some(3.8), None).unwrap();
             e.update_track(1, TrackUpdate { volume: Some(0.6), pan: Some(-0.25), ..Default::default() }).unwrap();
-            e.scan_plugins();
-            let plugin = e.scanned_plugins().first().map(|p| p.bundle.to_string_lossy().into_owned());
-            if let Some(p) = plugin {
-                e.insert_plugin(1, &p, None).unwrap();
-            }
+            // A built-in effect, so the shot doesn't depend on the VST3s installed here.
+            e.insert_plugin(1, "comp", None).unwrap();
             // Instrument track with a chord progression.
             let keys = e.add_instrument_track("Keys", "synth").unwrap();
             let beat = 60.0 / 110.0;
