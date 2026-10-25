@@ -101,6 +101,10 @@ jobs:
     needs: build
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    # One publish at a time; a newer push supersedes a pending one.
+    concurrency:
+      group: publish-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -116,17 +120,14 @@ jobs:
           files: dist/*
           generate_release_notes: true
 
-      # Every push to main refreshes the rolling "nightly" pre-release.
-      - name: Move nightly tag
-        if: github.ref == 'refs/heads/main'
-        run: |
-          git tag -f nightly
-          git push -f origin nightly
+      # Every push to main refreshes the rolling "nightly" pre-release. The tag is created
+      # through the Releases API (pushing it with git is refused when a commit touches
+      # workflow files).
       - name: Nightly release
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete nightly --yes || true
-          gh release create nightly dist/* --prerelease --title "Nightly build" \
-            --notes "Latest build from main ($(git rev-parse --short HEAD)). Unsigned; see the README for how to open it."
+          gh release delete nightly --yes --cleanup-tag || true
+          gh release create nightly dist/* --target "$GITHUB_SHA" --prerelease --title "Nightly build" \
+            --notes "Latest build from main (${GITHUB_SHA::7}). Unsigned; see the README for how to open it."
