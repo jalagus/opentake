@@ -72,11 +72,11 @@ jobs:
           mkdir -p dist
           case "${{ runner.os }}" in
             Linux)
-              mkdir -p stage/opentake && cp "$bin/opentake" README.md stage/opentake/
+              mkdir -p stage/opentake && cp "$bin/opentake" README.md LICENSE stage/opentake/
               tar -C stage -czf "dist/${{ matrix.asset }}" opentake
               ;;
             Windows)
-              mkdir -p stage/opentake && cp "$bin/opentake.exe" README.md stage/opentake/
+              mkdir -p stage/opentake && cp "$bin/opentake.exe" README.md LICENSE stage/opentake/
               (cd stage && 7z a -tzip "../dist/${{ matrix.asset }}" opentake)
               ;;
             macOS)

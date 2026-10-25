@@ -239,3 +239,7 @@ back on export, but they aren't applied to the loaded plugin.
 cargo test                     # unit tests + headless GUI interaction tests (egui_kittest)
 OPENTAKE_SCREENSHOT=/tmp/ui.png cargo test -p opentake render_screenshot -- --ignored   # render the GUI to a PNG
 ```
+
+## License
+
+OpenTake is released under the [MIT License](LICENSE).
