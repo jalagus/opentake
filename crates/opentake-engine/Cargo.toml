@@ -1,0 +1,18 @@
+[package]
+name = "opentake-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opentake-vst3.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+cpal.workspace = true
+hound.workspace = true
+rtrb.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+opentake-project.workspace = true
+serde_json.workspace = true

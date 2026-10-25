@@ -1,0 +1,36 @@
+[package]
+name = "opentake"
+description = "OpenTake — an open-source DAW you can drive with AI agents over MCP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "opentake"
+path = "src/main.rs"
+
+[dependencies]
+opentake-engine.workspace = true
+opentake-vst3.workspace = true
+opentake-project.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+tokio.workspace = true
+rmcp.workspace = true
+axum.workspace = true
+clap.workspace = true
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+hound.workspace = true
+egui_kittest = { version = "0.37", features = ["eframe", "wgpu", "snapshot"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.21", default-features = false }

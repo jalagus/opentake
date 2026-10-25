@@ -1,0 +1,131 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: opentake-linux-x86_64.tar.gz
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: opentake-windows-x86_64.zip
+          - name: macOS Apple Silicon
+            os: macos-14
+            target: aarch64-apple-darwin
+            asset: opentake-macos-arm64.zip
+          - name: macOS Intel
+            os: macos-14
+            target: x86_64-apple-darwin
+            asset: opentake-macos-x86_64.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Test
+        # Cross-compiled targets (Intel macOS on an Apple Silicon runner) are built, not run.
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked -p opentake --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          bin=target/${{ matrix.target }}/release
+          mkdir -p dist
+          case "${{ runner.os }}" in
+            Linux)
+              mkdir -p stage/opentake && cp "$bin/opentake" README.md stage/opentake/
+              tar -C stage -czf "dist/${{ matrix.asset }}" opentake
+              ;;
+            Windows)
+              mkdir -p stage/opentake && cp "$bin/opentake.exe" README.md stage/opentake/
+              (cd stage && 7z a -tzip "../dist/${{ matrix.asset }}" opentake)
+              ;;
+            macOS)
+              app=stage/OpenTake.app/Contents
+              mkdir -p "$app/MacOS"
+              cp "$bin/opentake" "$app/MacOS/opentake"
+              sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Info.plist"
+              # Ad-hoc signature so Apple Silicon will launch it (not notarized).
+              codesign --force --deep --sign - stage/OpenTake.app
+              (cd stage && ditto -c -k --keepParent OpenTake.app "../dist/${{ matrix.asset }}")
+              ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  release:
+    name: Publish
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Tags (v1.2.3) become versioned releases.
+      - name: Versioned release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+      # Every push to main refreshes the rolling "nightly" pre-release.
+      - name: Move nightly tag
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git tag -f nightly
+          git push -f origin nightly
+      - name: Nightly release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --yes || true
+          gh release create nightly dist/* --prerelease --title "Nightly build" \
+            --notes "Latest build from main ($(git rev-parse --short HEAD)). Unsigned; see the README for how to open it."

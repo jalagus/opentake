@@ -1,0 +1,13 @@
+[package]
+name = "opentake-vst3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+vst3.workspace = true
+libloading.workspace = true
+serde.workspace = true

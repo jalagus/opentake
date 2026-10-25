@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<GPIF>
+<GPVersion>7.6.0</GPVersion>
+<Score>
+<Title><![CDATA[Fixture Song]]></Title>
+<Artist><![CDATA[Test & Band]]></Artist>
+<Album><![CDATA[]]></Album>
+</Score>
+<MasterTrack>
+<Tracks>0 1</Tracks>
+<Automations>
+<Automation><Type>Tempo</Type><Linear>false</Linear><Bar>0</Bar><Position>0</Position><Visible>true</Visible><Value>120 2</Value></Automation>
+<Automation><Type>Tempo</Type><Linear>false</Linear><Bar>3</Bar><Position>0</Position><Visible>true</Visible><Value>60 2</Value></Automation>
+</Automations>
+</MasterTrack>
+<Tracks>
+<Track id="0">
+<Name><![CDATA[Guitar]]></Name>
+<ShortName><![CDATA[gtr]]></ShortName>
+<Color>255 0 0</Color>
+<InstrumentSet><Name>Electric Guitar</Name><Type>electricGuitar</Type><LineCount>5</LineCount></InstrumentSet>
+<Sounds><Sound><Name>Distortion</Name><MIDI><LSB>0</LSB><MSB>0</MSB><Program>30</Program></MIDI></Sound></Sounds>
+<Staves><Staff><Properties>
+<Property name="CapoFret"><Fret>0</Fret></Property>
+<Property name="Tuning"><Pitches>40 45 50 55 59 64</Pitches></Property>
+<Name>Standard</Name>
+</Properties></Staff></Staves>
+</Track>
+<Track id="1">
+<Name><![CDATA[Drums]]></Name>
+<ShortName><![CDATA[drm]]></ShortName>
+<Color>0 0 255</Color>
+<InstrumentSet><Name>Drums</Name><Type>drumKit</Type><LineCount>5</LineCount></InstrumentSet>
+<Sounds><Sound><MIDI><Program>0</Program></MIDI></Sound></Sounds>
+<Staves><Staff><Properties><Property name="Tuning"><Pitches>0 0 0 0 0 0 0</Pitches></Property></Properties></Staff></Staves>
+</Track>
+</Tracks>
+<MasterBars>
+<MasterBar><Time>4/4</Time><Repeat start="true" end="false" count="0"/><Section><Letter><![CDATA[A]]></Letter><Text><![CDATA[Intro]]></Text></Section><Bars>0 4</Bars></MasterBar>
+<MasterBar><Time>4/4</Time><Repeat start="false" end="true" count="2"/><AlternateEndings>1</AlternateEndings><Bars>1 5</Bars></MasterBar>
+<MasterBar><Time>4/4</Time><AlternateEndings>2</AlternateEndings><Bars>2 5</Bars></MasterBar>
+<MasterBar><Time>4/4</Time><TripletFeel>Triplet8th</TripletFeel><Bars>3 5</Bars></MasterBar>
+</MasterBars>
+<Bars>
+<Bar id="0"><Clef>G2</Clef><Voices>0 -1 -1 -1</Voices></Bar>
+<Bar id="1"><Clef>G2</Clef><Voices>1 -1 -1 -1</Voices></Bar>
+<Bar id="2"><Clef>G2</Clef><Voices>2 -1 -1 -1</Voices></Bar>
+<Bar id="3"><Clef>G2</Clef><Voices>3 -1 -1 -1</Voices></Bar>
+<Bar id="4"><Clef>Neutral</Clef><Voices>4 -1 -1 -1</Voices></Bar>
+<Bar id="5"><Clef>Neutral</Clef><Voices>-1 -1 -1 -1</Voices></Bar>
+</Bars>
+<Voices>
+<Voice id="0"><Beats>0 1</Beats></Voice>
+<Voice id="1"><Beats>2</Beats></Voice>
+<Voice id="2"><Beats>3 3 3 4</Beats></Voice>
+<Voice id="3"><Beats>5</Beats></Voice>
+<Voice id="4"><Beats>6 7</Beats></Voice>
+</Voices>
+<Beats>
+<Beat id="0"><Dynamic>MF</Dynamic><Rhythm ref="1"/><Notes>0</Notes></Beat>
+<Beat id="1"><Dynamic>MF</Dynamic><Rhythm ref="1"/><Notes>1</Notes></Beat>
+<Beat id="2"><Dynamic>MF</Dynamic><Rhythm ref="0"/></Beat>
+<Beat id="3"><Dynamic>F</Dynamic><Rhythm ref="2"/><Notes>2</Notes></Beat>
+<Beat id="4"><Dynamic>MF</Dynamic><Rhythm ref="3"/><Notes>3</Notes></Beat>
+<Beat id="5"><Dynamic>MF</Dynamic><Rhythm ref="0"/><Notes>4</Notes></Beat>
+<Beat id="6"><Dynamic>MF</Dynamic><Rhythm ref="4"/><Notes>5</Notes></Beat>
+<Beat id="7"><Dynamic>MF</Dynamic><Rhythm ref="3"/></Beat>
+</Beats>
+<Notes>
+<Note id="0"><Tie origin="true" destination="false"/><Properties><Property name="Fret"><Fret>5</Fret></Property><Property name="String"><String>0</String></Property><Property name="Midi"><Number>45</Number></Property><Property name="PalmMuted"><Enable/></Property></Properties></Note>
+<Note id="1"><Tie origin="false" destination="true"/><Properties><Property name="Fret"><Fret>5</Fret></Property><Property name="String"><String>0</String></Property><Property name="Midi"><Number>45</Number></Property></Properties></Note>
+<Note id="2"><Properties><Property name="Fret"><Fret>7</Fret></Property><Property name="String"><String>1</String></Property><Property name="HopoOrigin"><Enable/></Property></Properties></Note>
+<Note id="3"><Properties><Property name="Fret"><Fret>2</Fret></Property><Property name="String"><String>3</String></Property><Property name="Midi"><Number>57</Number></Property><Property name="Bended"><Enable/></Property><Property name="BendOriginValue"><Float>0</Float></Property><Property name="BendDestinationValue"><Float>100</Float></Property></Properties></Note>
+<Note id="4"><LetRing/><Vibrato>Wide</Vibrato><Properties><Property name="Fret"><Fret>0</Fret></Property><Property name="String"><String>5</String></Property><Property name="Midi"><Number>64</Number></Property></Properties></Note>
+<Note id="5"><Properties><Property name="Fret"><Fret>36</Fret></Property><Property name="String"><String>1</String></Property><Property name="Midi"><Number>36</Number></Property></Properties></Note>
+</Notes>
+<Rhythms>
+<Rhythm id="0"><NoteValue>Whole</NoteValue></Rhythm>
+<Rhythm id="1"><NoteValue>Half</NoteValue></Rhythm>
+<Rhythm id="2"><NoteValue>Eighth</NoteValue><PrimaryTuplet num="3" den="2"/></Rhythm>
+<Rhythm id="3"><NoteValue>Half</NoteValue><AugmentationDot count="1"/></Rhythm>
+<Rhythm id="4"><NoteValue>Quarter</NoteValue></Rhythm>
+</Rhythms>
+</GPIF>
