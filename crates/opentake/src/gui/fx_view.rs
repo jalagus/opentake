@@ -1,12 +1,13 @@
-//! Editors for the built-in compressor, limiter and delay: knobs for every parameter, plus
-//! a transfer curve and gain-reduction meter (compressor), meters (limiter) and tempo-synced
-//! note values (delay).
+//! Editors for the built-in compressor, multiband compressor, limiter and delay: knobs for
+//! every parameter, plus a transfer curve and gain-reduction meter (compressor), the bands
+//! with draggable crossovers (multiband), meters (limiter) and tempo-synced note values (delay).
 
 use std::sync::Arc;
 
 use eframe::egui;
 use egui::{Align2, Color32, FontId, Rect, RichText, Sense, Shape, Stroke, pos2, vec2};
 use opentake_engine::delay;
+use opentake_engine::multiband::{self, MultibandMeter};
 use opentake_engine::dynamics::{self, CompSettings, GainMeter, comp, limiter};
 use opentake_engine::{ParamView, SlotRef};
 
@@ -16,6 +17,7 @@ use super::{Action, DawApp, theme, widgets};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Compressor,
+    Multiband,
     Limiter,
     Delay,
 }
@@ -24,6 +26,7 @@ impl Kind {
     pub fn of(path: &str) -> Option<Self> {
         match path {
             comp::PATH => Some(Kind::Compressor),
+            multiband::PATH => Some(Kind::Multiband),
             limiter::PATH => Some(Kind::Limiter),
             delay::PATH => Some(Kind::Delay),
             _ => None,
@@ -32,16 +35,19 @@ impl Kind {
 
     pub fn window_size(self) -> [f32; 2] {
         match self {
-            Kind::Compressor => [600.0, 330.0],
-            Kind::Limiter => [420.0, 300.0],
+            Kind::Compressor => [600.0, 430.0],
+            Kind::Multiband => [760.0, 470.0],
+            Kind::Limiter => [420.0, 400.0],
             Kind::Delay => [560.0, 250.0],
         }
     }
 }
 
-pub fn show(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, kind: Kind, params: &[ParamView], meter: Option<&Arc<GainMeter>>, bpm: f64) {
+#[allow(clippy::too_many_arguments)]
+pub fn show(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, kind: Kind, params: &[ParamView], meter: Option<&Arc<GainMeter>>, bands: Option<&Arc<MultibandMeter>>, bpm: f64) {
     match kind {
         Kind::Compressor => compressor(app, ui, t, s, params, meter),
+        Kind::Multiband => multiband_view(app, ui, t, s, params, bands),
         Kind::Limiter => limiter_view(app, ui, t, s, params, meter),
         Kind::Delay => delay_view(app, ui, t, s, params, bpm),
     }
@@ -53,8 +59,12 @@ fn value(params: &[ParamView], id: u32) -> f64 {
 
 /// A labelled knob for one parameter (value shown under it).
 fn knob(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, p: &ParamView, bipolar: bool) {
+    knob_labeled(app, ui, t, s, p, &p.title, bipolar);
+}
+
+fn knob_labeled(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, p: &ParamView, label: &str, bipolar: bool) {
     ui.allocate_ui_with_layout(vec2(66.0, 86.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-        ui.label(RichText::new(p.title.to_uppercase()).size(9.0).color(theme::TEXT_FAINT).strong());
+        ui.label(RichText::new(label.to_uppercase()).size(9.0).color(theme::TEXT_FAINT).strong());
         let mut v = p.value as f32;
         let default = v;
         if widgets::knob(ui, &mut v, 0.0, 1.0, default, bipolar, 34.0, &p.title).changed() {
@@ -87,6 +97,53 @@ fn smoothed(ui: &egui::Ui, id: egui::Id, now: (f32, f32, f32)) -> (f32, f32, f32
     next
 }
 
+/// Scrolling history of gain reduction (orange, hanging from the top) over the input level
+/// (grey, from the bottom), so the editor shows what the dynamics did over the last seconds.
+fn history(ui: &mut egui::Ui, id: egui::Id, gr: f32, input_db: f32) {
+    const RATE: f64 = 30.0;
+    const LEN: usize = 120; // 4 s
+    let now = ui.input(|i| i.time);
+    let (mut last, mut points): (f64, std::collections::VecDeque<(f32, f32)>) = ui.data(|d| d.get_temp(id)).unwrap_or((now, Default::default()));
+    let steps = (((now - last) * RATE) as usize).min(LEN);
+    for _ in 0..steps {
+        points.push_back((gr.max(0.0), input_db));
+        if points.len() > LEN {
+            points.pop_front();
+        }
+    }
+    if steps > 0 {
+        last += steps as f64 / RATE;
+    }
+    ui.data_mut(|d| d.insert_temp(id, (last, points.clone())));
+
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 84.0), Sense::hover());
+    widgets::label(&resp, egui::Role::Image, "Gain Reduction History");
+    let p = ui.painter().with_clip_rect(rect);
+    p.rect_filled(rect, 6.0, theme::BG_DEEP);
+    // Gain reduction scale: 0 dB at the top, 12, 24 or 48 dB at the bottom (whichever fits).
+    let peak = points.iter().map(|p| p.0).fold(0.0f32, f32::max);
+    let range = [12.0f32, 24.0, 48.0].into_iter().find(|&r| peak <= r).unwrap_or(48.0);
+    for db in [3.0, 6.0, 12.0, 24.0].into_iter().filter(|&d| d < range) {
+        let y = rect.top() + db / range * rect.height();
+        p.hline(rect.x_range(), y, Stroke::new(1.0, theme::HAIRLINE));
+        p.text(pos2(rect.right() - 4.0, y), Align2::RIGHT_BOTTOM, format!("-{db:.0}"), FontId::proportional(9.0), theme::TEXT_FAINT);
+    }
+    let dx = rect.width() / (LEN - 1) as f32;
+    let x0 = rect.right() - (points.len().max(1) - 1) as f32 * dx;
+    for (i, &(g, inp)) in points.iter().enumerate() {
+        let x = x0 + i as f32 * dx;
+        let level = ((inp + 60.0) / 60.0).clamp(0.0, 1.0) * rect.height();
+        if level > 0.5 {
+            p.line_segment([pos2(x, rect.bottom()), pos2(x, rect.bottom() - level)], Stroke::new(dx + 0.5, Color32::from_white_alpha(28)));
+        }
+        let h = (g / range).clamp(0.0, 1.0) * rect.height();
+        if h > 0.5 {
+            p.line_segment([pos2(x, rect.top()), pos2(x, rect.top() + h)], Stroke::new(dx + 0.5, theme::with_alpha(theme::TEMPO, 190)));
+        }
+    }
+    p.text(rect.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, "GAIN REDUCTION", FontId::proportional(9.0), theme::TEXT_FAINT);
+}
+
 /// Vertical meter bar. `reduction` bars grow downward from the top in orange.
 fn bar(ui: &mut egui::Ui, label: &str, db: f32, reduction: bool) {
     ui.allocate_ui_with_layout(vec2(34.0, 190.0), egui::Layout::top_down(egui::Align::Center), |ui| {
@@ -112,7 +169,8 @@ fn bar(ui: &mut egui::Ui, label: &str, db: f32, reduction: bool) {
 fn compressor(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params: &[ParamView], meter: Option<&Arc<GainMeter>>) {
     let values: Vec<(u32, f64)> = params.iter().map(|p| (p.id, p.value)).collect();
     let settings = CompSettings::from_params(&values);
-    let levels = smoothed(ui, ui.make_persistent_id(("comp_meter", t, s)), meter.map_or((0.0, -120.0, -120.0), |m| m.take()));
+    let raw = meter.map_or((0.0, -120.0, -120.0), |m| m.take());
+    let levels = smoothed(ui, ui.make_persistent_id(("comp_meter", t, s)), raw);
     ui.horizontal_top(|ui| {
         // Transfer curve: input level (x) to output level (y), -60..0 dB.
         let (rect, _) = ui.allocate_exact_size(vec2(170.0, 170.0), Sense::hover());
@@ -151,10 +209,107 @@ fn compressor(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params:
             knob_row(app, ui, t, s, params, &[comp::ATTACK, comp::RELEASE, comp::MAKEUP, comp::MIX]);
         });
     });
+    ui.add_space(8.0);
+    history(ui, ui.make_persistent_id(("comp_history", t, s)), raw.0, raw.1);
+}
+
+fn multiband_view(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params: &[ParamView], bands: Option<&Arc<MultibandMeter>>) {
+    use multiband::{BANDS, BAND_NAMES, HIGH_CROSSOVER, LOW_CROSSOVER, band_param};
+    let values: Vec<(u32, f64)> = params.iter().map(|p| (p.id, p.value)).collect();
+    let settings = multiband::Settings::from_params(&values);
+    let none = (0.0, -120.0, -120.0);
+    let levels: [(f32, f32, f32); BANDS] =
+        std::array::from_fn(|b| smoothed(ui, ui.make_persistent_id(("mb_meter", t, s, b)), bands.map_or(none, |m| m.bands[b].take())));
+    let total = smoothed(ui, ui.make_persistent_id(("mb_total", t, s)), bands.map_or(none, |m| m.total.take()));
+    let color = |b: usize| [theme::TEMPO, theme::ACCENT, Color32::from_rgb(170, 120, 255)][b];
+
+    // The spectrum split into bands: gain reduction hangs from the top of each, and the
+    // crossovers can be dragged.
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 120.0), Sense::hover());
+    let p = ui.painter().with_clip_rect(rect);
+    p.rect_filled(rect, 6.0, theme::BG_DEEP);
+    let x_of = |hz: f64| rect.left() + ((hz / 20.0).ln() / 1000f64.ln()) as f32 * rect.width();
+    let hz_of = |x: f32| 20.0 * 1000f64.powf(((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64);
+    for hz in [50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10_000.0] {
+        p.vline(x_of(hz), rect.y_range(), Stroke::new(1.0, theme::HAIRLINE));
+        let label = if hz >= 1000.0 { format!("{}k", hz / 1000.0) } else { format!("{hz}") };
+        p.text(pos2(x_of(hz) + 3.0, rect.bottom() - 3.0), Align2::LEFT_BOTTOM, label, FontId::proportional(9.0), theme::TEXT_FAINT);
+    }
+    let edges = [20.0, settings.low_hz, settings.high_hz, 20_000.0];
+    let any_solo = settings.bands.iter().any(|b| b.solo);
+    for b in 0..BANDS {
+        let band = Rect::from_x_y_ranges(x_of(edges[b])..=x_of(edges[b + 1]), rect.y_range());
+        let live = !(any_solo && !settings.bands[b].solo);
+        p.rect_filled(band.shrink2(vec2(1.0, 0.0)), 0.0, theme::with_alpha(color(b), if live { 34 } else { 10 }));
+        let gr = levels[b].0;
+        let h = (gr / 24.0).clamp(0.0, 1.0) * rect.height();
+        p.rect_filled(Rect::from_min_size(band.min + vec2(1.0, 0.0), vec2(band.width() - 2.0, h)), 0.0, theme::with_alpha(color(b), 150));
+        let text = if settings.bands[b].bypass { format!("{} · bypassed", BAND_NAMES[b]) } else { format!("{} -{:.1} dB", BAND_NAMES[b], gr.max(0.0)) };
+        p.text(pos2(band.center().x, rect.top() + 14.0), Align2::CENTER_CENTER, text, FontId::proportional(10.5), Color32::WHITE);
+    }
+    for (id, hz) in [(LOW_CROSSOVER, settings.low_hz), (HIGH_CROSSOVER, settings.high_hz)] {
+        let x = x_of(hz);
+        let handle = Rect::from_center_size(pos2(x, rect.center().y), vec2(10.0, rect.height()));
+        let r = ui.interact(handle, ui.make_persistent_id(("mb_x", t, s, id)), Sense::drag());
+        widgets::label(&r, egui::Role::Slider, if id == LOW_CROSSOVER { "Low Crossover" } else { "High Crossover" });
+        let hot = r.hovered() || r.dragged();
+        if hot {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        p.vline(x, rect.y_range(), Stroke::new(if hot { 2.0 } else { 1.5 }, Color32::WHITE));
+        p.circle_filled(pos2(x, rect.center().y), 4.0, Color32::WHITE);
+        p.text(pos2(x + 6.0, rect.center().y + 6.0), Align2::LEFT_TOP, multiband::display(id, multiband::norm_crossover(id, hz)), FontId::proportional(10.0), Color32::WHITE);
+        if r.dragged() {
+            if let Some(pos) = r.interact_pointer_pos() {
+                app.act(Action::SetParam(t, s, id, multiband::norm_crossover(id, hz_of(pos.x))));
+            }
+        }
+    }
+
+    ui.add_space(8.0);
+    ui.horizontal_top(|ui| {
+        for b in 0..BANDS {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(BAND_NAMES[b].to_uppercase()).strong().color(color(b)));
+                    let band = settings.bands[b];
+                    let (bypass, solo) = (band_param(b, multiband::BYPASS), band_param(b, multiband::SOLO));
+                    if widgets::chip(ui, band.bypass, "BYP", theme::TEXT_DIM, &format!("Bypass {}", BAND_NAMES[b]), vec2(34.0, 18.0)).clicked() {
+                        app.act(Action::SetParam(t, s, bypass, if band.bypass { 0.0 } else { 1.0 }));
+                    }
+                    if widgets::chip(ui, band.solo, "S", theme::SOLO, &format!("Solo {}", BAND_NAMES[b]), vec2(22.0, 18.0)).clicked() {
+                        app.act(Action::SetParam(t, s, solo, if band.solo { 0.0 } else { 1.0 }));
+                    }
+                });
+                for row in [[multiband::THRESHOLD, multiband::RATIO, multiband::GAIN].as_slice(), &[multiband::ATTACK, multiband::RELEASE]] {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        for &offset in row {
+                            if let Some(p) = params.iter().find(|p| p.id == band_param(b, offset)) {
+                                let label = p.title.split_once(' ').map_or(p.title.as_str(), |(_, rest)| rest);
+                                knob_labeled(app, ui, t, s, p, label, offset == multiband::GAIN);
+                            }
+                        }
+                    });
+                }
+            });
+            ui.add_space(6.0);
+        }
+        ui.vertical(|ui| {
+            if let Some(p) = params.iter().find(|p| p.id == multiband::OUTPUT) {
+                knob(app, ui, t, s, p, true);
+            }
+            ui.horizontal_top(|ui| {
+                bar(ui, "IN", total.1, false);
+                bar(ui, "OUT", total.2, false);
+            });
+        });
+    });
 }
 
 fn limiter_view(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params: &[ParamView], meter: Option<&Arc<GainMeter>>) {
-    let levels = smoothed(ui, ui.make_persistent_id(("limiter_meter", t, s)), meter.map_or((0.0, -120.0, -120.0), |m| m.take()));
+    let raw = meter.map_or((0.0, -120.0, -120.0), |m| m.take());
+    let levels = smoothed(ui, ui.make_persistent_id(("limiter_meter", t, s)), raw);
     ui.horizontal_top(|ui| {
         bar(ui, "IN", levels.1, false);
         bar(ui, "GR", levels.0, true);
@@ -170,6 +325,8 @@ fn limiter_view(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, param
             );
         });
     });
+    ui.add_space(8.0);
+    history(ui, ui.make_persistent_id(("limiter_history", t, s)), raw.0, raw.1);
 }
 
 fn delay_view(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params: &[ParamView], bpm: f64) {

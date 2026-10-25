@@ -33,7 +33,7 @@ pub struct ExportOptions {
     pub sample_rate: u32,
     /// Where to write the full mix (the format's extension is added when missing).
     pub mix_path: Option<PathBuf>,
-    /// Folder for one file per track (audible tracks only).
+    /// Folder for one file per track (audible tracks reaching the master; a bus is one stem).
     pub stems_dir: Option<PathBuf>,
     /// Range in seconds; `None` = the whole song.
     pub range: Option<(f64, f64)>,
@@ -109,6 +109,9 @@ impl MixJob {
             None => (None, None),
         };
         let name = self.project_name().to_string();
+        // Stems are what reaches the master (tracks routed there, and buses as one stem with
+        // their effects), so together they make up the mix; tracks feeding a bus are in its stem.
+        let to_master: Vec<bool> = (0..self.project.tracks.len()).map(|i| self.project.output_of(i).is_none()).collect();
         let rendered = self.render(from, to, options.tail_secs);
         let sr = rendered.sample_rate;
         let mut files = Vec::new();
@@ -120,7 +123,7 @@ impl MixJob {
         if let Some(dir) = &options.stems_dir {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
             for (i, (track, audio, audible)) in rendered.tracks.iter().enumerate() {
-                if !audible || audio.iter().flatten().all(|v| v.abs() < 1e-7) {
+                if !audible || !to_master[i] || audio.iter().flatten().all(|v| v.abs() < 1e-7) {
                     continue;
                 }
                 let file = dir.join(format!("{:02} {}.{}", i + 1, file_safe(track), options.format.extension()));
@@ -274,6 +277,27 @@ mod tests {
         let only = ExportOptions { stems_dir: Some(dir.join("stems2")), ..Default::default() };
         let report = e.export_audio(&only).unwrap();
         assert_eq!(report.files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Bass"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_bus_is_one_stem_and_its_fader_shapes_the_mix() {
+        let dir = std::env::temp_dir().join(format!("opentake-export-bus-{}", std::process::id()));
+        let mut e = song();
+        let before = e.analyze_mix(None, None).unwrap().master.lufs;
+        let bus = e.create_bus_from(&[0, 1], "Band").unwrap();
+        let routed = e.analyze_mix(None, None).unwrap();
+        assert!((routed.master.lufs - before).abs() < 0.1, "a unity bus changes nothing");
+        assert_eq!(routed.tracks.len(), 3, "the bus is measured too");
+        e.update_track(bus, crate::TrackUpdate { volume: Some(0.5), ..Default::default() }).unwrap();
+        let quieter = e.analyze_mix(None, None).unwrap().master.lufs;
+        assert!((before - quieter - 6.0).abs() < 0.3, "{before} -> {quieter}");
+        // Soloing a source keeps its bus: half the band, still through the bus fader.
+        e.update_track(0, crate::TrackUpdate { solo: Some(true), ..Default::default() }).unwrap();
+        assert!(e.analyze_mix(None, None).unwrap().master.lufs < quieter - 0.5);
+
+        let report = e.export_audio(&ExportOptions { stems_dir: Some(dir.clone()), ..Default::default() }).unwrap();
+        assert_eq!(report.files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["Band"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

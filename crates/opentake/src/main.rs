@@ -33,12 +33,13 @@ struct Cli {
     #[arg(long, global = true)]
     no_mcp: bool,
 
-    /// Open this project (.otp, .rpp or .json) on startup.
+    /// Open this project (.otp, .rpp, .json, or one to import: .dawproject, .als, .fcpxml, .ardour) on startup.
     #[arg(long, global = true)]
     project: Option<PathBuf>,
 
-    /// A file to open: a project (.otp, .rpp, .json), or with the GUI a Guitar Pro song or
-    /// WAV to import (this is how "Open with" and file associations launch OpenTake).
+    /// A file to open: a project (.otp, .rpp, .json, .dawproject, .als, .fcpxml, .ardour), or
+    /// with the GUI a Guitar Pro song, MIDI file or WAV to import (this is how "Open with" and
+    /// file associations launch OpenTake).
     file: Option<PathBuf>,
 
     /// Start audio with default devices on startup.
@@ -63,7 +64,7 @@ enum Cmd {
     Serve,
     /// Print audio devices and exit.
     Devices,
-    /// Scan for VST3 plugins and exit.
+    /// Scan for VST3 plugins (and Audio Units on macOS) and exit.
     Scan,
 }
 
@@ -91,6 +92,10 @@ fn main() -> Result<()> {
     if let Some(paths) = settings_path.as_deref().map(settings::Settings::load).and_then(|s| s.plugin_paths) {
         engine.set_plugin_search_paths(paths);
     }
+    // Recording latency offsets per device setup live next to the settings.
+    if let Some(dir) = settings_path.as_deref().and_then(|p| p.parent()) {
+        engine.set_latency_store(&dir.join("latency.json"));
+    }
     for p in &cli.plugin_paths {
         engine.add_plugin_search_path(p.clone());
     }
@@ -103,7 +108,7 @@ fn main() -> Result<()> {
         }
         Cmd::Scan => {
             let (plugins, errors) = engine.scan_plugins();
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "plugins": plugins, "errors": errors }))?);
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "plugins": plugins, "audio_units": engine.audio_units(), "errors": errors }))?);
             return Ok(());
         }
         Cmd::Gui | Cmd::Serve => {}

@@ -2,7 +2,8 @@
 
 use opentake_engine::SlotRef;
 use opentake_engine::TrackUpdate;
-use opentake_engine::project::Track;
+use opentake_engine::project::automation::{gain_to_pos, pos_to_gain};
+use opentake_engine::project::{AutomationTarget, Track};
 use eframe::egui;
 use egui::{Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, vec2};
 
@@ -33,10 +34,41 @@ pub fn mixer_panel(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
                 if snap.project.tracks.is_empty() {
                     ui.label(RichText::new("No tracks").color(theme::TEXT_FAINT));
                 }
+                // Empty strip space selects the track on click and moves it on drag. Registered
+                // before the strip's widgets so those keep their own clicks.
+                let mut strips = Vec::with_capacity(snap.project.tracks.len());
+                let mut dragged = None;
                 for (t, track) in snap.project.tracks.iter().enumerate() {
+                    let area = Rect::from_min_size(ui.cursor().min, vec2(layout.width + 10.0, ui.available_height()));
+                    let bg = ui.interact(area, ui.make_persistent_id(("strip", t)), Sense::click_and_drag());
+                    widgets::label(&bg, egui::Role::Button, &format!("Strip {}", track.name));
                     strip_frame(ui, app.selected_track == Some(t), layout.width, |ui| {
                         track_strip(app, ui, t, track, snap, layout);
                     });
+                    if bg.clicked() || bg.drag_started() {
+                        app.selected_track = Some(t);
+                    }
+                    if bg.drag_started() {
+                        app.track_drag = Some(t);
+                    }
+                    if app.track_drag == Some(t) && (bg.dragged() || bg.drag_stopped()) {
+                        dragged = Some((t, bg.drag_stopped()));
+                    }
+                    strips.push(area);
+                }
+                if let Some((from, dropped)) = dragged {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                    let x = ui.ctx().pointer_latest_pos().map_or(strips[from].center().x, |p| p.x);
+                    let to = strips.iter().position(|r| x < r.right()).unwrap_or(strips.len() - 1);
+                    if dropped {
+                        app.track_drag = None;
+                        if to != from {
+                            app.act(Action::MoveTrack { from, to });
+                        }
+                    } else if to != from {
+                        let x = if to > from { strips[to].right() + 3.0 } else { strips[to].left() - 3.0 };
+                        ui.painter().vline(x, strips[to].y_range(), Stroke::new(2.0, theme::ACCENT));
+                    }
                 }
             });
         });
@@ -62,7 +94,17 @@ pub fn track_strip(app: &mut DawApp, ui: &mut egui::Ui, t: usize, track: &Track,
     ui.spacing_mut().item_spacing.y = 6.0;
     let w = layout.width;
 
-    if let Some(inst) = &track.instrument {
+    if track.bus {
+        widgets::section(ui, "Input");
+        let n = snap.project.sources_of(t).len();
+        let text = match n {
+            0 => "No inputs".to_string(),
+            1 => "1 track".to_string(),
+            n => format!("{n} tracks"),
+        };
+        ui.add_sized([w, 20.0], egui::Label::new(RichText::new(text).color(theme::TEXT_DIM)))
+            .on_hover_text("Tracks routed to this bus (set their Output)");
+    } else if let Some(inst) = &track.instrument {
         widgets::section(ui, "Instrument");
         slot_pill(app, ui, t, SlotRef::Instrument, &inst.name, inst.bypass, w, &snap.instruments);
     } else {
@@ -87,31 +129,45 @@ pub fn track_strip(app: &mut DawApp, ui: &mut egui::Ui, t: usize, track: &Track,
             add_fx_button(app, ui, t, w, snap);
         });
     });
+    widgets::section(ui, "Output");
+    output_button(app, ui, t, snap, w);
 
-    let mut pan = track.pan;
+    // Automated controls follow their lanes (see the track headers).
+    let playhead = snap.status.position_secs;
+    let mut pan = track.automated(AutomationTarget::Pan, playhead).map_or(track.pan, |v| v * 2.0 - 1.0);
     ui.horizontal(|ui| {
         ui.add_space((w - 34.0) / 2.0);
-        if widgets::knob(ui, &mut pan, -1.0, 1.0, 0.0, true, 34.0, "Pan").changed() {
-            app.act(Action::UpdateTrack(t, TrackUpdate { pan: Some(pan), ..Default::default() }));
+        let r = widgets::knob(ui, &mut pan, -1.0, 1.0, 0.0, true, 34.0, "Pan");
+        if r.changed() {
+            app.control(&track.automation, Some(t), AutomationTarget::Pan, (pan + 1.0) / 2.0, Action::UpdateTrack(t, TrackUpdate { pan: Some(pan), ..Default::default() }));
+        }
+        if r.drag_stopped() {
+            app.act(Action::ReleaseControl { owner: Some(t), target: AutomationTarget::Pan });
         }
     });
     let db = snap.status.track_peak_db.get(t).copied().unwrap_or(-120.0);
-    let mut gain = track.volume;
-    if fader_section(ui, &mut gain, [db, db], "Volume", w) {
-        app.act(Action::UpdateTrack(t, TrackUpdate { volume: Some(gain), ..Default::default() }));
+    let mut gain = track.automated(AutomationTarget::Volume, playhead).map_or(track.volume, pos_to_gain);
+    let (changed, released) = fader_section(ui, &mut gain, [db, db], "Volume", w);
+    if changed {
+        app.control(&track.automation, Some(t), AutomationTarget::Volume, gain_to_pos(gain), Action::UpdateTrack(t, TrackUpdate { volume: Some(gain), ..Default::default() }));
     }
+    if released {
+        app.act(Action::ReleaseControl { owner: Some(t), target: AutomationTarget::Volume });
+    }
+    let mute = track.automated(AutomationTarget::Mute, playhead).map_or(track.mute, |v| v >= 0.5);
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
-        let n = if track.is_instrument() { 2.0 } else { 4.0 };
+        let records = !track.is_instrument() && !track.bus;
+        let n = if records { 4.0 } else { 2.0 };
         let size = vec2((w - 3.0 * (n - 1.0)) / n, 20.0);
-        if widgets::chip(ui, track.mute, "M", theme::MUTE, "Mute", size).clicked() {
-            app.act(Action::UpdateTrack(t, TrackUpdate { mute: Some(!track.mute), ..Default::default() }));
+        if widgets::chip(ui, mute, "M", theme::MUTE, "Mute", size).clicked() {
+            app.control(&track.automation, Some(t), AutomationTarget::Mute, if mute { 0.0 } else { 1.0 }, Action::UpdateTrack(t, TrackUpdate { mute: Some(!mute), ..Default::default() }));
         }
         if widgets::chip(ui, track.solo, "S", theme::SOLO, "Solo", size).clicked() {
             app.act(Action::UpdateTrack(t, TrackUpdate { solo: Some(!track.solo), ..Default::default() }));
         }
-        if !track.is_instrument() {
+        if records {
             if widgets::chip(ui, track.armed, "R", theme::RECORD, "Record Enable", size).clicked() {
                 app.act(Action::UpdateTrack(t, TrackUpdate { armed: Some(!track.armed), ..Default::default() }));
             }
@@ -120,9 +176,36 @@ pub fn track_strip(app: &mut DawApp, ui: &mut egui::Ui, t: usize, track: &Track,
             }
         }
     });
-    if name_plate(ui, &track.name, theme::track_color(t), w).clicked() {
+    if name_plate(ui, &track.name, theme::color_of(track, t), w).clicked() {
         app.selected_track = Some(t);
     }
+}
+
+/// The track's output (Stereo Out or a bus); click to route it elsewhere or to a new bus.
+fn output_button(app: &mut DawApp, ui: &mut egui::Ui, t: usize, snap: &Snapshot, w: f32) {
+    let project = &snap.project;
+    let current = project.output_of(t);
+    let name = |o: Option<usize>| o.map_or("Stereo Out".to_string(), |b| project.tracks[b].name.clone());
+    let text = RichText::new(name(current)).size(11.0).color(if current.is_some() { theme::BUS } else { theme::TEXT });
+    let resp = ui.add_sized([w - 2.0, 22.0], egui::Button::new(text).truncate().fill(theme::BG_CONTROL).corner_radius(4));
+    let label = format!("Output: {}", name(current));
+    widgets::label(&resp, egui::Role::Button, &label);
+    let resp = resp.on_hover_text("Where this track goes: the master (Stereo Out) or a bus");
+    egui::Popup::menu(&resp).show(|ui| {
+        ui.set_min_width(180.0);
+        let targets = std::iter::once(None).chain((0..project.tracks.len()).filter(|&b| project.tracks[b].bus).map(Some));
+        for to in targets.filter(|&to| project.can_route(t, to)) {
+            if ui.add(egui::Button::new(name(to)).selected(to == current)).clicked() {
+                app.act(Action::SetOutput(t, to));
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui.button("New Bus").clicked() {
+            app.act(Action::AddBus(vec![t]));
+            ui.close();
+        }
+    });
 }
 
 pub fn master_strip(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot, layout: StripLayout) {
@@ -142,16 +225,22 @@ pub fn master_strip(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot, layout
         });
     });
     ui.allocate_exact_size(vec2(w, 34.0), Sense::hover());
-    let mut gain = snap.project.master_volume;
-    if fader_section(ui, &mut gain, snap.status.master_peak_db, "Master Volume", w) {
-        app.act(Action::SetMasterVolume(gain));
+    let lanes = &snap.project.master_automation;
+    let mut gain = opentake_engine::project::automated(lanes, AutomationTarget::Volume, snap.status.position_secs).map_or(snap.project.master_volume, pos_to_gain);
+    let (changed, released) = fader_section(ui, &mut gain, snap.status.master_peak_db, "Master Volume", w);
+    if changed {
+        app.control(lanes, None, AutomationTarget::Volume, gain_to_pos(gain), Action::SetMasterVolume(gain));
+    }
+    if released {
+        app.act(Action::ReleaseControl { owner: None, target: AutomationTarget::Volume });
     }
     ui.allocate_exact_size(vec2(w, 20.0), Sense::hover());
     name_plate(ui, "Stereo Out", Color32::from_gray(120), w);
 }
 
-/// dB readouts, fader and meter. Returns true when the gain changed.
-fn fader_section(ui: &mut egui::Ui, gain: &mut f32, peak_db: [f32; 2], a11y: &str, w: f32) -> bool {
+/// dB readouts, fader and meter. Returns whether the gain changed (or the fader is held) and
+/// whether it was let go.
+fn fader_section(ui: &mut egui::Ui, gain: &mut f32, peak_db: [f32; 2], a11y: &str, w: f32) -> (bool, bool) {
     ui.horizontal(|ui| {
         let peak = peak_db[0].max(peak_db[1]);
         let readout = |ui: &mut egui::Ui, text: String, color: Color32| {
@@ -167,9 +256,9 @@ fn fader_section(ui: &mut egui::Ui, gain: &mut f32, peak_db: [f32; 2], a11y: &st
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         ui.add_space((w - 60.0 - 12.0 - 4.0) / 2.0);
-        let changed = widgets::vfader(ui, gain, vec2(60.0, fader_h), a11y).changed();
+        let r = widgets::vfader(ui, gain, vec2(60.0, fader_h), a11y);
         widgets::vmeter(ui, vec2(12.0, fader_h), peak_db);
-        changed
+        (r.changed(), r.drag_stopped())
     })
     .inner
 }
@@ -240,6 +329,7 @@ fn add_fx_button(app: &mut DawApp, ui: &mut egui::Ui, t: usize, w: f32, snap: &S
         let builtins = [
             (opentake_engine::eq::NAME, opentake_engine::eq::PATH),
             (opentake_engine::dynamics::comp::NAME, opentake_engine::dynamics::comp::PATH),
+            (opentake_engine::multiband::NAME, opentake_engine::multiband::PATH),
             (opentake_engine::dynamics::limiter::NAME, opentake_engine::dynamics::limiter::PATH),
             (opentake_engine::delay::NAME, opentake_engine::delay::PATH),
         ];
@@ -260,6 +350,19 @@ fn add_fx_button(app: &mut DawApp, ui: &mut egui::Ui, t: usize, w: f32, snap: &S
                 insert(app, p.bundle.to_string_lossy().into_owned());
                 ui.close();
             }
+        }
+        let units: Vec<_> = snap.audio_units.iter().filter(|a| !a.instrument).collect();
+        if !units.is_empty() {
+            ui.separator();
+            widgets::section(ui, "Audio Units");
+            egui::ScrollArea::vertical().id_salt("au_effects").max_height(280.0).show(ui, |ui| {
+                for a in units {
+                    if ui.button(format!("{}  ·  {}", a.name, a.manufacturer)).clicked() {
+                        insert(app, a.id.clone());
+                        ui.close();
+                    }
+                }
+            });
         }
         ui.separator();
         if ui.button("Plug-in Manager…").clicked() {

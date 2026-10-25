@@ -218,9 +218,7 @@ impl Engine {
                 let t = &mut e.project.tracks[r.track];
                 match data {
                     RegionData::Audio(c) => {
-                        let left = Clip { length_secs: cut, ..c.clone() };
-                        let right =
-                            Clip { position_secs: at_secs, length_secs: c.length_secs - cut, source_offset_secs: c.source_offset_secs + cut, ..c };
+                        let (left, right) = c.split(cut);
                         t.clips[r.index] = left;
                         t.clips.insert(r.index + 1, right);
                     }

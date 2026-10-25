@@ -9,7 +9,6 @@ use anyhow::Result;
 use opentake_project::{PluginSlot, Project, Track};
 use serde::Serialize;
 
-use super::plugins::Loaded;
 use super::{Engine, track_params};
 use crate::mixer::Command;
 
@@ -23,6 +22,8 @@ struct Entry {
     project: Project,
     key: Option<String>,
     at: Instant,
+    /// Where undoing this step puts the playhead (seconds), e.g. back where a recording began.
+    playhead: Option<f64>,
 }
 
 #[derive(Default)]
@@ -31,6 +32,8 @@ pub(super) struct History {
     redo: Vec<Entry>,
     /// Nesting depth of `record` calls; only the outermost one creates a step.
     depth: usize,
+    /// `Entry::playhead` for the step being recorded.
+    pub(super) playhead: Option<f64>,
 }
 
 impl History {
@@ -70,8 +73,18 @@ impl Engine {
         }
         let before = self.project.clone();
         self.history.depth += 1;
-        let result = f(self);
+        let mut result = f(self);
         self.history.depth -= 1;
+        if result.is_ok() {
+            // New plug-ins get their automation ids; lanes of removed ones go with them.
+            self.project.assign_slot_ids();
+            self.project.prune_automation();
+        }
+        // Bus tracks only mix: whatever path an edit took, it can't give one regions or input.
+        if let (Ok(_), Some(bus)) = (&result, self.project.tracks.iter().find(|t| t.bus && (!t.clips.is_empty() || !t.midi_clips.is_empty() || t.instrument.is_some() || t.armed || t.monitor_input))) {
+            result = Err(anyhow::anyhow!("'{}' is a bus: it has no regions, instrument or input", bus.name));
+        }
+        let playhead = self.history.playhead.take();
         match result {
             Ok(v) => {
                 if self.project != before {
@@ -80,7 +93,7 @@ impl Engine {
                     match self.history.undo.last_mut() {
                         Some(last) if merge => last.at = Instant::now(),
                         _ => {
-                            self.history.undo.push(Entry { label: label.into(), project: before, key, at: Instant::now() });
+                            self.history.undo.push(Entry { label: label.into(), project: before, key, at: Instant::now(), playhead });
                             if self.history.undo.len() > MAX_STEPS {
                                 self.history.undo.remove(0);
                                 self.prune_pool();
@@ -106,7 +119,10 @@ impl Engine {
         let Some(entry) = self.history.undo.pop() else { return Ok(None) };
         let current = self.project.clone();
         self.restore(entry.project)?;
-        self.history.redo.push(Entry { label: entry.label.clone(), project: current, key: None, at: Instant::now() });
+        if let Some(secs) = entry.playhead {
+            self.seek(secs)?;
+        }
+        self.history.redo.push(Entry { label: entry.label.clone(), project: current, key: None, at: Instant::now(), playhead: entry.playhead });
         Ok(Some(entry.label))
     }
 
@@ -115,7 +131,7 @@ impl Engine {
         let Some(entry) = self.history.redo.pop() else { return Ok(None) };
         let current = self.project.clone();
         self.restore(entry.project)?;
-        self.history.undo.push(Entry { label: entry.label.clone(), project: current, key: None, at: Instant::now() });
+        self.history.undo.push(Entry { label: entry.label.clone(), project: current, key: None, at: Instant::now(), playhead: entry.playhead });
         Ok(Some(entry.label))
     }
 
@@ -149,7 +165,16 @@ impl Engine {
         target.loop_end_secs = self.project.loop_end_secs;
         target.count_in_bars = self.project.count_in_bars;
         target.count_in_on_play = self.project.count_in_on_play;
+        target.auto_input_monitoring = self.project.auto_input_monitoring;
         target.sample_rate = self.project.sample_rate;
+        // Whether a track shows its automation is a view setting too.
+        for t in &mut target.tracks {
+            if let Some(o) = self.project.tracks.iter().find(|o| o.id == t.id) {
+                t.show_automation = o.show_automation;
+            }
+        }
+        // Controls being written refer to the lanes as they were.
+        self.writing.clear();
         let old = std::mem::replace(&mut self.project, target);
 
         // Plugin parameter values: controllers exist whether or not audio is running.
@@ -163,8 +188,8 @@ impl Engine {
                     if prev == Some(value) {
                         continue;
                     }
-                    if let Some(Loaded::Vst3(plugin)) = self.pool.get(&slot.instance) {
-                        plugin.set_param_on_controller(id, value);
+                    if let Some(plugin) = self.pool.get(&slot.instance) {
+                        plugin.set_param(id, value);
                     }
                     if old_slot.is_some() {
                         self.send(Command::SetPluginParam { track: t.id, instance: slot.instance, id, value })?;
@@ -209,11 +234,18 @@ impl Engine {
                     if chain_signature(o) != chain_signature(t) {
                         self.sync_chain(i)?;
                     }
+                    if o.automation != t.automation {
+                        self.sync_automation(Some(i))?;
+                    }
                 }
             }
         }
         if added || old_ids != new_ids {
             self.send(Command::ReorderTracks(Box::new(new_ids)))?;
+        }
+        let outputs = |p: &Project| p.tracks.iter().map(|t| t.output).collect::<Vec<_>>();
+        if added || old_ids != self.project.tracks.iter().map(|t| t.id).collect::<Vec<_>>() || outputs(&old) != outputs(&self.project) {
+            self.sync_routing()?;
         }
         // Master inserts: parameter values and the chain.
         for slot in self.project.master_plugins.clone() {
@@ -222,8 +254,8 @@ impl Engine {
                 if old_slot.and_then(|s| s.params.iter().find(|p| p.0 == id)).map(|p| p.1) == Some(value) {
                     continue;
                 }
-                if let Some(Loaded::Vst3(plugin)) = self.pool.get(&slot.instance) {
-                    plugin.set_param_on_controller(id, value);
+                if let Some(plugin) = self.pool.get(&slot.instance) {
+                    plugin.set_param(id, value);
                 }
                 if old_slot.is_some() {
                     self.send(Command::SetPluginParam { track: crate::mixer::MASTER, instance: slot.instance, id, value })?;
@@ -233,6 +265,8 @@ impl Engine {
         let master_sig = |p: &Project| p.master_plugins.iter().map(|s| (s.instance, s.bypass)).collect::<Vec<_>>();
         if master_sig(&old) != master_sig(&self.project) {
             self.sync_master_chain()?;
+        } else if old.master_automation != self.project.master_automation {
+            self.sync_automation(None)?;
         }
         if (old.tempo_bpm, old.time_signature, &old.tempo_changes) != (self.project.tempo_bpm, self.project.time_signature, &self.project.tempo_changes) {
             let cmd = self.tempo_command();

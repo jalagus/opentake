@@ -10,6 +10,7 @@ license = "MIT"
 [workspace.dependencies]
 opentake-engine = { path = "crates/opentake-engine" }
 opentake-vst3 = { path = "crates/opentake-vst3" }
+opentake-au = { path = "crates/opentake-au" }
 opentake-project = { path = "crates/opentake-project" }
 anyhow = "1"
 thiserror = "2"
@@ -34,7 +35,14 @@ rfd = "0.17"
 dirs = "7"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 roxmltree = "0.21"
+flate2 = "1"
 flacenc = "0.5"
+midly = "0.5"
+signalsmith-stretch = "0.1"
+
+# Region pitch/stretch renders in C++; keep it fast in debug builds too.
+[profile.dev.package.signalsmith-stretch]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

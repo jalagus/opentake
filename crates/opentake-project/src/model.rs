@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::automation::{AutomationLane, AutomationTarget};
 use crate::tempo::{TempoChange, TempoMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -37,9 +38,16 @@ pub struct Project {
     /// Also count in before plain playback.
     #[serde(default)]
     pub count_in_on_play: bool,
+    /// Armed tracks monitor their input while stopped or recording (Logic's Auto Input
+    /// Monitoring); off means only the I button monitors.
+    #[serde(default = "yes")]
+    pub auto_input_monitoring: bool,
     /// Insert effects on the master bus.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub master_plugins: Vec<PluginSlot>,
+    /// Automation of the master fader and master plug-ins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub master_automation: Vec<AutomationLane>,
     pub tracks: Vec<Track>,
 }
 
@@ -49,6 +57,10 @@ fn default_click() -> f32 {
 
 fn unity() -> f32 {
     1.0
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for Project {
@@ -67,7 +79,9 @@ impl Default for Project {
             tempo_changes: Vec::new(),
             count_in_bars: 0,
             count_in_on_play: false,
+            auto_input_monitoring: true,
             master_plugins: Vec::new(),
+            master_automation: Vec::new(),
             tracks: Vec::new(),
         }
     }
@@ -122,6 +136,20 @@ pub struct Track {
     #[serde(default)]
     pub instrument: Option<PluginSlot>,
     pub plugins: Vec<PluginSlot>,
+    /// A bus (aux) track: no regions, it sums the tracks routed to it through its effects.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bus: bool,
+    /// Where the track's signal goes: the master (`None`) or a bus. In a session this is
+    /// the bus's `id`; in files (and from importers) its track index, since ids aren't
+    /// saved (see [`Project::outputs_from_indices`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<u64>,
+    /// Automation lanes (fader, pan, mute, plug-in parameters).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub automation: Vec<AutomationLane>,
+    /// Whether the lanes are shown under the track in the arrangement.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub show_automation: bool,
 }
 
 impl Track {
@@ -139,12 +167,164 @@ impl Track {
             midi_clips: Vec::new(),
             instrument: None,
             plugins: Vec::new(),
+            bus: false,
+            output: None,
+            automation: Vec::new(),
+            show_automation: false,
             id: 0,
         }
     }
 
+    /// An empty bus track.
+    pub fn new_bus(name: impl Into<String>) -> Self {
+        Self { bus: true, ..Self::new(name) }
+    }
+
     pub fn is_instrument(&self) -> bool {
         self.instrument.is_some()
+    }
+
+    /// The instrument and effect slots.
+    pub fn slots(&self) -> impl Iterator<Item = &PluginSlot> {
+        self.instrument.iter().chain(&self.plugins)
+    }
+
+    /// The automated value of `target` at `t` seconds, if an active lane moves it.
+    pub fn automated(&self, target: AutomationTarget, t: f64) -> Option<f32> {
+        automated(&self.automation, target, t)
+    }
+}
+
+/// The value an active lane for `target` has at `t`.
+pub fn automated(lanes: &[AutomationLane], target: AutomationTarget, t: f64) -> Option<f32> {
+    lanes.iter().find(|l| l.target == target && l.is_active()).and_then(|l| l.value_at(t))
+}
+
+/// Automation bookkeeping: plug-in slots get persistent ids that lanes refer to, and lanes
+/// whose plug-in is gone go with it.
+impl Project {
+    fn all_slots_mut(&mut self) -> impl Iterator<Item = &mut PluginSlot> {
+        self.tracks.iter_mut().flat_map(|t| t.instrument.iter_mut().chain(t.plugins.iter_mut())).chain(self.master_plugins.iter_mut())
+    }
+
+    /// Give every slot without an id (new, or from a file or importer that has none) a fresh
+    /// one; a duplicated id (e.g. a hand-edited file) is replaced on its later copies.
+    pub fn assign_slot_ids(&mut self) {
+        let mut next = self.all_slots_mut().map(|s| s.id).max().unwrap_or(0) + 1;
+        let mut seen = std::collections::HashSet::new();
+        for slot in self.all_slots_mut() {
+            if slot.id == 0 || !seen.insert(slot.id) {
+                slot.id = next;
+                seen.insert(next);
+                next += 1;
+            }
+        }
+    }
+
+    /// Drop lanes that point at a plug-in slot their track (or the master) no longer has, or
+    /// at what a bus or the master can't move. Returns whether anything was removed.
+    pub fn prune_automation(&mut self) -> bool {
+        let before = self.tracks.iter().map(|t| t.automation.len()).sum::<usize>() + self.master_automation.len();
+        for t in &mut self.tracks {
+            let ids: Vec<u32> = t.slots().map(|s| s.id).collect();
+            t.automation.retain(|l| match l.target {
+                AutomationTarget::Param { slot, .. } => ids.contains(&slot),
+                _ => true,
+            });
+        }
+        let ids: Vec<u32> = self.master_plugins.iter().map(|s| s.id).collect();
+        self.master_automation.retain(|l| match l.target {
+            AutomationTarget::Param { slot, .. } => ids.contains(&slot),
+            AutomationTarget::Volume => true,
+            _ => false,
+        });
+        before != self.tracks.iter().map(|t| t.automation.len()).sum::<usize>() + self.master_automation.len()
+    }
+}
+
+/// Routing: tracks feed the master or a bus; buses can feed further buses, never in a loop.
+impl Project {
+    pub fn track_by_id(&self, id: u64) -> Option<usize> {
+        self.tracks.iter().position(|t| t.id == id)
+    }
+
+    /// Index of the bus track `index` feeds (`None` = the master).
+    pub fn output_of(&self, index: usize) -> Option<usize> {
+        self.tracks[index].output.and_then(|id| self.track_by_id(id)).filter(|&b| b != index && self.tracks[b].bus)
+    }
+
+    /// The buses from `index` on the way to the master (bounded, in case of a bad file).
+    pub fn route(&self, index: usize) -> Vec<usize> {
+        let mut route = Vec::new();
+        let mut at = index;
+        while let Some(next) = self.output_of(at) {
+            if next == index || route.contains(&next) {
+                break;
+            }
+            route.push(next);
+            at = next;
+        }
+        route
+    }
+
+    /// Whether track `index` may feed `to` (a bus index, `None` = master): `to` must be a bus
+    /// that isn't the track itself or fed by it.
+    pub fn can_route(&self, index: usize, to: Option<usize>) -> bool {
+        let Some(to) = to else { return true };
+        to != index && self.tracks.get(to).is_some_and(|t| t.bus) && !self.route(to).contains(&index)
+    }
+
+    /// Tracks feeding bus `index` directly.
+    pub fn sources_of(&self, index: usize) -> Vec<usize> {
+        (0..self.tracks.len()).filter(|&i| self.output_of(i) == Some(index)).collect()
+    }
+
+    /// Mixing order: every track before the buses it feeds (plain tracks first).
+    pub fn processing_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.tracks.len()).filter(|&i| !self.tracks[i].bus).collect();
+        let mut buses: Vec<usize> = (0..self.tracks.len()).filter(|&i| self.tracks[i].bus).collect();
+        // A bus further from the master comes first (its route is longer than its output's).
+        buses.sort_by_key(|&b| std::cmp::Reverse(self.route(b).len()));
+        order.extend(buses);
+        order
+    }
+
+    /// Which tracks reach the output: not muted, and when anything is soloed, soloed, on the
+    /// route of a soloed track (its buses), or feeding a soloed bus.
+    pub fn audible(&self) -> Vec<bool> {
+        let mut soloed: Vec<bool> = self.tracks.iter().map(|t| t.solo).collect();
+        for i in 0..self.tracks.len() {
+            let route = self.route(i);
+            if self.tracks[i].solo {
+                route.iter().for_each(|&b| soloed[b] = true);
+            } else if route.iter().any(|&b| self.tracks[b].solo) {
+                soloed[i] = true;
+            }
+        }
+        let any_solo = self.tracks.iter().any(|t| t.solo);
+        self.tracks.iter().zip(soloed).map(|(t, s)| !t.mute && (!any_solo || s)).collect()
+    }
+
+    /// Outputs from track indices (as files store them) to session ids; invalid ones (not a
+    /// bus, or a loop) go to the master. Call once the tracks have their ids.
+    pub fn outputs_from_indices(&mut self) {
+        let ids: Vec<(u64, bool)> = self.tracks.iter().map(|t| (t.id, t.bus)).collect();
+        for (i, t) in self.tracks.iter_mut().enumerate() {
+            t.output = t.output.and_then(|o| ids.get(o as usize).filter(|(_, bus)| *bus && o as usize != i)).map(|(id, _)| *id);
+        }
+        for i in 0..self.tracks.len() {
+            if self.output_of(i).is_some_and(|to| self.route(to).contains(&i)) {
+                self.tracks[i].output = None;
+            }
+        }
+    }
+
+    /// Outputs from session ids to track indices, for saving.
+    pub fn outputs_to_indices(&mut self) {
+        let outputs: Vec<Option<usize>> = (0..self.tracks.len()).map(|i| self.output_of(i)).collect();
+        for (t, o) in self.tracks.iter_mut().zip(outputs) {
+            t.output = o.map(|o| o as u64);
+        }
     }
 }
 
@@ -271,10 +451,117 @@ pub struct Clip {
     pub file: PathBuf,
     pub position_secs: f64,
     pub length_secs: f64,
-    /// Offset into the source file where playback starts.
+    /// Offset into the source file where playback starts (negative: silence first).
     pub source_offset_secs: f64,
     pub gain: f32,
     pub mute: bool,
+    /// Take folder: the alternatives recorded for this region (cycle recording), one of
+    /// which (`active_take`) plays. `file` and `source_offset_secs` are the active take's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub takes: Vec<Take>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub active_take: usize,
+    /// Pitch shift in semitones plus fine cents, independent of `stretch`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pitch_semitones: i32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pitch_cents: i32,
+    /// Time stretch: how many times longer the audio plays than recorded (2.0 = half speed).
+    /// Position and length are timeline seconds, but `source_offset_secs` (and take offsets)
+    /// stay in source seconds, so `t` seconds of the region play `t / stretch` of the source.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub stretch: f64,
+}
+
+fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+fn is_one(v: &f64) -> bool {
+    *v == 1.0
+}
+
+/// One take in a take folder.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Take {
+    pub name: String,
+    pub file: PathBuf,
+    /// Its source offset relative to the region's (so the active take's is 0, and moving,
+    /// trimming or splitting the region moves every take with it).
+    pub offset_secs: f64,
+}
+
+impl Clip {
+    /// Total pitch shift in semitones.
+    pub fn transpose(&self) -> f64 {
+        self.pitch_semitones as f64 + self.pitch_cents as f64 / 100.0
+    }
+
+    /// Whether the region plays processed (pitch-shifted or time-stretched) audio.
+    pub fn is_flexed(&self) -> bool {
+        self.pitch_semitones != 0 || self.pitch_cents != 0 || self.stretch != 1.0
+    }
+
+    /// Split `cut` timeline seconds after the region start into (left, right).
+    pub fn split(&self, cut: f64) -> (Clip, Clip) {
+        let left = Clip { length_secs: cut, ..self.clone() };
+        let right = Clip {
+            position_secs: self.position_secs + cut,
+            length_secs: self.length_secs - cut,
+            source_offset_secs: self.source_offset_secs + cut / self.stretch,
+            ..self.clone()
+        };
+        (left, right)
+    }
+
+    /// Make take `index` the one that plays. Returns false if there's no such take.
+    pub fn select_take(&mut self, index: usize) -> bool {
+        let Some(take) = self.takes.get(index) else { return false };
+        let (delta, file) = (take.offset_secs, take.file.clone());
+        for t in &mut self.takes {
+            t.offset_secs -= delta;
+        }
+        self.source_offset_secs += delta;
+        self.file = file;
+        self.active_take = index;
+        true
+    }
+
+    /// Add a take (by its absolute source offset) and make it the one that plays. A plain
+    /// region becomes a take folder whose first take is what it played so far.
+    pub fn push_take(&mut self, name: String, file: PathBuf, source_offset_secs: f64) {
+        if self.takes.is_empty() {
+            self.takes.push(Take { name: "Take 1".into(), file: self.file.clone(), offset_secs: 0.0 });
+            self.active_take = 0;
+        }
+        self.takes.push(Take { name, file, offset_secs: source_offset_secs - self.source_offset_secs });
+        self.select_take(self.takes.len() - 1);
+    }
+
+    /// Remove a take; the next one (or the previous, for the last) plays if it was active.
+    /// A folder left with one take becomes a plain region. Returns false if there's no such take.
+    pub fn remove_take(&mut self, index: usize) -> bool {
+        if index >= self.takes.len() || self.takes.len() < 2 {
+            return false;
+        }
+        let active = self.active_take;
+        if index == active {
+            self.select_take(if index + 1 < self.takes.len() { index + 1 } else { index - 1 });
+        }
+        self.takes.remove(index);
+        if self.active_take > index {
+            self.active_take -= 1;
+        }
+        if self.takes.len() == 1 {
+            self.takes.clear();
+            self.active_take = 0;
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -292,6 +579,10 @@ pub struct PluginSlot {
     /// Normalized parameter values set by this host, as (param id, value). Applied on load.
     #[serde(default)]
     pub params: Vec<(u32, f64)>,
+    /// Persistent id, unique within the project, that automation lanes refer to (0 = not
+    /// assigned yet; see [`Project::assign_slot_ids`]).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub id: u32,
     /// Engine handle of the loaded instance (0 = not loaded). Session only.
     #[serde(skip)]
     pub instance: u64,
@@ -302,6 +593,8 @@ pub enum PluginFormat {
     Vst3,
     Vst2,
     Clap,
+    /// macOS Audio Unit (`path` is "Manufacturer: Name", `uid` the codes, e.g. "aufx:dely:appl").
+    AudioUnit,
     /// Built into OpenTake (`path` names it, e.g. "synth").
     Builtin,
     Other,
@@ -310,6 +603,49 @@ pub enum PluginFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn clip(file: &str, offset: f64) -> Clip {
+        Clip { name: "c".into(), file: file.into(), position_secs: 4.0, length_secs: 2.0, source_offset_secs: offset, gain: 1.0, mute: false, takes: Vec::new(), active_take: 0, pitch_semitones: 0, pitch_cents: 0, stretch: 1.0 }
+    }
+
+    #[test]
+    fn stretched_split_and_neutral_serialization() {
+        let mut c = clip("a.wav", 1.0);
+        assert!(!serde_json::to_string(&c).unwrap().contains("stretch"), "neutral values aren't written");
+        c.stretch = 2.0;
+        let (l, r) = c.split(0.5);
+        assert_eq!((l.length_secs, r.position_secs, r.length_secs, r.source_offset_secs), (0.5, 4.5, 1.5, 1.25));
+        c.pitch_semitones = -3;
+        let back: Clip = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!((back.stretch, back.transpose()), (2.0, -3.0));
+        // Files from before pitch/stretch load with neutral values.
+        let old: Clip = serde_json::from_str(r#"{"name":"c","file":"a.wav","position_secs":0,"length_secs":1,"source_offset_secs":0,"gain":1,"mute":false}"#).unwrap();
+        assert!(!old.is_flexed() && old.stretch == 1.0);
+    }
+
+    #[test]
+    fn takes_switch_offsets_and_files() {
+        // Two passes of a cycle in one file, then a take from another recording.
+        let mut c = clip("rec.wav", 1.0);
+        c.push_take("Take 2".into(), "rec.wav".into(), 3.0);
+        c.push_take("Take 3".into(), "other.wav".into(), -0.5);
+        assert_eq!((c.active_take, c.file.to_str(), c.source_offset_secs), (2, Some("other.wav"), -0.5));
+        assert!(c.select_take(1));
+        assert_eq!((c.file.to_str(), c.source_offset_secs), (Some("rec.wav"), 3.0));
+        assert_eq!(c.takes.iter().map(|t| t.offset_secs).collect::<Vec<_>>(), vec![-2.0, 0.0, -3.5]);
+        // A trim or split shifts the region's offset; every take keeps its alignment.
+        c.source_offset_secs += 0.25;
+        assert!(c.select_take(0));
+        assert_eq!(c.source_offset_secs, 1.25);
+        assert!(!c.select_take(3));
+
+        // Removing the active take plays the next; one take left is a plain region.
+        assert!(c.remove_take(0));
+        assert_eq!((c.active_take, c.source_offset_secs, c.takes.len()), (0, 3.25, 2));
+        assert!(c.remove_take(1));
+        assert!(c.takes.is_empty() && c.source_offset_secs == 3.25 && c.file.to_str() == Some("rec.wav"));
+        assert!(!c.remove_take(0));
+    }
 
     fn note(pitch: u8, tab: Option<TabPos>) -> Note {
         Note { start_secs: 0.0, length_secs: 1.0, pitch, velocity: 100, tab }
@@ -327,6 +663,70 @@ mod tests {
         let capo = TabLayout { capo: 2, ..layout.clone() };
         assert_eq!(capo.position(&note(42, None)), Some(TabPos { string: 0, fret: 0 }));
         assert_eq!(layout.position(&note(20, None)), None, "below the lowest string");
+    }
+
+    fn routed(buses: &[bool], outputs: &[Option<usize>]) -> Project {
+        let mut p = Project::default();
+        for (i, (&bus, &out)) in buses.iter().zip(outputs).enumerate() {
+            p.tracks.push(Track { id: 10 + i as u64, bus, output: out.map(|o| o as u64), ..Track::new(format!("T{i}")) });
+        }
+        p.outputs_from_indices();
+        p
+    }
+
+    #[test]
+    fn routing_orders_buses_after_their_sources_and_refuses_loops() {
+        // 0 -> bus 2 -> bus 1 -> master; 3 -> master.
+        let mut p = routed(&[false, true, true, false], &[Some(2), None, Some(1), None]);
+        assert_eq!(p.tracks[0].output, Some(12), "indices become ids");
+        assert_eq!(p.route(0), vec![2, 1]);
+        assert_eq!(p.processing_order(), vec![0, 3, 2, 1]);
+        assert_eq!(p.sources_of(1), vec![2]);
+        assert!(!p.can_route(1, Some(2)), "bus 1 feeding bus 2 would loop");
+        assert!(!p.can_route(2, Some(2)) && !p.can_route(0, Some(3)), "not itself, only buses");
+        assert!(p.can_route(3, Some(2)) && p.can_route(1, None));
+        // A loop or a non-bus target in a file goes to the master.
+        let bad = routed(&[true, true, false], &[Some(1), Some(0), Some(2)]);
+        assert_eq!(bad.tracks.iter().filter(|t| t.output.is_some()).count(), 1);
+        p.outputs_to_indices();
+        assert_eq!(p.tracks.iter().map(|t| t.output).collect::<Vec<_>>(), vec![Some(2), None, Some(1), None]);
+    }
+
+    #[test]
+    fn solo_keeps_the_route_and_a_soloed_bus_keeps_its_sources() {
+        // 0 -> bus 1 -> master, 2 -> master.
+        let mut p = routed(&[false, true, false], &[Some(1), None, None]);
+        p.tracks[0].solo = true;
+        assert_eq!(p.audible(), vec![true, true, false]);
+        p.tracks[0].solo = false;
+        p.tracks[1].solo = true;
+        assert_eq!(p.audible(), vec![true, true, false]);
+        p.tracks[1].mute = true;
+        assert_eq!(p.audible(), vec![true, false, false]);
+    }
+
+    #[test]
+    fn slots_get_unique_ids_and_orphaned_lanes_go() {
+        use crate::automation::{AutomationLane, AutomationTarget};
+        let slot = |id: u32| PluginSlot { name: "fx".into(), format: PluginFormat::Builtin, path: "p".into(), uid: "p".into(), bypass: false, state: Vec::new(), params: Vec::new(), id, instance: 0 };
+        let mut p = Project::default();
+        let mut t = Track::new("A");
+        t.plugins = vec![slot(4), slot(0), slot(4)];
+        p.tracks.push(t);
+        p.master_plugins.push(slot(0));
+        p.assign_slot_ids();
+        let ids: Vec<u32> = p.tracks[0].plugins.iter().chain(&p.master_plugins).map(|s| s.id).collect();
+        assert_eq!(ids, vec![4, 5, 6, 7], "kept, new, duplicate replaced, master");
+        let param = |slot| AutomationTarget::Param { slot, param: 0 };
+        p.tracks[0].automation = vec![AutomationLane::new(AutomationTarget::Volume), AutomationLane::new(param(5)), AutomationLane::new(param(7))];
+        p.master_automation = vec![AutomationLane::new(param(7)), AutomationLane::new(AutomationTarget::Pan)];
+        assert!(p.prune_automation());
+        assert_eq!(p.tracks[0].automation.iter().map(|l| l.target).collect::<Vec<_>>(), vec![AutomationTarget::Volume, param(5)], "the master's slot isn't the track's");
+        assert_eq!(p.master_automation.len(), 1, "the master has no pan");
+        assert!(!p.prune_automation());
+        // Tracks without automation don't write the fields.
+        let json = serde_json::to_string(&Track::new("B")).unwrap();
+        assert!(!json.contains("automation"), "{json}");
     }
 
     #[test]

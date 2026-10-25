@@ -1,0 +1,17 @@
+[package]
+name = "opentake-au"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Audio Units exist only on macOS; elsewhere the crate is empty.
+[target.'cfg(target_os = "macos")'.dependencies]
+thiserror.workspace = true
+serde.workspace = true
+block2 = "0.6"
+objc2-audio-toolbox = { version = "0.3", default-features = false, features = [
+    "std", "bitflags", "block2", "objc2-core-audio-types", "objc2-core-foundation",
+    "AUComponent", "AudioComponent", "AudioUnitProperties", "MusicDevice",
+] }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = ["std", "bitflags", "CoreAudioBaseTypes"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFArray", "CFData", "CFPropertyList", "CFString", "CFError"] }

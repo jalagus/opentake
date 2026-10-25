@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use opentake_engine::project::Note;
+use opentake_engine::project::{AutomationMode, AutomationPoint, AutomationTarget, Curve, Note};
 use opentake_engine::{AudioConfig, Engine, MidiClipUpdate, SlotRef, TrackUpdate};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -17,22 +17,33 @@ const INSTRUCTIONS: &str = "\
 Controls OpenTake, a running digital audio workstation.
 
 Typical flow: list_audio_devices -> start_audio -> add_track -> update_track (armed, input_channel, \
-monitor_input) -> record -> stop (recordings become clips) -> save_project.
+monitor_input) -> record -> stop (recordings become clips) -> save_project. With the cycle on \
+(set_loop), recording loops and each pass becomes a take in one take folder region; select_take \
+switches which take plays.
 
 Tracks, clips and plugin slots are addressed by zero-based index as shown by get_project. \
 Plugin parameters are normalized 0..1; list_plugin_params shows ids, current values and display strings. \
-Projects can be saved/loaded as native .otp or Reaper .rpp files.
+Projects can be saved/loaded as native .otp, Reaper .rpp or .dawproject files; Ableton .als, Logic (via .fcpxml) and Ardour sessions can be imported.
 
-MIDI: add_instrument_track (\"synth\" = built-in synth, or a VST3 instrument from list_instruments) -> \
+MIDI: add_instrument_track (\"synth\" = built-in synth, or a VST3 / AU instrument from list_instruments) -> \
 add_midi_clip -> set_midi_notes / add_midi_notes (times in seconds relative to the region start, \
 pitch 60 = middle C, velocity 1..127). Every edit — yours or the user's — can be undone with undo/redo; \
-get_history lists the steps.
+get_history lists the steps. Songs: import_guitar_pro (.gp) and import_midi_file (.mid) create \
+instrument tracks; export_midi_file writes the MIDI regions back out.
 
 Tempo: set_tempo sets the opening tempo/signature; set_tempo_map adds tempo and time-signature changes. \
 Region and note times are always seconds; get_tempo_map and convert_time translate between seconds and \
-bars/beats. Effects: insert_plugin with \"eq\", \"comp\", \"limiter\" or \"delay\" adds a built-in effect to a track; \
-insert_master_plugin puts effects on the master bus (address them with master: true). Plug-in delay \
-(e.g. the limiter's look-ahead) is compensated automatically.
+bars/beats. Effects: insert_plugin with \"eq\", \"comp\", \"multiband\", \"limiter\" or \"delay\" adds a built-in effect to a track; \
+insert_master_plugin puts effects on the master bus (address them with master: true); VST3 and, on macOS, Audio Unit plug-ins work too (scan_plugins lists them). Plug-in delay \
+(e.g. the limiter's look-ahead) is compensated automatically. Buses: add_bus (with tracks to group them) \
+creates a bus track; update_track output routes a track to a bus index or \"master\"; effects on the bus \
+(insert_plugin with its index) process the whole group. get_project shows each track's kind and output.
+
+Automation: list_automation_params shows what a track (or master: true) can automate — volume, \
+pan, mute and every plug-in parameter; add_automation_lane makes a lane, set_automation_points \
+draws it (times in seconds; values normalized 0..1, or db for volume and pan -1..1), \
+get_automation reads lanes back. Lanes play in mode \"read\" and are shown under the track in the \
+GUI; analyze_mix and export_audio render them.
 
 Mixing: analyze_mix renders the mix offline and reports peak, LUFS, band energy and phone-speaker \
 translation per track and for the master — balance with update_track (volume_db, pan) and EQs, \
@@ -139,16 +150,63 @@ pub struct AnalyzeMixArgs {
 /// tablature bars summarized, so the answer stays small.
 fn project_json(project: &opentake_engine::project::Project, include_notes: bool) -> serde_json::Value {
     let mut v = serde_json::to_value(project).unwrap_or_default();
+    compact_lanes(v.get_mut("master_automation"));
     if let Some(tracks) = v.get_mut("tracks").and_then(|t| t.as_array_mut()) {
         for (i, t) in tracks.iter_mut().enumerate() {
             compact_track(t, include_notes);
             t["index"] = json!(i);
+            // Kind and output by index (the model stores buses by session id).
+            let track = &project.tracks[i];
+            t["kind"] = json!(if track.bus { "bus" } else if track.is_instrument() { "instrument" } else { "audio" });
+            t["output"] = project.output_of(i).map_or(json!("master"), |b| json!(b));
+            t.as_object_mut().map(|o| o.remove("bus"));
         }
     }
     v
 }
 
+/// A track output: a bus track's index or "master".
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum OutputArg {
+    Bus(usize),
+    Named(String),
+}
+
+impl OutputArg {
+    fn bus(&self) -> anyhow::Result<Option<usize>> {
+        match self {
+            OutputArg::Bus(i) => Ok(Some(*i)),
+            OutputArg::Named(s) if s.eq_ignore_ascii_case("master") => Ok(None),
+            OutputArg::Named(s) => s.trim().parse().map(Some).map_err(|_| anyhow::anyhow!("output must be a bus track index or \"master\", not '{s}'")),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AddBusArgs {
+    pub name: String,
+    /// Tracks to route into the new bus (it then feeds where the first of them went).
+    pub tracks: Option<Vec<usize>>,
+}
+
+/// Automation lanes say how many points they have (get_automation lists them).
+fn compact_lanes(lanes: Option<&mut serde_json::Value>) {
+    for l in lanes.and_then(|a| a.as_array_mut()).into_iter().flatten() {
+        let count = l.get("points").and_then(|n| n.as_array()).map_or(0, |n| n.len());
+        l.as_object_mut().map(|o| o.remove("points"));
+        l["point_count"] = json!(count);
+    }
+}
+
 fn compact_track(t: &mut serde_json::Value, include_notes: bool) {
+    compact_lanes(t.get_mut("automation"));
+    // Take folders always say which take plays (serde leaves out 0).
+    for c in t.get_mut("clips").and_then(|c| c.as_array_mut()).into_iter().flatten() {
+        if c.get("takes").is_some() && c.get("active_take").is_none() {
+            c["active_take"] = json!(0);
+        }
+    }
     if let Some(clips) = t.get_mut("midi_clips").and_then(|c| c.as_array_mut()) {
         for c in clips {
             if !include_notes {
@@ -172,13 +230,13 @@ pub struct NameArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PathArgs {
-    /// File path. `.rpp` = Reaper project, anything else = native JSON.
+    /// File path. `.rpp` = Reaper, `.dawproject`/`.als`/`.fcpxml`/`.ardour` = import, anything else = native JSON.
     pub path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct OptionalPathArgs {
-    /// File path (`.rpp` for Reaper, otherwise JSON). Omit to save to the current path.
+    /// File path (`.rpp` for Reaper, `.dawproject`, otherwise native). Omit to save to the current path.
     pub path: Option<String>,
 }
 
@@ -234,7 +292,7 @@ pub struct CountInArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct InsertMasterPluginArgs {
-    /// "eq" for the built-in EQ, or a VST3 effect name / .vst3 bundle path.
+    /// "eq" for the built-in EQ, or a VST3 / AU effect name, .vst3 bundle path or AU id ("au:...").
     pub plugin: String,
     /// Position in the master chain; omit to append.
     pub position: Option<usize>,
@@ -244,6 +302,20 @@ pub struct InsertMasterPluginArgs {
 pub struct MasterSlotArgs {
     /// Zero-based position in the master effect chain.
     pub slot: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MeasureLatencyArgs {
+    /// Zero-based input channel that hears the output (default 0).
+    #[serde(default)]
+    pub input_channel: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RecordOffsetArgs {
+    /// Milliseconds added to the measured round trip (-500..500). Positive moves new
+    /// recordings earlier, negative later.
+    pub offset_ms: f64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -272,13 +344,35 @@ pub struct GuitarProImportArgs {
     pub path: String,
     /// Guitar Pro track indices to import (see inspect_guitar_pro); omit for all tracks with notes.
     pub tracks: Option<Vec<usize>>,
-    /// Instrument for pitched tracks: "synth" (default) or a VST3 instrument (see list_instruments).
+    /// Instrument for pitched tracks: "synth" (default) or a VST3 / AU instrument (see list_instruments).
     pub instrument: Option<String>,
-    /// Instrument for drum tracks (GM drum map): "drums" (built-in kit, default), "synth" or a VST3 instrument.
+    /// Instrument for drum tracks (GM drum map): "drums" (built-in kit, default), "synth" or a VST3 / AU instrument.
     pub drum_instrument: Option<String>,
     /// Adopt the song's opening tempo and time signature (default true).
     pub set_tempo: Option<bool>,
     /// Timeline position for the song start in seconds (default 0).
+    pub position_secs: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MidiFilePathArgs {
+    /// Path to a Standard MIDI File (.mid, .midi).
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MidiFileImportArgs {
+    /// Path to a Standard MIDI File (.mid, .midi).
+    pub path: String,
+    /// Part indices to import (see inspect_midi_file); omit for all.
+    pub tracks: Option<Vec<usize>>,
+    /// Instrument for pitched parts: "synth" (default) or a VST3 instrument (see list_instruments).
+    pub instrument: Option<String>,
+    /// Instrument for drum parts (channel 10): "drums" (built-in kit, default), "synth" or a VST3 instrument.
+    pub drum_instrument: Option<String>,
+    /// Adopt the file's tempo map and time signatures (default true).
+    pub set_tempo: Option<bool>,
+    /// Timeline position for the file start in seconds (default 0).
     pub position_secs: Option<f64>,
 }
 
@@ -315,6 +409,8 @@ pub struct UpdateTrackArgs {
     pub monitor_input: Option<bool>,
     /// Zero-based input channel on the audio interface.
     pub input_channel: Option<u16>,
+    /// Where the track goes: a bus track's index, or "master".
+    pub output: Option<OutputArg>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -331,6 +427,41 @@ pub struct AddClipArgs {
 pub struct ClipArgs {
     pub track: usize,
     pub clip: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EnabledArgs {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MoveTrackArgs {
+    pub track: usize,
+    /// Its new index (past the end = last).
+    pub to_index: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ClipGainArgs {
+    pub track: usize,
+    pub clip: usize,
+    pub gain_db: f32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct NormalizeClipArgs {
+    pub track: usize,
+    pub clip: usize,
+    /// Peak level to reach in dBFS (default 0, max 0).
+    pub target_db: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TakeArgs {
+    pub track: usize,
+    pub clip: usize,
+    /// Zero-based index into the region's `takes`.
+    pub take: usize,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -372,16 +503,32 @@ pub struct TrimClipArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct PitchStretchArgs {
+    pub track: usize,
+    pub clip: usize,
+    /// Pitch shift in semitones (-24..24); omit to keep.
+    pub semitones: Option<i32>,
+    /// Fine pitch in cents (-100..100); omit to keep.
+    pub cents: Option<i32>,
+    /// Time stretch ratio, new length / original length (0.25..4; 2 = half speed, 1 = off). The region's length scales with it.
+    pub stretch: Option<f64>,
+    /// Instead of stretch: fit the region to this length in seconds.
+    pub length_secs: Option<f64>,
+    /// Instead of stretch: fit the region to this many bars (at the tempo where it starts).
+    pub length_bars: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct InstrumentTrackArgs {
     pub name: String,
-    /// "synth" for the built-in synth, "drums" for the built-in GM drum kit, or a VST3 instrument name / bundle path (see list_instruments).
+    /// "synth" for the built-in synth, "drums" for the built-in GM drum kit, or a VST3 / AU instrument name, bundle path or AU id (see list_instruments).
     pub instrument: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetInstrumentArgs {
     pub track: usize,
-    /// "synth", "drums", a VST3 instrument name / bundle path, or omit to remove the instrument.
+    /// "synth", "drums", a VST3 / AU instrument name, bundle path or AU id, or omit to remove the instrument.
     pub instrument: Option<String>,
 }
 
@@ -461,7 +608,7 @@ pub struct ScanArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct InsertPluginArgs {
     pub track: usize,
-    /// Plugin name (as listed by scan_plugins, partial match ok) or path to a .vst3 bundle.
+    /// Plugin name (as listed by scan_plugins, partial match ok), path to a .vst3 bundle, or an AU id ("au:aufx:dely:appl"); "AU: Name" picks the Audio Unit when a VST3 has the same name.
     pub plugin: String,
     /// Position in the effect chain; omit to append.
     pub position: Option<usize>,
@@ -508,6 +655,150 @@ pub struct BypassArgs {
     #[serde(default)]
     pub master: bool,
     pub bypass: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AutomationOwnerArgs {
+    #[serde(default)]
+    pub track: usize,
+    /// The master bus's automation instead of a track's (track is ignored).
+    #[serde(default)]
+    pub master: bool,
+}
+
+/// What a lane automates.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AutomationTargetArgs {
+    /// "volume", "pan", "mute" (tracks only) or "plugin".
+    pub parameter: String,
+    /// For "plugin": the effect slot (as in get_project; with master: true, the master's).
+    pub slot: Option<usize>,
+    /// For "plugin": the track's instrument instead of an effect slot.
+    #[serde(default)]
+    pub instrument: bool,
+    /// For "plugin": the parameter id (see list_automation_params / list_plugin_params).
+    pub param_id: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AddLaneArgs {
+    #[serde(flatten)]
+    pub owner: AutomationOwnerArgs,
+    #[serde(flatten)]
+    pub target: AutomationTargetArgs,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LaneArgs {
+    #[serde(flatten)]
+    pub owner: AutomationOwnerArgs,
+    /// Lane index (see get_automation).
+    pub lane: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PointArg {
+    /// Timeline position (seconds).
+    pub time: f64,
+    /// Normalized 0..1 (volume: fader travel; pan: 0 left, 0.5 centre, 1 right; mute: 1 muted).
+    pub value: Option<f32>,
+    /// Volume lanes: the level in dB instead of value.
+    pub db: Option<f32>,
+    /// Pan lanes: -1 (left) .. 1 (right) instead of value.
+    pub pan: Option<f32>,
+    /// Shape of the segment to the next point: "linear" (default), "hold" (step), "smooth", "fast_start", "fast_end".
+    pub curve: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetPointsArgs {
+    #[serde(flatten)]
+    pub owner: AutomationOwnerArgs,
+    pub lane: usize,
+    pub points: Vec<PointArg>,
+    /// Replace the lane's points (default) or add to them.
+    #[serde(default = "yes")]
+    pub replace: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ClearAutomationArgs {
+    #[serde(flatten)]
+    pub owner: AutomationOwnerArgs,
+    pub lane: usize,
+    /// Only clear from/to these times (seconds); everything by default.
+    pub from: Option<f64>,
+    pub to: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LaneSettingsArgs {
+    #[serde(flatten)]
+    pub owner: AutomationOwnerArgs,
+    pub lane: usize,
+    /// Show the lane under its track in the GUI (also opens the track's automation view).
+    pub shown: Option<bool>,
+    /// "read" (play it), "off", or "touch"/"latch" (record GUI control moves while playing).
+    pub mode: Option<String>,
+}
+
+impl AutomationOwnerArgs {
+    fn owner(&self) -> Option<usize> {
+        (!self.master).then_some(self.track)
+    }
+}
+
+fn parse_name<T: serde::de::DeserializeOwned>(what: &str, s: &str) -> anyhow::Result<T> {
+    serde_json::from_value(json!(s.trim().to_lowercase())).map_err(|_| anyhow::anyhow!("unknown {what} '{s}'"))
+}
+
+/// A target as agents name it.
+fn target_json(e: &Engine, owner: Option<usize>, t: AutomationTarget) -> serde_json::Value {
+    match (t, e.target_slot(owner, t)) {
+        (AutomationTarget::Param { param, .. }, Some(SlotRef::Instrument)) => json!({ "parameter": "plugin", "instrument": true, "param_id": param }),
+        (AutomationTarget::Param { param, .. }, Some(SlotRef::Effect(s) | SlotRef::Master(s))) => json!({ "parameter": "plugin", "slot": s, "param_id": param }),
+        (AutomationTarget::Param { param, .. }, None) => json!({ "parameter": "plugin", "param_id": param }),
+        (other, _) => json!({ "parameter": format!("{other:?}").to_lowercase() }),
+    }
+}
+
+fn resolve_target(e: &Engine, owner: Option<usize>, a: &AutomationTargetArgs) -> anyhow::Result<AutomationTarget> {
+    Ok(match a.parameter.trim().to_lowercase().as_str() {
+        "volume" => AutomationTarget::Volume,
+        "pan" => AutomationTarget::Pan,
+        "mute" => AutomationTarget::Mute,
+        "plugin" | "param" | "parameter" => {
+            let param = a.param_id.ok_or_else(|| anyhow::anyhow!("give param_id for a plug-in parameter"))?;
+            let which = match (owner, a.instrument, a.slot) {
+                (Some(_), true, _) => SlotRef::Instrument,
+                (None, _, Some(s)) => SlotRef::Master(s),
+                (Some(_), false, Some(s)) => SlotRef::Effect(s),
+                _ => anyhow::bail!("give the plug-in's slot (or instrument: true)"),
+            };
+            e.param_target(owner, which, param)?
+        }
+        other => anyhow::bail!("parameter must be volume, pan, mute or plugin, not '{other}'"),
+    })
+}
+
+fn lane_json(e: &Engine, owner: Option<usize>, i: usize) -> anyhow::Result<serde_json::Value> {
+    let l = e.automation(owner)?.get(i).ok_or_else(|| anyhow::anyhow!("no lane {i}"))?;
+    let points: Vec<_> = l
+        .points
+        .iter()
+        .map(|p| {
+            let mut v = json!({ "time": (p.time_secs * 1e4).round() / 1e4, "value": (p.value * 1e4).round() / 1e4, "display": e.format_automation_value(owner, l.target, p.value) });
+            if p.curve != Curve::Linear {
+                v["curve"] = serde_json::to_value(p.curve).unwrap_or_default();
+            }
+            v
+        })
+        .collect();
+    Ok(json!({ "lane": i, "name": e.target_name(owner, l.target), "target": target_json(e, owner, l.target), "mode": l.mode, "shown": l.shown, "points": points }))
 }
 
 fn db_to_gain(db: f32) -> f32 {
@@ -605,7 +896,7 @@ impl DawServer {
         serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
     }
 
-    #[tool(description = "Render the mix offline and measure it: per track and for the master — peak (dBFS), integrated loudness (LUFS, BS.1770), energy per frequency band, and loudness through a simulated phone speaker. Use it to balance levels/EQ by numbers: similar phone_drop across tracks means the balance holds on small speakers; keep the master peak below -1 dBFS (clipped_samples 0). Built-in instruments and EQs are rendered; VST3 plug-ins are listed in warnings.")]
+    #[tool(description = "Render the mix offline and measure it: per track and for the master — peak (dBFS), integrated loudness (LUFS, BS.1770), energy per frequency band, and loudness through a simulated phone speaker. Use it to balance levels/EQ by numbers: similar phone_drop across tracks means the balance holds on small speakers; keep the master peak below -1 dBFS (clipped_samples 0). Built-in instruments and effects, VST3 and AU plug-ins are rendered; plug-ins that fail to load are listed in warnings.")]
     async fn analyze_mix(&self, Parameters(a): Parameters<AnalyzeMixArgs>) -> ToolResult {
         // Snapshot under the engine lock, then render without holding it.
         let engine = self.engine.clone();
@@ -624,12 +915,12 @@ impl DawServer {
         self.with_engine(move |e| e.new_project(&a.name).map(|_| "created")).await
     }
 
-    #[tool(description = "Load a project from a Reaper .rpp or native .json file. Returns warnings for missing media/plugins.")]
+    #[tool(description = "Load a project: native .otp/.json, Reaper .rpp, or import from another DAW — .dawproject (Bitwig, Studio One, Cubase), Ableton .als, .fcpxml (Logic Pro via File > Export > Project to Final Cut Pro XML), Ardour .ardour. Returns warnings for missing media/plugins and anything the import couldn't carry over. Imported projects have no path until saved.")]
     async fn load_project(&self, Parameters(a): Parameters<PathArgs>) -> ToolResult {
         self.with_engine(move |e| e.load_project(&PathBuf::from(a.path)).map(|w| json!({ "warnings": w }))).await
     }
 
-    #[tool(description = "Save the project. Use .otp (OpenTake project; added when no extension is given) or .rpp for a Reaper project. Plugin parameter values, MIDI and built-in plug-ins are only preserved in .otp.")]
+    #[tool(description = "Save the project. Use .otp (OpenTake project; added when no extension is given), .rpp for a Reaper project, or .dawproject to open it in Bitwig/Studio One/Cubase (audio embedded, MIDI included). Plugin parameter values and built-in plug-ins are only preserved in .otp.")]
     async fn save_project(&self, Parameters(a): Parameters<OptionalPathArgs>) -> ToolResult {
         self.with_engine(move |e| e.save_project(a.path.as_deref().map(std::path::Path::new))).await
     }
@@ -712,6 +1003,21 @@ impl DawServer {
         .await
     }
 
+    #[tool(description = "Measure the true recording latency: plays test chirps (about 2 s, replacing the mix; transport stops) and finds them on an input that hears the output — a cable from an output to that input, or speakers near a microphone. Sets the recording offset for this device setup to the difference from what the device reports. Ask the user to set up the loopback first.")]
+    async fn measure_latency(&self, Parameters(a): Parameters<MeasureLatencyArgs>) -> ToolResult {
+        self.with_engine(move |e| e.measure_latency(a.input_channel)).await
+    }
+
+    #[tool(description = "Recording latency correction for the current device setup (remembered per setup). New recordings are moved earlier by the interface round trip the device reports (get_status io_latency_ms) plus this offset, so they line up with what the performer heard. measure_latency sets it automatically.")]
+    async fn set_record_offset(&self, Parameters(a): Parameters<RecordOffsetArgs>) -> ToolResult {
+        self.with_engine(move |e| e.set_record_offset(a.offset_ms).map(|_| "ok")).await
+    }
+
+    #[tool(description = "Auto input monitoring (on by default): record-armed tracks monitor their input while stopped and while recording, and play back their regions during plain playback. Turn it off when the audio interface does its own direct monitoring; the I (monitor_input) button always monitors.")]
+    async fn set_auto_input_monitoring(&self, Parameters(a): Parameters<EnabledArgs>) -> ToolResult {
+        self.with_engine(move |e| e.set_auto_input_monitoring(a.enabled).map(|_| "ok")).await
+    }
+
     #[tool(description = "Set the master output level in dB.")]
     async fn set_master_volume(&self, Parameters(a): Parameters<MasterVolumeArgs>) -> ToolResult {
         self.with_engine(move |e| e.set_master_volume(db_to_gain(a.volume_db)).map(|_| "ok")).await
@@ -722,7 +1028,7 @@ impl DawServer {
         self.with_engine(move |e| e.set_metronome(a.enabled, a.volume_db.map(db_to_gain)).map(|_| "ok")).await
     }
 
-    #[tool(description = "Cycle (loop) playback: set the loop range in seconds and/or turn it on or off. Playback wraps from the end back to the start (not while recording).")]
+    #[tool(description = "Cycle (loop) playback: set the loop range in seconds and/or turn it on or off. Playback wraps from the end back to the start; recording does too, making each pass a take.")]
     async fn set_loop(&self, Parameters(a): Parameters<LoopArgs>) -> ToolResult {
         self.with_engine(move |e| {
             e.set_loop(a.enabled, a.start_secs, a.end_secs)?;
@@ -751,9 +1057,39 @@ impl DawServer {
         self.with_engine(move |e| e.import_guitar_pro(&path, &options).map(|t| json!({ "tracks": t }))).await
     }
 
+    #[tool(description = "Read a Standard MIDI File (.mid) and list its parts (one per track, or per channel where a track mixes channels) with channel, GM program and note count, plus tempo and length, without importing.")]
+    async fn inspect_midi_file(&self, Parameters(a): Parameters<MidiFilePathArgs>) -> ToolResult {
+        let path = PathBuf::from(a.path);
+        self.with_engine(move |_| opentake_engine::inspect_midi_file(&path)).await
+    }
+
+    #[tool(description = "Import a Standard MIDI File (format 0/1): each part becomes an instrument track with a MIDI region, timed through the file's tempo map; channel 10 gets the drum kit. One undo step. Returns the new track indices.")]
+    async fn import_midi_file(&self, Parameters(a): Parameters<MidiFileImportArgs>) -> ToolResult {
+        let path = PathBuf::from(&a.path);
+        let options = opentake_engine::MidiFileImport {
+            tracks: a.tracks,
+            instrument: a.instrument.unwrap_or_else(|| "synth".into()),
+            drum_instrument: a.drum_instrument,
+            set_tempo: a.set_tempo.unwrap_or(true),
+            position_secs: a.position_secs.unwrap_or(0.0),
+        };
+        self.with_engine(move |e| e.import_midi_file(&path, &options).map(|t| json!({ "tracks": t }))).await
+    }
+
+    #[tool(description = "Export the project's MIDI regions as a Standard MIDI File (format 1, with the tempo map; one track per instrument track, drum kits on channel 10). Muted regions are left out.")]
+    async fn export_midi_file(&self, Parameters(a): Parameters<MidiFilePathArgs>) -> ToolResult {
+        let path = PathBuf::from(a.path);
+        self.with_engine(move |e| e.export_midi_file(&path).map(|n| json!({ "tracks": n }))).await
+    }
+
     #[tool(description = "Add a track. Returns its index.")]
     async fn add_track(&self, Parameters(a): Parameters<NameArgs>) -> ToolResult {
         self.with_engine(move |e| e.add_track(&a.name).map(|i| json!({ "track": i }))).await
+    }
+
+    #[tool(description = "Move a track to another position in the track list (indices of the tracks in between shift). Undoable.")]
+    async fn move_track(&self, Parameters(a): Parameters<MoveTrackArgs>) -> ToolResult {
+        self.with_engine(move |e| e.move_track(a.track, a.to_index).map(|_| "ok")).await
     }
 
     #[tool(description = "Remove a track (indices of later tracks shift down).")]
@@ -761,7 +1097,17 @@ impl DawServer {
         self.with_engine(move |e| e.remove_track(a.track)).await
     }
 
-    #[tool(description = "Change track settings: name, volume (dB), pan, mute, solo, record arm, input monitoring, input channel.")]
+    #[tool(description = "Add a bus (aux) track: it sums the tracks routed to it (pass tracks, or set their output with update_track), runs them through its own effects (insert_plugin with the bus's index) and fader, and feeds the master or another bus. Returns its index.")]
+    async fn add_bus(&self, Parameters(a): Parameters<AddBusArgs>) -> ToolResult {
+        self.with_engine(move |e| match &a.tracks {
+            Some(tracks) => e.create_bus_from(tracks, &a.name),
+            None => e.add_bus(&a.name),
+        }
+        .map(|i| json!({ "track": i })))
+        .await
+    }
+
+    #[tool(description = "Change track settings: name, volume (dB), pan, mute, solo, record arm, input monitoring, input channel, output (a bus track index or \"master\").")]
     async fn update_track(&self, Parameters(a): Parameters<UpdateTrackArgs>) -> ToolResult {
         let update = TrackUpdate {
             name: a.name,
@@ -774,9 +1120,13 @@ impl DawServer {
             input_channel: a.input_channel,
         };
         self.with_engine(move |e| {
+            if let Some(output) = &a.output {
+                e.set_track_output(a.track, output.bus()?)?;
+            }
             let track = e.update_track(a.track, update)?;
             // The settings, not every region and note.
             Ok(json!({
+                "output": e.project().output_of(a.track).map_or(json!("master"), |b| json!(b)),
                 "track": a.track,
                 "name": track.name,
                 "volume_db": 20.0 * track.volume.max(1e-6).log10(),
@@ -794,6 +1144,16 @@ impl DawServer {
     #[tool(description = "Place a WAV file on a track at a position (seconds).")]
     async fn add_clip(&self, Parameters(a): Parameters<AddClipArgs>) -> ToolResult {
         self.with_engine(move |e| e.add_clip(a.track, &PathBuf::from(a.file), a.position_secs)).await
+    }
+
+    #[tool(description = "Choose which take of a take folder (a region with `takes`, from cycle recording) plays. Undoable.")]
+    async fn select_take(&self, Parameters(a): Parameters<TakeArgs>) -> ToolResult {
+        self.with_engine(move |e| e.select_take(a.track, a.clip, a.take)).await
+    }
+
+    #[tool(description = "Delete a take from a take folder (the audio file stays on disk). A folder left with one take becomes a plain region. Undoable.")]
+    async fn delete_take(&self, Parameters(a): Parameters<TakeArgs>) -> ToolResult {
+        self.with_engine(move |e| e.remove_take(a.track, a.clip, a.take)).await
     }
 
     #[tool(description = "Remove a clip from a track.")]
@@ -825,6 +1185,55 @@ impl DawServer {
         self.with_engine(move |e| e.trim_clip(a.track, a.clip, a.start_secs, a.end_secs)).await
     }
 
+    #[tool(description = "Set an audio region's gain in dB (before the track fader; 0 = unchanged, -60..+24). Undoable.")]
+    async fn set_clip_gain(&self, Parameters(a): Parameters<ClipGainArgs>) -> ToolResult {
+        self.with_engine(move |e| e.set_clip_gain(a.track, a.clip, a.gain_db)).await
+    }
+
+    #[tool(description = "Normalize an audio region: set its gain so its loudest sample (after pitch/stretch) reaches target_db dBFS (default 0). Returns the peak found and the gain set. Undoable.")]
+    async fn normalize_clip(&self, Parameters(a): Parameters<NormalizeClipArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let peak = e.clip_peak(a.track, a.clip)?;
+            let c = e.normalize_clip(a.track, a.clip, a.target_db.unwrap_or(0.0))?;
+            let db = |v: f32| (20.0 * v.log10() * 100.0).round() / 100.0;
+            Ok(json!({ "peak_db": db(peak), "gain_db": db(c.gain) }))
+        })
+        .await
+    }
+
+    #[tool(description = "Pitch-shift and/or time-stretch an audio region (independently; formants aren't preserved). Stretch by a ratio, or fit the region to a length in seconds or bars (e.g. to match a loop to the tempo). The source offset stays in source seconds. Long regions take a moment to render. Undoable.")]
+    async fn set_clip_pitch_stretch(&self, Parameters(a): Parameters<PitchStretchArgs>) -> ToolResult {
+        let engine = self.engine.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let lock = || engine.lock().map_err(|_| anyhow::anyhow!("engine lock poisoned"));
+            let (ps, job) = {
+                let mut e = lock()?;
+                let clip = e.project().tracks.get(a.track).and_then(|t| t.clips.get(a.clip)).ok_or_else(|| anyhow::anyhow!("no clip {} on track {}", a.clip, a.track))?;
+                let length_secs = match a.length_bars {
+                    Some(bars) => {
+                        let map = e.project().tempo_map();
+                        let q0 = map.quarters_at(clip.position_secs);
+                        Some(map.secs_at(q0 + bars * opentake_engine::project::tempo::bar_len_q(map.signature_at(clip.position_secs))) - clip.position_secs)
+                    }
+                    None => a.length_secs,
+                };
+                let ps = opentake_engine::PitchStretch { semitones: a.semitones, cents: a.cents, stretch: a.stretch, length_secs };
+                (ps, e.pitch_stretch_job(a.track, a.clip, ps)?)
+            };
+            // Render without holding the engine, then apply the edit (now cached).
+            let render = job.map(|j| j.render());
+            let mut e = lock()?;
+            if let Some(r) = render {
+                e.add_flex_render(r);
+            }
+            e.set_clip_pitch_stretch(a.track, a.clip, ps)
+        })
+        .await
+        .map_err(|e| format!("pitch/stretch failed: {e}"))?;
+        let clip = result.map_err(|e| format!("{e:#}"))?;
+        serde_json::to_string_pretty(&clip).map_err(|e| e.to_string())
+    }
+
     #[tool(description = "Undo the last edit (made by the user or an agent). Returns what was undone.")]
     async fn undo(&self) -> ToolResult {
         self.with_engine(|e| e.undo().map(|l| json!({ "undone": l }))).await
@@ -840,7 +1249,7 @@ impl DawServer {
         self.with_engine(|e| Ok(e.history_info())).await
     }
 
-    #[tool(description = "Instruments available for instrument tracks: the built-in synth plus scanned VST3 instruments.")]
+    #[tool(description = "Instruments available for instrument tracks: the built-in synth and drums plus scanned VST3 and Audio Unit (macOS) instruments.")]
     async fn list_instruments(&self) -> ToolResult {
         self.with_engine(|e| {
             if e.scanned_plugins().is_empty() {
@@ -935,29 +1344,29 @@ impl DawServer {
         self.with_engine(move |e| e.seek(a.position_secs).map(|_| "ok")).await
     }
 
-    #[tool(description = "Start recording all armed tracks from the current position (also starts playback). Call stop to finish.")]
+    #[tool(description = "Start recording all armed tracks from the current position (also starts playback). Call stop to finish. With the cycle on it loops, and each pass through the cycle becomes a take (a pass under half the cycle is dropped); recording the same cycle again adds takes to the same folder.")]
     async fn record(&self) -> ToolResult {
         self.with_engine(|e| e.record_audio().map(|files| json!({ "recording_to": files }))).await
     }
 
-    #[tool(description = "Scan VST3 folders and list available plugins.")]
+    #[tool(description = "Scan VST3 folders and list available plugins, plus installed Audio Units on macOS (audio_units; insert them by id).")]
     async fn scan_plugins(&self, Parameters(a): Parameters<ScanArgs>) -> ToolResult {
         self.with_engine(move |e| {
             for p in a.extra_paths {
                 e.add_plugin_search_path(p.into());
             }
             let (plugins, errors) = e.scan_plugins();
-            Ok(json!({ "search_paths": e.plugin_search_paths(), "plugins": plugins, "errors": errors }))
+            Ok(json!({ "search_paths": e.plugin_search_paths(), "plugins": plugins, "audio_units": e.audio_units(), "errors": errors }))
         })
         .await
     }
 
-    #[tool(description = "Insert an effect into a track's chain. Built-ins: \"eq\" (6-band parametric EQ), \"comp\" (compressor: threshold, ratio, attack, release, knee, makeup, mix), \"limiter\" (look-ahead brickwall: gain, ceiling, release), \"delay\" (ms or tempo-synced note values, feedback, mix, repeat filters, ping-pong); or a VST3 effect. list_plugin_params shows ids and values. Plug-in latency is compensated automatically. Returns the slot index.")]
+    #[tool(description = "Insert an effect into a track's chain. Built-ins: \"eq\" (6-band parametric EQ), \"comp\" (compressor: threshold, ratio, attack, release, knee, makeup, mix), \"multiband\" (3-band compressor: two crossovers, then threshold, ratio, attack, release, gain, bypass and solo per band, and output), \"limiter\" (look-ahead brickwall: gain, ceiling, release), \"delay\" (ms or tempo-synced note values, feedback, mix, repeat filters, ping-pong); or a VST3 / AU effect. list_plugin_params shows ids and values. Plug-in latency is compensated automatically. Returns the slot index.")]
     async fn insert_plugin(&self, Parameters(a): Parameters<InsertPluginArgs>) -> ToolResult {
         self.with_engine(move |e| e.insert_plugin(a.track, &a.plugin, a.position).map(|s| json!({ "slot": s }))).await
     }
 
-    #[tool(description = "Insert an effect on the master bus (\"eq\", \"comp\", \"limiter\", \"delay\" or a VST3 effect; a limiter last in the chain sets the final peak ceiling and loudness). Returns the slot index; use master: true with list_plugin_params / set_plugin_param / set_plugin_bypass.")]
+    #[tool(description = "Insert an effect on the master bus (\"eq\", \"comp\", \"multiband\", \"limiter\", \"delay\" or a VST3 / AU effect; a limiter last in the chain sets the final peak ceiling and loudness). Returns the slot index; use master: true with list_plugin_params / set_plugin_param / set_plugin_bypass.")]
     async fn insert_master_plugin(&self, Parameters(a): Parameters<InsertMasterPluginArgs>) -> ToolResult {
         self.with_engine(move |e| e.insert_master_plugin(&a.plugin, a.position).map(|s| json!({ "slot": s }))).await
     }
@@ -989,6 +1398,86 @@ impl DawServer {
             Ok(params)
         })
         .await
+    }
+
+    #[tool(description = "What a track (or master: true) can automate: volume, pan, mute and each plug-in parameter, with the target to pass to add_automation_lane.")]
+    async fn list_automation_params(&self, Parameters(a): Parameters<AutomationOwnerArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let owner = a.owner();
+            let list: Vec<_> = e.automation_params(owner)?.into_iter().map(|p| json!({ "name": p.name, "group": p.group, "target": target_json(e, owner, p.target) })).collect();
+            Ok(list)
+        })
+        .await
+    }
+
+    #[tool(description = "A track's (or the master's) automation lanes with their points (time s, normalized value, display, curve), mode and visibility.")]
+    async fn get_automation(&self, Parameters(a): Parameters<AutomationOwnerArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let owner = a.owner();
+            (0..e.automation(owner)?.len()).map(|i| lane_json(e, owner, i)).collect::<anyhow::Result<Vec<_>>>()
+        })
+        .await
+    }
+
+    #[tool(description = "Add an automation lane (shown under the track) for volume, pan, mute or a plug-in parameter; returns its index (an existing lane for the same target is reused). Draw it with set_automation_points. Undoable.")]
+    async fn add_automation_lane(&self, Parameters(a): Parameters<AddLaneArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let owner = a.owner.owner();
+            let target = resolve_target(e, owner, &a.target)?;
+            let lane = e.add_lane(owner, target)?;
+            Ok(json!({ "lane": lane, "name": e.target_name(owner, target) }))
+        })
+        .await
+    }
+
+    #[tool(description = "Set a lane's points (replace, or add with replace: false). Values are normalized 0..1, or give db (volume) or pan (-1..1). Between points the value ramps (curve per point). Undoable.")]
+    async fn set_automation_points(&self, Parameters(a): Parameters<SetPointsArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let owner = a.owner.owner();
+            let target = e.automation(owner)?.get(a.lane).ok_or_else(|| anyhow::anyhow!("no lane {}", a.lane))?.target;
+            let mut points = Vec::new();
+            for p in &a.points {
+                let value = match (p.value, p.db, p.pan, target) {
+                    (Some(v), ..) => v,
+                    (None, Some(db), _, AutomationTarget::Volume) => target.from_units(db),
+                    (None, _, Some(pan), AutomationTarget::Pan) => target.from_units(pan),
+                    _ => anyhow::bail!("point at {} s needs a value (or db for volume, pan for pan lanes)", p.time),
+                };
+                let curve = p.curve.as_deref().map(|c| parse_name::<Curve>("curve", c)).transpose()?.unwrap_or_default();
+                points.push(AutomationPoint { curve, ..AutomationPoint::new(p.time, value) });
+            }
+            e.set_automation_points(owner, a.lane, points, a.replace)?;
+            lane_json(e, owner, a.lane)
+        })
+        .await
+    }
+
+    #[tool(description = "Remove a lane's points, all or between from and to (seconds). Undoable.")]
+    async fn clear_automation(&self, Parameters(a): Parameters<ClearAutomationArgs>) -> ToolResult {
+        self.with_engine(move |e| e.clear_automation(a.owner.owner(), a.lane, a.from, a.to).map(|_| "ok")).await
+    }
+
+    #[tool(description = "Show/hide a lane and set its mode: read (plays), off, touch or latch (record GUI control moves while playing). Undoable.")]
+    async fn set_automation_lane(&self, Parameters(a): Parameters<LaneSettingsArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let owner = a.owner.owner();
+            if let Some(m) = &a.mode {
+                e.set_lane_mode(owner, a.lane, parse_name::<AutomationMode>("mode", m)?)?;
+            }
+            if let Some(shown) = a.shown {
+                e.set_lane_shown(owner, a.lane, shown)?;
+                if let (Some(t), true) = (owner, shown) {
+                    e.set_automation_shown(Some(t), true)?;
+                }
+            }
+            lane_json(e, owner, a.lane)
+        })
+        .await
+    }
+
+    #[tool(description = "Delete an automation lane (later lanes' indices shift down). Undoable.")]
+    async fn remove_automation_lane(&self, Parameters(a): Parameters<LaneArgs>) -> ToolResult {
+        self.with_engine(move |e| e.remove_lane(a.owner.owner(), a.lane).map(|_| "ok")).await
     }
 
     #[tool(description = "Set a plugin parameter (normalized 0..1). Returns the plugin's display string for the new value.")]
@@ -1036,5 +1525,41 @@ mod compact_tests {
         assert_eq!(compact["tracks"][0]["index"], 0);
         let full = project_json(&p, true);
         assert_eq!(full["tracks"][0]["midi_clips"][0]["notes"].as_array().map(|n| n.len()), Some(3));
+    }
+
+    #[test]
+    fn automation_targets_points_and_compact_lanes() {
+        let mut e = Engine::new();
+        e.add_track("Gtr").unwrap();
+        e.insert_plugin(0, "comp", None).unwrap();
+        let args: AddLaneArgs = serde_json::from_value(json!({ "track": 0, "parameter": "plugin", "slot": 0, "param_id": 1 })).unwrap();
+        let target = resolve_target(&e, args.owner.owner(), &args.target).unwrap();
+        let lane = e.add_lane(Some(0), target).unwrap();
+        assert_eq!(target_json(&e, Some(0), target), json!({ "parameter": "plugin", "slot": 0, "param_id": 1 }));
+        let vol = e.add_lane(Some(0), AutomationTarget::Volume).unwrap();
+        e.set_automation_points(Some(0), vol, vec![AutomationPoint::new(1.0, AutomationTarget::Volume.from_units(-6.0))], true).unwrap();
+        let v = lane_json(&e, Some(0), vol).unwrap();
+        assert_eq!(v["points"][0]["display"], json!("-6.0 dB"));
+        assert_eq!(lane_json(&e, Some(0), lane).unwrap()["name"], json!("OpenTake Compressor: Ratio"));
+        assert!(parse_name::<Curve>("curve", "Fast_Start").is_ok() && parse_name::<AutomationMode>("mode", "bogus").is_err());
+        let p = project_json(e.project(), false);
+        assert_eq!(p["tracks"][0]["automation"][1]["point_count"], json!(1));
+        assert!(p["tracks"][0]["automation"][1].get("points").is_none());
+        let bad: AddLaneArgs = serde_json::from_value(json!({ "master": true, "parameter": "pan" })).unwrap();
+        assert!(e.add_lane(bad.owner.owner(), resolve_target(&e, None, &bad.target).unwrap()).is_err());
+    }
+
+    #[test]
+    fn project_json_shows_kind_and_output_by_index() {
+        let mut e = Engine::new();
+        e.add_track("Gtr").unwrap();
+        e.create_bus_from(&[0], "Bus").unwrap();
+        let v = project_json(e.project(), false);
+        assert_eq!((&v["tracks"][0]["kind"], &v["tracks"][0]["output"]), (&json!("audio"), &json!(1)));
+        assert_eq!((&v["tracks"][1]["kind"], &v["tracks"][1]["output"]), (&json!("bus"), &json!("master")));
+        let arg: UpdateTrackArgs = serde_json::from_value(json!({ "track": 0, "output": "master" })).unwrap();
+        assert_eq!(arg.output.unwrap().bus().unwrap(), None);
+        let arg: UpdateTrackArgs = serde_json::from_value(json!({ "track": 0, "output": 1 })).unwrap();
+        assert_eq!(arg.output.unwrap().bus().unwrap(), Some(1));
     }
 }

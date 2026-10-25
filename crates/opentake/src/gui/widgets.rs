@@ -8,8 +8,10 @@ use egui::{Align2, Color32, FontId, Pos2, Rangef, Rect, Response, Role, Sense, S
 
 use super::theme;
 
-pub const MIN_DB: f32 = -60.0;
-pub const MAX_DB: f32 = 6.0;
+use opentake_engine::project::automation;
+
+pub const MIN_DB: f32 = automation::FADER_MIN_DB;
+pub const MAX_DB: f32 = automation::FADER_MAX_DB;
 
 pub fn label(resp: &Response, role: Role, text: &str) {
     let text = text.to_string();
@@ -56,6 +58,9 @@ pub enum Icon {
     Forward,
     Metronome,
     Cycle,
+    Mixer,
+    PianoRoll,
+    Tablature,
 }
 
 /// Rounded transport-style button with a vector icon.
@@ -295,6 +300,34 @@ pub fn draw_icon(p: &egui::Painter, icon: Icon, c: Pos2, r: f32, color: Color32)
             p.circle_filled(pos2(c.x, c.y - r * 0.45), 1.3, color);
             p.line_segment([pos2(c.x, c.y - r * 0.1), pos2(c.x, c.y + r * 0.55)], stroke);
         }
+        Icon::Mixer => {
+            // Three fader slots with their caps at different heights.
+            for (i, cap) in [0.35f32, -0.45, 0.05].into_iter().enumerate() {
+                let x = c.x + (i as f32 - 1.0) * r * 0.75;
+                p.line_segment([pos2(x, c.y - r), pos2(x, c.y + r)], Stroke::new(1.2, color));
+                p.rect_filled(Rect::from_center_size(pos2(x, c.y + cap * r), vec2(r * 0.55, r * 0.32)), 1.0, color);
+            }
+        }
+        Icon::PianoRoll => {
+            // A keyboard: white keys, with black keys between some of them.
+            let rect = Rect::from_center_size(c, vec2(r * 2.1, r * 1.8));
+            p.rect_stroke(rect, 1.5, stroke, egui::StrokeKind::Middle);
+            let w = rect.width() / 4.0;
+            for i in 1..4 {
+                let x = rect.left() + w * i as f32;
+                p.line_segment([pos2(x, rect.top() + rect.height() * 0.55), pos2(x, rect.bottom())], Stroke::new(1.0, color));
+                p.rect_filled(Rect::from_min_size(pos2(x - w * 0.28, rect.top()), vec2(w * 0.56, rect.height() * 0.58)), 0.5, color);
+            }
+        }
+        Icon::Tablature => {
+            // Tab staff lines with fret numbers as dots.
+            for i in 0..4 {
+                let y = c.y + (i as f32 - 1.5) * r * 0.6;
+                p.line_segment([pos2(c.x - r, y), pos2(c.x + r, y)], Stroke::new(1.0, color));
+            }
+            p.circle_filled(pos2(c.x - r * 0.4, c.y - r * 0.3), r * 0.24, color);
+            p.circle_filled(pos2(c.x + r * 0.45, c.y + r * 0.3), r * 0.24, color);
+        }
     }
 }
 
@@ -345,26 +378,9 @@ pub fn knob(ui: &mut Ui, value: &mut f32, min: f32, max: f32, default: f32, bipo
     resp
 }
 
-/// Fader position (0..1) <-> linear gain, with 0 dB at ~78% travel like hardware faders.
-pub fn gain_to_pos(gain: f32) -> f32 {
-    let db = gain_to_db(gain);
-    if db <= MIN_DB { 0.0 } else { ((db - MIN_DB) / (MAX_DB - MIN_DB)).powf(1.6) }
-}
-
-pub fn pos_to_gain(pos: f32) -> f32 {
-    if pos <= 0.0 {
-        return 0.0;
-    }
-    db_to_gain(MIN_DB + pos.clamp(0.0, 1.0).powf(1.0 / 1.6) * (MAX_DB - MIN_DB))
-}
-
-pub fn gain_to_db(gain: f32) -> f32 {
-    if gain <= 0.0 { f32::NEG_INFINITY } else { 20.0 * gain.log10() }
-}
-
-pub fn db_to_gain(db: f32) -> f32 {
-    if db <= MIN_DB { 0.0 } else { 10f32.powf(db / 20.0) }
-}
+// Fader position (0..1) <-> linear gain; shared with volume automation, so a volume curve
+// moves like the fader.
+pub use automation::{db_to_gain, gain_to_db, gain_to_pos, pos_to_gain};
 
 pub fn format_db(gain: f32) -> String {
     let db = gain_to_db(gain);

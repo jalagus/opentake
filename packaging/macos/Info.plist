@@ -52,6 +52,19 @@
         </dict>
         <dict>
             <key>CFBundleTypeName</key>
+            <string>MIDI File</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>mid</string>
+                <string>midi</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
             <string>Reaper Project</string>
             <key>CFBundleTypeRole</key>
             <string>Editor</string>
@@ -60,6 +73,32 @@
             <key>CFBundleTypeExtensions</key>
             <array>
                 <string>rpp</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>DAWproject</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>dawproject</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>DAW Project (import)</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>als</string>
+                <string>fcpxml</string>
+                <string>ardour</string>
             </array>
         </dict>
     </array>

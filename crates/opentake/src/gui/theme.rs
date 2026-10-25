@@ -38,6 +38,9 @@ pub const TEMPO: Color32 = Color32::from_rgb(255, 150, 70);
 pub const RECORD: Color32 = Color32::from_rgb(232, 64, 58);
 pub const INPUT: Color32 = Color32::from_rgb(240, 140, 50);
 pub const PLAY: Color32 = Color32::from_rgb(80, 205, 120);
+/// Automation: the track button and lanes in Read (Logic's green), writing modes (amber).
+pub const AUTOMATION: Color32 = Color32::from_rgb(120, 200, 110);
+pub const AUTOMATION_WRITE: Color32 = Color32::from_rgb(236, 150, 60);
 
 pub const METER_LOW: Color32 = Color32::from_rgb(70, 210, 110);
 pub const METER_MID: Color32 = Color32::from_rgb(230, 205, 70);
@@ -56,6 +59,14 @@ pub const TRACK_COLORS: [Color32; 8] = [
 
 pub fn track_color(i: usize) -> Color32 {
     TRACK_COLORS[i % TRACK_COLORS.len()]
+}
+
+/// Bus tracks share one muted colour, so they stand apart from the tracks they sum.
+pub const BUS: Color32 = Color32::from_rgb(128, 168, 152);
+
+/// A track's colour: its palette colour, or `BUS` for a bus.
+pub fn color_of(track: &opentake_engine::project::Track, i: usize) -> Color32 {
+    if track.bus { BUS } else { track_color(i) }
 }
 
 /// Scale a colour's brightness (keeps alpha).

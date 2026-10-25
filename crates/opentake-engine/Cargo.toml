@@ -17,3 +17,10 @@ serde.workspace = true
 opentake-project.workspace = true
 serde_json.workspace = true
 flacenc.workspace = true
+midly.workspace = true
+signalsmith-stretch.workspace = true
+
+# Audio Unit hosting (see engine/au.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+opentake-au.workspace = true
+base64 = "0.23"

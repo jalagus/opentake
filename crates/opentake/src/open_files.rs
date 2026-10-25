@@ -1,5 +1,5 @@
-//! Files the operating system asks OpenTake to open (a double-clicked `.otp`, `.rpp` or
-//! `.gp`), queued for the GUI. On macOS documents arrive as an "open documents" Apple Event
+//! Files the operating system asks OpenTake to open (a double-clicked `.otp`, `.rpp`,
+//! `.gp`, `.mid`, `.dawproject`, …), queued for the GUI. On macOS documents arrive as an "open documents" Apple Event
 //! rather than as command-line arguments, so a small handler catches those.
 
 use std::path::PathBuf;

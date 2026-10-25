@@ -23,7 +23,7 @@ impl GainMeter {
         let _ = cell.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| (db > f32::from_bits(old)).then_some(db.to_bits()));
     }
 
-    fn report(&self, reduction_db: f32, input_db: f32, output_db: f32) {
+    pub(crate) fn report(&self, reduction_db: f32, input_db: f32, output_db: f32) {
         Self::raise(&self.reduction, reduction_db);
         Self::raise(&self.input, input_db);
         Self::raise(&self.output, output_db);

@@ -79,7 +79,7 @@ fn song_tempo_map(score: &Score, perf: &timeline::Performance, start: f64) -> (f
 
 /// Opening tempo/signature and changes from song-relative points (time, tempo change,
 /// signature change), placed at `start` seconds on the timeline.
-fn tempo_map_from_points(
+pub(super) fn tempo_map_from_points(
     mut points: Vec<(f64, Option<f64>, Option<(u32, u32)>)>,
     first_bpm: f64,
     first_sig: (u32, u32),

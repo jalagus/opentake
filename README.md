@@ -16,16 +16,21 @@ in a clean, Logic-inspired interface. Every part of a session is also exposed ov
 same project you have open: create tracks, write MIDI, set up plug-ins, edit and mix while
 you watch the changes appear live — and undo anything you don't like.
 
-- 🎙️ Multitrack recording from any audio interface (CoreAudio, WASAPI, ALSA/JACK via cpal)
-- 🎹 Instrument tracks, piano roll, a built-in synth and GM drum kit; VST3 instruments and effects
-- 🎛️ Built-in EQ, compressor, limiter and delay on any track or the master bus; plug-in delay compensation
+- 🎙️ Multitrack recording from any audio interface (CoreAudio, WASAPI, ALSA/JACK via cpal), latency-compensated with a built-in loopback measurement
+- 🎹 Instrument tracks, piano roll, a built-in synth and GM drum kit; VST3 instruments and effects, plus Audio Units on macOS
+- 🎛️ Built-in EQ, compressor, multiband compressor, limiter and delay on any track or the master bus; plug-in delay compensation
+- 🔀 Buses: route tracks into a bus and process the group with its own effects and fader
+- 📈 Automation of volume, pan, mute and any plug-in parameter, in lanes under each track, with Read, Touch and Latch modes
 - ⏱️ Project tempo map (tempo and time-signature changes), metronome with count-in
-- ✂️ Region editing: select, move, copy, split, trim, snap, cycle/loop
+- 🔁 Cycle recording: loop a section and record take after take, then pick the one that plays
+- ✂️ Region editing: select, move, copy, split, trim, snap, cycle/loop; region gain and normalize
 - 🎚️ Full mixer, metronome, undo/redo for everything
 - 💾 Export the mix and stems to WAV or FLAC, faster than real time
-- 🤖 MCP server (stdio or HTTP) with 57 tools — the agent and you share one session
-- 📂 Its own `.otp` project files (double-click to open), and Reaper `.rpp` projects
+- 🤖 MCP server (stdio or HTTP) with 77 tools — the agent and you share one session
+- 📂 Its own `.otp` project files (double-click to open), Reaper `.rpp` and DAWproject (Bitwig, Studio One, Cubase) projects
+- 🔀 Imports Ableton Live sets (`.als`), Ardour sessions, and Logic Pro projects exported as Final Cut Pro XML
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
+- 🎼 Imports and exports Standard MIDI Files (`.mid`): one instrument track per part, with the file's tempo map
 - 🦀 Real-time safe audio engine: no locks or allocation on the audio thread
 
 ## Download
@@ -54,6 +59,7 @@ The builds aren't signed yet:
 |---|---|
 | `crates/opentake-project` | Project model (tracks, clips, plugin slots), Reaper `.rpp` import/export, Guitar Pro 7/8 reader |
 | `crates/opentake-vst3` | VST3 hosting: bundle scanning, loading, parameters, state, realtime processing |
+| `crates/opentake-au` | Audio Unit hosting on macOS (AudioToolbox): listing, loading, parameters, state, host transport, realtime processing |
 | `crates/opentake-engine` | cpal audio I/O, lock-free mixer, WAV recorder, control-side `Engine` API |
 | `crates/opentake` | `opentake` binary: egui GUI, MCP server (stdio or streamable HTTP), small CLI |
 
@@ -79,7 +85,7 @@ cargo build --release
 ./target/release/opentake serve           # headless, MCP over stdio (for agents that launch it)
 ./target/release/opentake serve --http 127.0.0.1:8808   # headless, MCP over HTTP
 ./target/release/opentake devices         # list audio interfaces
-./target/release/opentake scan            # list VST3 plugins
+./target/release/opentake scan            # list VST3 plugins (and Audio Units on macOS)
 ```
 
 Options: `--project song.rpp` (open on start), `--no-input` (output only), `--no-mcp` (GUI without
@@ -90,11 +96,12 @@ elsewhere); set `OPENTAKE_CONFIG_DIR` to keep them somewhere else.
 
 ### GUI
 
-![OpenTake: arrangement with tracks, regions, cycle range and the mixer](assets/screenshots/arrange.png)
+![OpenTake: arrangement with tracks, a take folder, a bus, a volume automation lane, the cycle range and the mixer](assets/screenshots/arrange.png)
 
 <p>
-  <img src="assets/screenshots/tablature.png" alt="Guitar Pro import shown as notation and tablature under the arrangement" width="49%">
-  <img src="assets/screenshots/eq.png" alt="The built-in EQ with its live analyzer on the master bus" width="49%">
+  <img src="assets/screenshots/tablature.png" alt="Guitar Pro import shown as notation and tablature under the arrangement" width="32.5%">
+  <img src="assets/screenshots/eq.png" alt="The built-in EQ with its live analyzer on the master bus" width="32.5%">
+  <img src="assets/screenshots/multiband.png" alt="The built-in multiband compressor with its bands, crossovers and gain reduction" width="32.5%">
 </p>
 
 A dark, Logic Pro–inspired interface. The GUI and the MCP server share one engine, so
@@ -103,11 +110,39 @@ agent.
 
 - **Record and arrange**: audio and instrument tracks; move, trim, split, copy and loop regions
   with snapping; tempo and time-signature changes; a metronome with count-in.
-- **MIDI**: a built-in synth and drum kit or any VST3 instrument, edited in the piano roll.
+- **MIDI**: a built-in synth and drum kit or any VST3 / Audio Unit instrument, edited in the piano roll.
 - **Guitar Pro import**: drop a `.gp` file to get one instrument track per part, the song's
   tempo map, and tablature or notation that scrolls along with the arrangement (**T**).
-- **Mix**: an inspector and a mixer (**I**, **X**), plus built-in EQ, compressor, limiter and
-  delay alongside VST3 effects. Plug-in latency is compensated automatically.
+- **MIDI files**: drop a `.mid` file (or File → Import MIDI File…) to pick its parts; each
+  becomes an instrument track (channel 10 on the drum kit). File → Export MIDI File… writes
+  the MIDI regions back out.
+- **Mix**: an inspector and a mixer (**I**, **X**), plus built-in EQ, compressor, multiband compressor, limiter and
+  delay alongside VST3 and Audio Unit effects. Plug-in latency is compensated automatically.
+- **Buses**: Track → New Bus (or Create Bus from Selection), then pick a track's Output in
+  the inspector or mixer; effects on the bus process the whole group.
+- **Automation**: the **A** button in a track header (or **A** for all tracks, View → Show
+  Automation, or the track's context menu) shows its automation lanes right under it. Pick what a
+  lane moves (volume, pan, mute or any plug-in parameter) in its header, click to add points
+  (snapped), drag them (Shift: fine), double-click or ⌫ to delete; right-click a point for its
+  curve (linear, hold, smooth, fast start/end). In Read, faders and knobs follow the lane; moved
+  while stopped they set the point at the playhead. Touch and Latch record control moves while
+  playing. The master's volume and plug-ins can be automated too (over MCP).
+- **Region gain**: select an audio region and set its Gain in the inspector, or Normalize it so
+  its peak reaches 0 dBFS.
+- **Arrange tracks**: drag a track's header (or its mixer strip) to move it; click a strip to
+  select its track. The buttons left of the transport show the inspector, mixer, piano roll and
+  tablature.
+- **Recording**: armed tracks monitor their input while stopped and while recording (Transport →
+  Auto Input Monitoring; turn it off if your interface monitors directly), and show a red region
+  growing with the playhead while they record.
+- **Dynamics**: the compressor and limiter show a scrolling gain-reduction history.
+- **Takes**: record with the cycle on and each pass becomes a take in one region; its badge
+  (e.g. 3/5) picks the take that plays, and recording the same cycle again adds more.
+- **Latency compensation**: recordings land where you played them. Audio Settings → Measure
+  Latency checks the device's figure with a loopback (a cable, or speakers into a microphone).
+- **Pitch and stretch**: transpose an audio region (semitones and cents) and time-stretch it,
+  each without changing the other: use the inspector, or ⌥-drag the region's end to stretch it
+  to the grid. Uses Signalsmith Stretch (MIT).
 - **Export**: the mix and stems as WAV or FLAC (File → Export Audio…, ⇧⌘E).
 - **Undo everything**: ⌘Z / ⇧⌘Z, including edits made by an agent.
 
@@ -136,6 +171,7 @@ of the tool calls behind them):
 - "Import `~/Songs/riff.gp` with the drum kit for drums and use the song's tempo map."
 - "Loop bars 17–24 with a two-bar count-in so I can practise the solo."
 - "Arm the Guitar track on input 1 and record from bar 9."
+- "Cycle bars 5–8 so I can record a few takes of the chorus vocal." Then: "Play take 3."
 - "Write a root-note bass line for an A–F–C–G progression over bars 1–8."
 - "Do a balanced mix that works on phones and studio monitors." The agent measures with
   `analyze_mix`, adjusts levels, pans and EQs, and re-checks until it's right.
@@ -145,14 +181,21 @@ of the tool calls behind them):
 
 `get_status`, `list_audio_devices`, `start_audio`, `stop_audio`, `undo`, `redo`, `get_history`,
 `get_project`, `get_midi_notes`, `analyze_mix`, `export_audio`, `new_project`, `load_project`, `save_project`, `set_tempo`, `set_tempo_map`, `get_tempo_map`, `convert_time`,
-`set_master_volume`, `set_metronome`, `set_count_in`, `set_loop`,
-`add_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `remove_clip`,
+`set_master_volume`, `set_metronome`, `set_auto_input_monitoring`, `set_count_in`, `set_loop`,
+`add_track`, `add_bus`, `move_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `set_clip_gain`, `normalize_clip`, `set_clip_pitch_stretch`, `remove_clip`,
 `play`, `stop`, `seek`, `record`,
 `scan_plugins`, `insert_plugin`, `remove_plugin`, `insert_master_plugin`, `remove_master_plugin`, `set_plugin_bypass`,
 `list_plugin_params`, `set_plugin_param` (`"eq"` inserts the built-in EQ; `master: true` addresses the master bus),
 `list_instruments`, `add_instrument_track`, `set_instrument`, `list_instrument_params`, `set_instrument_param`,
 `add_midi_clip`, `set_midi_notes`, `add_midi_notes`, `update_midi_clip`, `copy_midi_clip`, `remove_midi_clip`,
-`inspect_guitar_pro`, `import_guitar_pro`.
+`inspect_guitar_pro`, `import_guitar_pro`, `inspect_midi_file`, `import_midi_file`, `export_midi_file`,
+`list_automation_params`, `get_automation`, `add_automation_lane`, `set_automation_points`, `clear_automation`,
+`set_automation_lane`, `remove_automation_lane`.
+
+Automation: `list_automation_params` lists what a track (or `master: true`) can automate;
+`add_automation_lane` creates a lane and `set_automation_points` draws it, with times in seconds
+and values normalized 0..1, or `db` for volume and `pan` (-1..1) for pan. Lanes play during
+playback and in `analyze_mix` / `export_audio`.
 
 Mixing: `analyze_mix` renders the mix offline (built-in instruments and EQs, audio regions,
 faders, pans, master) and reports, per track and for the master, the peak, integrated loudness
@@ -170,34 +213,80 @@ Recording: arm a track (`update_track` with `armed: true` and `input_channel`), 
 `.json` files from earlier versions still open).
 Supported: tempo/time signature and the tempo map (tempo envelope), sample rate, master volume, loop range (`LOOP`/`SELECTION`), track name/volume/pan/mute/solo/
 record-arm/input/monitoring, audio items (position, length, source offset, gain, mute,
-media file) and FX chain references. VST3 plugins in a Reaper project are matched by
-bundle file name and class id/name and loaded if installed.
+play rate / pitch, media file), FX chain references and buses (written as receives; folders and receives
+from tracks with the master send off import as buses), and volume/pan/mute envelopes
+(`VOLENV2`/`PANENV2`/`MUTEENV`). VST3 plugins in a Reaper project are matched by
+bundle file name and class id/name and loaded if installed; Audio Units by their
+type/subtype/manufacturer codes or name.
 
-Not (yet) supported: envelopes/automation, MIDI items, sends/folders, takes beyond the
+Not (yet) supported: plug-in parameter envelopes (`PARMENV`, which number parameters by
+position), fader-scaled volume envelopes, MIDI items, sends, takes beyond the
 first, and Reaper's opaque plugin state blobs. Those are kept in the model and written
 back on export, but they aren't applied to the loaded plugin.
+
+## Projects from other DAWs
+
+Open them like any project (File → Open, drag and drop, or `load_project`); what couldn't be
+carried over is listed as warnings. An imported project has no path until you save it, so the
+original file is never overwritten.
+
+- **DAWproject** (`.dawproject`; Bitwig Studio, Studio One, Cubase 14+): tracks, volume/pan/
+  mute/solo, audio clips (embedded audio is extracted to `<name> Media/` next to the file),
+  MIDI clips, clip loops, tempo and time-signature automation, plug-in references. Also
+  **exported** (Save As → DAWproject) with the audio embedded, to take a project into those DAWs.
+- **Ableton Live** (`.als`, Live 9–12): audio and MIDI tracks, arrangement clips with
+  start/loop markers, mixer, tempo automation, plug-in references. Live's own devices become
+  the built-in synth/drums or are skipped; session-view clips aren't imported.
+- **Logic Pro**: `.logicx` is a closed format and can't be opened. In Logic choose
+  File → Export → Project to Final Cut Pro XML and open the `.fcpxml`: audio regions arrive on
+  tracks per role/lane with their positions, offsets and volume. FCPXML has no MIDI, tempo or
+  mixer, so set the tempo afterwards, and bring MIDI over as audio (bounce) or MIDI files.
+- **Ardour** (`.ardour`, Ardour 5–8): audio tracks and their regions, gain/pan/mute/solo,
+  tempo map. MIDI regions (kept in separate `.mid` files), buses and sends aren't imported.
+
+Common limits: warped/time-stretched clips play at their original speed, plug-in states
+(presets) aren't transferred (VST3 plug-ins are found by name and start at their defaults),
+automation other than tempo, sends/returns and fades aren't imported.
 
 ## Known limitations / next steps
 
 - f32 devices only (fine for CoreAudio; some ASIO/ALSA setups need sample conversion).
-- WAV media only; add `symphonia` for MP3/FLAC/OGG. Resampling is linear.
-- No compensation for audio-interface input latency yet (recordings may sit a few ms late);
-  plug-in delay is compensated.
-- VST3: no MIDI/instruments yet, no plugin editor windows, and no `IMessage` host
+- Audio import is WAV only (export also writes FLAC); add `symphonia` for MP3/FLAC/OGG.
+  Resampling is linear.
+- Recording latency comes from what the device reports; some devices misreport it (the
+  built-in Mac audio by 20–40 ms), so measure it once per setup (Audio Settings → Measure Latency).
+- VST3: no plugin editor windows (generic parameter sliders instead) and no `IMessage` host
   objects (some plugins need them for processor ↔ controller messaging). Plugin
-  parameters are saved by value in our JSON format, but full state chunks aren't saved yet.
+  parameters are saved by value, but full state chunks aren't saved yet. Instruments get
+  note events only and haven't been tested with many third-party plugins.
+- Audio Units (macOS only): no editor windows (generic sliders), stereo/mono main bus only
+  (no side-chains or extra outputs), notes only (no pitch bend/CC). State is saved as the
+  unit's property list; Reaper's AU state may not restore. AUv3 extensions that load only
+  asynchronously wait up to 10 s and fail if they need the main thread meanwhile.
 - Plugin parameter values, MIDI regions, the built-in synth/drums/effects and master-bus effects
   are saved in `.otp` projects only (`.rpp` export skips them; VST3 instruments are exported).
 - Guitar Pro: only GP7/8 (`.gp`, `.gpif`); `.gp3`–`.gp5` and `.gpx` are recognised but not
   imported yet. Bends, slides and vibrato aren't played back (no pitch bend yet).
   `cargo run -p opentake-project --example gpinfo -- song.gp` prints what the reader sees.
+- MIDI files: notes, tempo and time signatures are imported (format 0/1; format 2 is read
+  as parallel tracks); program changes only pick names, and CC, pitch bend and lyrics are skipped.
 - MIDI: no MIDI input / recording yet, no CC/pitch-bend; notes are in seconds, so changing
   the tempo map doesn't stretch existing regions (they keep their real-time positions).
-- Tempo map: steps only (no gradual tempo ramps); Reaper ramps are imported as steps. VST3 instrument hosting is implemented
-  (note events on the event bus) but has only been tested with the built-in synth.
-- GUI: no plugin editor windows (generic parameter sliders instead), no region fades,
-  multi-selection or undo yet.
-- No built-in reverb yet (EQ, compressor, limiter and delay are built in; any VST3 reverb works).
+- Takes: one plays at a time (no comping from parts of several takes yet), and a take folder
+  doesn't expand into take lanes.
+- Tempo map: steps only (no gradual tempo ramps); Reaper ramps are imported as steps.
+- Pitch/stretch: one ratio per region (no Flex markers, no varispeed mode), formants are not
+  preserved, and stretch is limited to 0.25–4×. Each new setting renders the region first:
+  long regions take about a second per minute, in the background in the GUI. A pitched or
+  stretched region doesn't collect new cycle-recording takes.
+- Regions: no fades or crossfades, and one region is selected at a time.
+- Buses: no sends yet (each track feeds one bus or the master); stems export what reaches the
+  master (a bus is one stem, its sources are inside it).
+- Automation: plug-in parameters change once per 64-sample block (fader, pan and mute ramp
+  within it), so changes land within ~1.3 ms of their point; master automation has no lanes in
+  the GUI yet (use MCP); plug-in editor windows don't follow automated values; no automation of
+  sends (there are none) or of region gain, and Touch/Latch only record from the GUI.
+- No built-in reverb yet (EQ, compressor, multiband compressor, limiter and delay are built in; any VST3 reverb works).
 
 ## Development
 

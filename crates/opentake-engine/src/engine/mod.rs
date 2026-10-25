@@ -5,12 +5,20 @@
 //! diff two project states and update only what changed on the audio thread.
 
 mod analysis;
+mod au;
+mod automation;
+mod calibration;
 mod export;
+mod flex;
+mod gain;
 mod guitarpro;
 mod history;
 mod midi;
+mod midi_file;
 mod plugins;
+mod recording;
 mod regions;
+mod routing;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,14 +35,20 @@ use serde::Serialize;
 
 use crate::audio::{self, AudioConfig, AudioStreams};
 use crate::media::{self, AudioData};
-use crate::mixer::{ClipRt, Command, Garbage, Mixer, SharedState, TrackParams, TrackRt};
+use crate::mixer::{ClipRt, Command, EnvTarget, Garbage, LATENCY_UNKNOWN, Mixer, SharedState, TrackParams, TrackRt};
 use crate::recorder::{RecordTarget, Recorder};
 
 pub use guitarpro::{GuitarProImport, GuitarProSummary, GuitarProTrackInfo, inspect as inspect_guitar_pro};
 pub use analysis::{LevelReport, MixJob, MixReport};
+pub use au::AudioUnitInfo;
+pub use automation::{AutomationParam, LaneOwner};
+pub use calibration::LatencyReport;
 pub use export::{AudioFormat, ExportOptions, ExportReport, ExportedFile, SAMPLE_RATES};
+pub use flex::{FlexJob, FlexRender, MAX_SEMITONES, PitchStretch, STRETCH_RANGE};
+pub use gain::CLIP_GAIN_DB;
 pub use history::HistoryInfo;
 pub use midi::MidiClipUpdate;
+pub use midi_file::{MidiFileImport, MidiFileSummary, MidiFileTrackInfo, gm_program_name, inspect as inspect_midi_file, is_midi_file_path};
 pub use plugins::SlotRef;
 pub use regions::{RegionData, RegionKind, RegionRef};
 
@@ -96,7 +110,16 @@ pub struct EngineStatus {
     pub counting_in: bool,
     /// Plug-in delay being compensated (milliseconds).
     pub latency_ms: f64,
+    /// Interface round trip, input capture to output playback, as the device reports it
+    /// (milliseconds; `None` if it doesn't). Recordings are moved earlier by this plus
+    /// `record_offset_ms`.
+    pub io_latency_ms: Option<f64>,
+    /// Manual correction added to the measured round trip (milliseconds).
+    pub record_offset_ms: f64,
     pub position_secs: f64,
+    /// Where the current recording started (seconds), while recording.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_start_secs: Option<f64>,
     pub record_overrun_samples: u64,
     /// Peak level in dBFS with a 30 dB/s fall (floored at -120).
     pub master_peak_db: [f32; 2],
@@ -165,17 +188,22 @@ struct AudioRuntime {
     input_channels: usize,
     commands: Producer<Command>,
     recorder: Option<Recorder>,
+    /// Identifies the device setup (for its stored recording offset).
+    setup: String,
+    /// Latency probe captures, handed on by the garbage collector.
+    probe_results: crossbeam_channel::Receiver<Box<Vec<f32>>>,
     _gc: GarbageCollector,
 }
 
-/// Drops whatever the audio thread hands back, off the audio thread.
+/// Drops whatever the audio thread hands back, off the audio thread (except latency probe
+/// captures, which it passes on).
 struct GarbageCollector {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl GarbageCollector {
-    fn spawn(mut rx: Consumer<Garbage>) -> Self {
+    fn spawn(mut rx: Consumer<Garbage>, probes: crossbeam_channel::Sender<Box<Vec<f32>>>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let handle = std::thread::Builder::new()
@@ -183,7 +211,10 @@ impl GarbageCollector {
             .spawn(move || {
                 while !flag.load(Ordering::Relaxed) {
                     while let Ok(g) = rx.pop() {
-                        drop(g);
+                        match g {
+                            Garbage::Probe(buf) => drop(probes.send(buf)),
+                            g => drop(g),
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -209,6 +240,8 @@ pub struct Engine {
     shared: Arc<SharedState>,
     audio: Option<AudioRuntime>,
     media: HashMap<(PathBuf, u32), Arc<AudioData>>,
+    /// Pitch-shifted/stretched region audio (see flex.rs).
+    flexed: HashMap<flex::FlexKey, Arc<AudioData>>,
     waveforms: HashMap<PathBuf, Arc<Waveform>>,
     meters: Meters,
     // Plugins (see plugins.rs).
@@ -216,13 +249,22 @@ pub struct Engine {
     plugin_paths: Vec<PathBuf>,
     scanned: Vec<ScannedPlugin>,
     scan_errors: Vec<String>,
+    audio_units: Vec<au::AudioUnitInfo>,
     /// Every plugin instance loaded this session, by instance id. Instances removed from
     /// the project stay here while undo history may still refer to them.
     pool: HashMap<u64, plugins::Loaded>,
     /// What the audio thread currently has, per track id (to diff against).
     live_chain: HashMap<u64, Vec<u64>>,
     live_instrument: HashMap<u64, Option<u64>>,
+    /// Automation targets the audio thread plays, per track id (or `MASTER`), and the
+    /// controls being written into lanes (see automation.rs).
+    live_automation: HashMap<u64, Vec<EnvTarget>>,
+    writing: Vec<automation::Writing>,
     history: history::History,
+    /// Added to the measured round trip when placing recordings (milliseconds), and the
+    /// stored offsets per device setup (see calibration.rs).
+    record_offset_ms: f64,
+    latency_store: calibration::LatencyStore,
 }
 
 impl Default for Engine {
@@ -240,16 +282,22 @@ impl Engine {
             shared: Arc::new(SharedState::new()),
             audio: None,
             media: HashMap::new(),
+            flexed: HashMap::new(),
             waveforms: HashMap::new(),
             meters: Meters { last: Instant::now(), master: [0.0; 2], tracks: Vec::new() },
             modules: HashMap::new(),
             plugin_paths: opentake_vst3::scan::default_search_paths(),
             scanned: Vec::new(),
             scan_errors: Vec::new(),
+            audio_units: Vec::new(),
             pool: HashMap::new(),
             live_chain: HashMap::new(),
             live_instrument: HashMap::new(),
+            live_automation: HashMap::new(),
+            writing: Vec::new(),
             history: history::History::default(),
+            record_offset_ms: 0.0,
+            latency_store: calibration::LatencyStore::default(),
         }
     }
 
@@ -323,13 +371,16 @@ impl Engine {
 
         self.live_chain.clear();
         self.live_instrument.clear();
+        self.live_automation.clear();
         let tracks = (0..self.project.tracks.len()).map(|i| self.build_track(i, sample_rate)).collect::<Result<Vec<_>>>()?;
         // Queued before the stream starts, so the first callback picks them up.
         let _ = cmd_tx.push(Command::ResetTracks(Box::new(tracks)));
+        let _ = cmd_tx.push(self.routing_command());
         let _ = cmd_tx.push(self.tempo_command());
         let _ = cmd_tx.push(Command::SetMasterGain(self.project.master_volume));
         let _ = cmd_tx.push(self.metronome_command());
         let _ = cmd_tx.push(self.count_in_command());
+        let _ = cmd_tx.push(Command::SetAutoMonitor(self.project.auto_input_monitoring));
         let _ = cmd_tx.push(Command::SetSongEnd((self.project.length_secs() * sample_rate as f64).round() as u64));
         let _ = cmd_tx.push(self.loop_command_at(sample_rate));
 
@@ -343,14 +394,21 @@ impl Engine {
             streams.input_name,
             streams.input_channels
         );
+        let setup = calibration::setup_key(streams.input_name.as_deref(), &streams.output_name, streams.sample_rate, config.buffer_size);
+        self.record_offset_ms = self.latency_store.get(&setup);
+        let (probe_tx, probe_results) = crossbeam_channel::bounded(2);
         self.audio = Some(AudioRuntime {
             sample_rate: streams.sample_rate,
             input_channels: streams.input_channels,
             streams: Some(streams),
             commands: cmd_tx,
             recorder,
-            _gc: GarbageCollector::spawn(g_rx),
+            setup,
+            probe_results,
+            _gc: GarbageCollector::spawn(g_rx, probe_tx),
         });
+        // The master bus's inserts too (the tracks went with ResetTracks).
+        self.sync_master_chain()?;
         Ok(self.status())
     }
 
@@ -362,16 +420,22 @@ impl Engine {
         self.project.sample_rate = sample_rate;
         self.live_chain.clear();
         self.live_instrument.clear();
+        self.live_automation.clear();
         let tracks = (0..self.project.tracks.len()).map(|i| self.build_track(i, sample_rate)).collect::<Result<Vec<_>>>().unwrap();
         let _ = cmd_tx.push(Command::ResetTracks(Box::new(tracks)));
+        let _ = cmd_tx.push(self.routing_command());
+        let (probe_tx, probe_results) = crossbeam_channel::bounded(2);
         self.audio = Some(AudioRuntime {
             streams: None,
             sample_rate,
             input_channels: 0,
             commands: cmd_tx,
             recorder: None,
-            _gc: GarbageCollector::spawn(g_rx),
+            setup: "test".into(),
+            probe_results,
+            _gc: GarbageCollector::spawn(g_rx, probe_tx),
         });
+        self.sync_master_chain().unwrap();
         Mixer::new(cmd_rx, g_tx, None, self.shared.clone(), sample_rate)
     }
 
@@ -382,6 +446,8 @@ impl Engine {
         self.audio = None;
         self.live_chain.clear();
         self.live_instrument.clear();
+        self.live_automation.clear();
+        self.writing.clear();
         self.shared.playing.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -416,12 +482,16 @@ impl Engine {
     }
 
     fn build_clip(&mut self, clip: &Clip, sr: u32) -> Result<ClipRt> {
-        let data = self.load_media(&clip.file, sr)?;
+        let data = self.clip_media(clip, sr)?;
         let secs = |s: f64| (s.max(0.0) * sr as f64).round() as u64;
+        // The processed audio is already stretched, so the source offset scales with it. A
+        // negative offset (a take that starts later than its folder) is silence first.
+        let offset = clip.source_offset_secs * clip.stretch;
+        let lead = (-offset).max(0.0).min(clip.length_secs);
         Ok(ClipRt {
-            start: secs(clip.position_secs),
-            len: secs(clip.length_secs),
-            offset: secs(clip.source_offset_secs),
+            start: secs(clip.position_secs + lead),
+            len: secs(clip.length_secs - lead),
+            offset: secs(offset),
             gain: clip.gain,
             mute: clip.mute,
             data,
@@ -446,7 +516,8 @@ impl Engine {
     /// edits can be diffed against it.
     fn build_track(&mut self, index: usize, sr: u32) -> Result<Box<TrackRt>> {
         let id = self.track_id(index);
-        let mut rt = Box::new(TrackRt::new(id, track_params(&self.project.tracks[index])));
+        let params = track_params(&self.project.tracks[index]);
+        let mut rt = Box::new(if self.project.tracks[index].bus { TrackRt::new_bus(id, params) } else { TrackRt::new(id, params) });
         for clip in self.build_clips(index, sr) {
             rt.clips.push(clip);
         }
@@ -464,6 +535,8 @@ impl Engine {
             }
         }
         self.live_chain.insert(id, rt.plugins.iter().map(|p| p.instance).collect());
+        rt.automation = self.envelopes(Some(index));
+        self.live_automation.insert(id, rt.automation.iter().map(|e| e.target).collect());
         Ok(rt)
     }
 
@@ -500,28 +573,10 @@ impl Engine {
             None => return Ok(Vec::new()),
         };
 
-        let sr = self.sample_rate();
-        let start = self.shared.record_start.load(Ordering::Relaxed) as f64 / sr as f64;
-        self.record("Record", None, |e| {
-            let mut added = Vec::new();
-            for f in files {
-                let Some(index) = e.project.tracks.iter().position(|t| t.id == f.track_id) else { continue };
-                let clip = Clip {
-                    name: f.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-                    file: f.path.clone(),
-                    position_secs: start,
-                    length_secs: f.frames as f64 / sr as f64,
-                    source_offset_secs: 0.0,
-                    gain: 1.0,
-                    mute: false,
-                };
-                e.project.tracks[index].clips.push(clip.clone());
-                let rt = e.build_clip(&clip, sr)?;
-                e.send(Command::AddClip { track: f.track_id, clip: rt })?;
-                added.push(clip);
-            }
-            Ok(added)
-        })
+        let placement = self.record_placement();
+        // Undoing a take also takes the playhead back to where recording began.
+        self.history.playhead = Some(placement.start as f64 / self.sample_rate() as f64);
+        self.record("Record", None, |e| e.add_recordings(files, &placement))
     }
 
     pub fn seek(&mut self, secs: f64) -> Result<()> {
@@ -601,7 +656,18 @@ impl Engine {
             recording: self.shared.recording.load(Ordering::Relaxed),
             counting_in: self.shared.counting_in.load(Ordering::Relaxed),
             latency_ms: self.shared.latency.load(Ordering::Relaxed) as f64 * 1000.0 / sr.max(1) as f64,
+            io_latency_ms: match self.shared.io_latency.load(Ordering::Relaxed) {
+                _ if self.audio.is_none() => None,
+                LATENCY_UNKNOWN => None,
+                v => Some((v as f64 * 1000.0 / sr.max(1) as f64 * 100.0).round() / 100.0),
+            },
+            record_offset_ms: self.record_offset_ms,
             position_secs: self.shared.position.load(Ordering::Relaxed) as f64 / sr as f64,
+            record_start_secs: self
+                .shared
+                .recording
+                .load(Ordering::Relaxed)
+                .then(|| self.shared.record_start.load(Ordering::Relaxed) as f64 / sr as f64),
             record_overrun_samples: self.shared.record_overruns.load(Ordering::Relaxed),
             master_peak_db: self.meters.master.map(db),
             track_peak_db: self.meters.tracks.iter().map(|&v| db(v)).collect(),
@@ -646,6 +712,13 @@ impl Engine {
         }
         let cmd = self.count_in_command();
         self.send(cmd)
+    }
+
+    /// Auto input monitoring: armed tracks monitor their input while stopped or recording.
+    /// A setting, not an undoable edit.
+    pub fn set_auto_input_monitoring(&mut self, on: bool) -> Result<()> {
+        self.project.auto_input_monitoring = on;
+        self.send(Command::SetAutoMonitor(on))
     }
 
     /// Replace the tempo changes after the start (the opening tempo and signature are set
@@ -725,13 +798,31 @@ impl Engine {
         Ok(index)
     }
 
+    /// Move a track to position `to` in the track list (the others shift to make room).
+    pub fn move_track(&mut self, from: usize, to: usize) -> Result<()> {
+        let from = self.track_index(from)?;
+        let to = to.min(self.project.tracks.len() - 1);
+        if from == to {
+            return Ok(());
+        }
+        self.record("Move Track", None, |e| {
+            let track = e.project.tracks.remove(from);
+            e.project.tracks.insert(to, track);
+            // Meters are reported in this order, so the audio thread follows it.
+            e.send(Command::ReorderTracks(Box::new(e.project.tracks.iter().map(|t| t.id).collect())))?;
+            e.sync_routing()
+        })
+    }
+
     pub fn remove_track(&mut self, index: usize) -> Result<Track> {
         let index = self.track_index(index)?;
         self.record("Delete Track", None, |e| {
+            e.unroute_bus(index)?;
             let track = e.project.tracks.remove(index);
             e.live_chain.remove(&track.id);
             e.live_instrument.remove(&track.id);
             e.send(Command::RemoveTrack(track.id))?;
+            e.sync_routing()?;
             Ok(track)
         })
     }
@@ -787,6 +878,11 @@ impl Engine {
             source_offset_secs: 0.0,
             gain: 1.0,
             mute: false,
+            takes: Vec::new(),
+            active_take: 0,
+            pitch_semitones: 0,
+            pitch_cents: 0,
+            stretch: 1.0,
         };
         self.record("Add Region", None, |e| {
             e.project.tracks[index].clips.push(clip.clone());
@@ -877,13 +973,7 @@ impl Engine {
         if at_secs <= start + Self::MIN_CLIP_SECS || at_secs >= end - Self::MIN_CLIP_SECS {
             bail!("split point {at_secs:.3}s is outside clip '{}' ({start:.3}s – {end:.3}s)", c.name);
         }
-        let left = Clip { length_secs: at_secs - start, ..c.clone() };
-        let right = Clip {
-            position_secs: at_secs,
-            length_secs: end - at_secs,
-            source_offset_secs: c.source_offset_secs + (at_secs - start),
-            ..c
-        };
+        let (left, right) = c.split(at_secs - start);
         self.record("Split Region", None, |e| {
             let clips = &mut e.project.tracks[index].clips;
             clips[clip] = left.clone();
@@ -899,9 +989,10 @@ impl Engine {
         let index = self.clip_index(track, clip)?;
         let c = self.project.tracks[index].clips[clip].clone();
         let source = self.source_secs(&c)?;
-        // Timeline time where the source file starts / ends for this clip.
-        let source_start = c.position_secs - c.source_offset_secs;
-        let source_end = source_start + source;
+        // Timeline time where the source file starts / ends for this clip (offsets are in
+        // source seconds; the timeline plays them `stretch` times as long).
+        let source_start = c.position_secs - c.source_offset_secs * c.stretch;
+        let source_end = source_start + source * c.stretch;
         let end = end_secs.unwrap_or(c.position_secs + c.length_secs).min(source_end);
         let start = start_secs.unwrap_or(c.position_secs).max(source_start).max(0.0);
         if end - start < Self::MIN_CLIP_SECS {
@@ -910,7 +1001,7 @@ impl Engine {
         let trimmed = Clip {
             position_secs: start,
             length_secs: end - start,
-            source_offset_secs: start - source_start,
+            source_offset_secs: (start - source_start) / c.stretch,
             ..c
         };
         self.record("Trim Region", None, |e| {
@@ -942,7 +1033,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Save as Reaper `.rpp` or native `.json`, chosen by extension.
+    /// Save as Reaper `.rpp`, DAWproject or native `.otp`/`.json`, chosen by extension.
     pub fn save_project(&mut self, path: Option<&Path>) -> Result<PathBuf> {
         let mut path = match path {
             Some(p) => std::path::absolute(p)?,
@@ -954,18 +1045,32 @@ impl Engine {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        // Files refer to buses by track index (ids are per session).
+        let mut file = self.project_with_plugin_state();
+        file.outputs_to_indices();
         if is_rpp(&path) {
-            opentake_project::rpp::save(&self.project, &path)?;
+            opentake_project::rpp::save(&file, &path)?;
+        } else if is_ext(&path, "dawproject") {
+            opentake_project::dawproject::save(&file, &path)?;
         } else {
-            std::fs::write(&path, serde_json::to_string_pretty(&self.project)?)?;
+            std::fs::write(&path, serde_json::to_string_pretty(&file)?)?;
         }
         self.project_path = Some(path.clone());
         Ok(path)
     }
 
-    /// Load a `.rpp` or `.json` project. Returns warnings (missing media/plugins).
+    /// Load a project (`.otp`/`.json`, `.rpp`, or another DAW's: see `import`). Returns
+    /// warnings (missing media/plugins, what an import couldn't carry over).
     pub fn load_project(&mut self, path: &Path) -> Result<Vec<String>> {
         let path = std::path::absolute(path)?;
+        if opentake_project::import::is_import_path(&path) {
+            // Imported projects get no path, so Save asks where to put the .otp instead of
+            // overwriting the other DAW's file.
+            let imported = opentake_project::import::load(&path).with_context(|| format!("importing {}", path.display()))?;
+            let mut warnings = imported.warnings;
+            warnings.extend(self.replace_project(imported.project, None)?);
+            return Ok(warnings);
+        }
         let project = if is_rpp(&path) {
             opentake_project::rpp::load(&path)?
         } else {
@@ -981,6 +1086,10 @@ impl Engine {
         let mut warnings = Vec::new();
         for track in &mut project.tracks {
             track.id = self.next_id();
+            if track.bus {
+                // A bus only mixes (see `record`).
+                (track.clips, track.midi_clips, track.instrument, track.armed, track.monitor_input) = (Vec::new(), Vec::new(), None, false, false);
+            }
             let name = track.name.clone();
             for slot in track.instrument.iter_mut().chain(track.plugins.iter_mut()) {
                 slot.instance = match self.load_slot(slot) {
@@ -997,6 +1106,9 @@ impl Engine {
                 }
             }
         }
+        project.outputs_from_indices();
+        project.assign_slot_ids();
+        project.prune_automation();
 
         if guitarpro::upgrade_song_tempo(&mut project) {
             warnings.push("The imported song's tempo changes were added to the project's tempo map".into());
@@ -1013,7 +1125,9 @@ impl Engine {
 
         self.project = project;
         self.project_path = path;
+        self.writing.clear();
         self.media.clear();
+        self.flexed.clear();
         self.waveforms.clear();
         self.history.clear();
         self.prune_pool();
@@ -1024,8 +1138,10 @@ impl Engine {
             self.project.sample_rate = sr;
             self.live_chain.clear();
             self.live_instrument.clear();
+            self.live_automation.clear();
             let tracks = (0..self.project.tracks.len()).map(|i| self.build_track(i, sr)).collect::<Result<Vec<_>>>()?;
             self.send(Command::ResetTracks(Box::new(tracks)))?;
+            self.sync_routing()?;
             let tempo = self.tempo_command();
             self.send(tempo)?;
             self.send(Command::SetMasterGain(self.project.master_volume))?;
@@ -1033,6 +1149,7 @@ impl Engine {
             self.send(metronome)?;
             let count_in = self.count_in_command();
             self.send(count_in)?;
+            self.send(Command::SetAutoMonitor(self.project.auto_input_monitoring))?;
             self.sync_song_end()?;
             let looping = self.loop_command_at(sr);
             self.send(looping)?;
@@ -1051,20 +1168,26 @@ fn track_params(t: &Track) -> TrackParams {
         armed: t.armed,
         monitor: t.monitor_input,
         input_channel: t.input_channel as usize,
+        output: t.output.unwrap_or(crate::mixer::MASTER),
     }
 }
 
 /// OpenTake's own project file extension (JSON inside).
 pub const PROJECT_EXTENSION: &str = "otp";
 
-/// Files `load_project` opens: OpenTake projects (`.otp`, or `.json` from earlier versions)
-/// and Reaper projects (`.rpp`).
+/// Files `load_project` opens: OpenTake projects (`.otp`, or `.json` from earlier versions),
+/// Reaper projects (`.rpp`) and other DAWs' projects it imports.
 pub fn is_project_path(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "otp" | "json" | "rpp"))
+        || opentake_project::import::is_import_path(path)
 }
 
 fn is_rpp(path: &Path) -> bool {
-    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("rpp"))
+    is_ext(path, "rpp")
+}
+
+fn is_ext(path: &Path, ext: &str) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext))
 }
 
 /// "VST3: ReaEQ (Cockos)" -> "ReaEQ"
@@ -1093,6 +1216,47 @@ mod tests {
         }
         w.finalize().unwrap();
         wav
+    }
+
+    #[test]
+    fn dynamics_meters_follow_the_audio() {
+        let dir = std::env::temp_dir().join(format!("opentake-meter-{}", std::process::id()));
+        let wav = tone_file(&dir, 1.0); // peaks at -6 dBFS
+        let mut e = Engine::new();
+        e.add_track("Drums").unwrap();
+        e.add_clip(0, &wav, 0.0).unwrap();
+        e.insert_plugin(0, "comp", None).unwrap();
+        e.insert_plugin(0, "limiter", None).unwrap();
+        e.insert_master_plugin("comp", None).unwrap();
+        e.insert_master_plugin("limiter", None).unwrap();
+        let mut mixer = e.attach_test_mixer(48_000);
+        e.play().unwrap();
+        let mut out = vec![0.0f32; 2 * 512];
+        for _ in 0..20 {
+            mixer.process(&[], 0, &mut out, 2);
+        }
+        for s in [SlotRef::Effect(0), SlotRef::Effect(1), SlotRef::Master(0), SlotRef::Master(1)] {
+            let (_, input, output) = e.fx_meter(0, s).expect("meter").take();
+            assert!(input > -10.0 && output > -20.0, "{s:?}: in {input} out {output}");
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn move_track_reorders_and_undoes() {
+        let mut e = Engine::new();
+        for name in ["A", "B", "C"] {
+            e.add_track(name).unwrap();
+        }
+        let names = |e: &Engine| e.project().tracks.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        e.move_track(0, 2).unwrap();
+        assert_eq!(names(&e), ["B", "C", "A"]);
+        e.move_track(2, 0).unwrap();
+        e.move_track(1, 9).unwrap(); // past the end = last
+        assert_eq!(names(&e), ["A", "C", "B"]);
+        e.undo().unwrap();
+        assert_eq!(names(&e), ["A", "B", "C"]);
+        assert!(e.move_track(5, 0).is_err());
     }
 
     #[test]
@@ -1170,6 +1334,26 @@ mod tests {
         let tr = &e2.project().tracks[0];
         assert_eq!((tr.name.as_str(), tr.volume, tr.armed), ("Guitar", 0.5, true));
         assert_eq!(tr.clips[0].file, wav);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dawproject_export_reimports_without_a_path() {
+        let dir = std::env::temp_dir().join(format!("opentake-test-daw-{}", std::process::id()));
+        let wav = tone_file(&dir, 1.0);
+        let mut e = Engine::new();
+        let t = e.add_track("Guitar").unwrap();
+        e.add_clip(t, &wav, 2.0).unwrap();
+        let file = dir.join("song.dawproject");
+        e.save_project(Some(&file)).unwrap();
+        let mut e2 = Engine::new();
+        let warnings = e2.load_project(&file).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Saving must not overwrite the imported file in place.
+        assert_eq!(e2.project_path(), None);
+        let c = &e2.project().tracks[0].clips[0];
+        assert_eq!(c.file, dir.join("song Media/audio").join(wav.file_name().unwrap()));
+        assert!(c.file.exists() && (c.position_secs - 2.0).abs() < 1e-9);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

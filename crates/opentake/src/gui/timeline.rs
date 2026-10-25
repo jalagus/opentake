@@ -1,10 +1,12 @@
-//! Arrangement view: ruler, track headers and the region timeline (audio and MIDI).
+//! Arrangement view: ruler, track headers, the region timeline (audio and MIDI) and the
+//! automation lanes shown under each track.
 
 use std::sync::Arc;
 
-use opentake_engine::{RegionData, TrackUpdate, Waveform};
+use opentake_engine::{AutomationParam, RegionData, TrackUpdate, Waveform};
+use opentake_engine::project::automation::{envelope_at, gain_to_pos, pos_to_gain};
 use opentake_engine::project::tempo::{bar_len_q, beat_len_q};
-use opentake_engine::project::{BarLine, Clip, Grid, MidiClip, Project, TempoChange, TempoMap, Track};
+use opentake_engine::project::{AutomationLane, AutomationMode, AutomationTarget, BarLine, Clip, Curve, Grid, MidiClip, Project, Take, TempoChange, TempoMap, Track};
 use eframe::egui;
 use egui::{Align, Align2, Color32, CursorIcon, FontId, Layout, Painter, Pos2, Rangef, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
 
@@ -22,6 +24,9 @@ const CYCLE_COLOR: Color32 = Color32::from_rgb(232, 190, 60);
 /// Pointer distance (px) from a region edge that grabs the edge for trimming.
 const EDGE_GRAB: f32 = 6.0;
 const MIN_REGION_SECS: f64 = 0.01;
+/// Height of an automation lane, and how close (px) the pointer must be to grab a point.
+const LANE_H: f32 = 46.0;
+const POINT_GRAB: f32 = 6.0;
 
 /// Grid resolution used for snapping and grid lines (Logic's "Snap" menu).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +89,14 @@ impl<'a> RegionView<'a> {
         self.position + self.length
     }
 
+    /// A take folder's takes and the one playing.
+    pub fn takes(&self) -> Option<(&'a [Take], usize)> {
+        match self.content {
+            Content::Audio(c) if !c.takes.is_empty() => Some((&c.takes, c.active_take)),
+            _ => None,
+        }
+    }
+
     /// Detached copy of the underlying region.
     pub fn to_data(self) -> RegionData {
         match self.content {
@@ -124,6 +137,8 @@ enum DragMode {
     Move,
     TrimStart,
     TrimEnd,
+    /// ⌥-drag of an audio region's end: time-stretch it to the new length.
+    StretchEnd,
 }
 
 struct RegionDrag {
@@ -170,6 +185,7 @@ struct CycleDrag {
 enum Edit {
     Move { delta_t: f64, delta_track: isize, copy: bool },
     Trim { region: RegionRef, start: Option<f64>, end: Option<f64> },
+    Stretch { region: RegionRef, length: f64 },
 }
 
 const MIN_PX_PER_SEC: f32 = 2.0;
@@ -204,7 +220,9 @@ pub struct View {
     pub start: f64,
     pub px_per_sec: f32,
     x_range: Rangef,
+    /// Each track's region row, and its whole extent including its automation lanes.
     rows: Vec<(usize, Rangef)>,
+    spans: Vec<(usize, Rangef)>,
     drag: Option<RegionDrag>,
     marquee: Option<Marquee>,
     cycle_drag: Option<CycleDrag>,
@@ -213,6 +231,27 @@ pub struct View {
     tempo_drag: Option<TempoDrag>,
     /// Timeline position of the last right-click on the tempo track.
     tempo_context: f64,
+    /// The selected automation point (⌫ deletes it), a point being dragged, and the point
+    /// (if any) under the last right-click in a lane.
+    pub auto_sel: Option<AutoSel>,
+    auto_drag: Option<AutoDrag>,
+    auto_context: Option<usize>,
+}
+
+/// An automation point: track, lane (index into the track's lanes) and point.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AutoSel {
+    pub track: usize,
+    pub lane: usize,
+    pub point: usize,
+}
+
+struct AutoDrag {
+    sel: AutoSel,
+    /// The point's time and value when grabbed.
+    from: (f64, f32),
+    /// Where it was last sent, so an unmoved pointer sends nothing.
+    sent: (f64, f32),
 }
 
 /// A drag on the tempo track.
@@ -231,12 +270,16 @@ impl Default for View {
             px_per_sec: 48.0,
             x_range: Rangef::new(0.0, 0.0),
             rows: Vec::new(),
+            spans: Vec::new(),
             drag: None,
             marquee: None,
             cycle_drag: None,
             context_time: 0.0,
             tempo_drag: None,
             tempo_context: 0.0,
+            auto_sel: None,
+            auto_drag: None,
+            auto_context: None,
         }
     }
 }
@@ -255,8 +298,14 @@ impl View {
         (x >= self.x_range.min && x <= self.x_range.max).then(|| self.t_of(x).max(0.0))
     }
 
+    /// The track at screen y (its region row or one of its automation lanes).
     pub fn track_at(&self, y: f32) -> Option<usize> {
-        self.rows.iter().find(|(_, r)| r.contains(y)).map(|(i, _)| *i)
+        self.spans.iter().find(|(_, r)| r.contains(y)).map(|(i, _)| *i)
+    }
+
+    /// A track's extent: its region row and automation lanes.
+    fn span_of(&self, track: usize) -> Option<Rangef> {
+        self.spans.iter().find(|(i, _)| *i == track).map(|(_, r)| *r)
     }
 
     fn row_of(&self, track: usize) -> Option<Rangef> {
@@ -409,13 +458,14 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
     });
 
     let mut rows = Vec::with_capacity(project.tracks.len());
+    let mut spans = Vec::with_capacity(project.tracks.len());
     let mut edit: Option<Edit> = None;
     let grid = grid_at(app.snap_mode, &map, app.view.start + app.view.visible_secs() / 2.0, app.view.px_per_sec);
 
     egui::ScrollArea::vertical().id_salt("arrange").auto_shrink([false, false]).show(ui, |ui| {
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
         for (ti, track) in project.tracks.iter().enumerate() {
-            ui.horizontal(|ui| {
+            let row = ui.horizontal(|ui| {
                 track_header(app, ui, ti, track, snap);
                 let (resp, painter) = ui.allocate_painter(vec2(ui.available_width(), ROW_H), Sense::click_and_drag());
                 widgets::label(&resp, egui::Role::Group, &format!("Lane {}", track.name));
@@ -440,6 +490,13 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
                 draw_grid(&painter, rect, &app.view, &map, grid);
                 draw_loop_tint(&painter, rect, &app.view, project);
                 painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+                // A bus has no regions: a tinted lane that names what it sums.
+                if track.bus {
+                    painter.rect_filled(rect.shrink2(vec2(0.0, 1.0)), 0.0, theme::with_alpha(theme::BUS, 14));
+                    let sources: Vec<&str> = project.sources_of(ti).iter().map(|&s| project.tracks[s].name.as_str()).collect();
+                    let text = if sources.is_empty() { "Bus — route tracks here with their Output".to_string() } else { format!("Bus — {}", sources.join(", ")) };
+                    painter.text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, text, FontId::proportional(11.5), theme::shade(theme::BUS, 0.8));
+                }
 
                 // Dragging on empty lane space draws a selection rectangle.
                 if resp.drag_started() && app.tool == Tool::Pointer {
@@ -475,6 +532,11 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
                     }
                 }
 
+                if track.armed {
+                    if let Some(start) = snap.status.record_start_secs {
+                        recording_region(&painter, rect, &app.view, start, playhead, project, ui);
+                    }
+                }
                 for view in regions_of(track, ti) {
                     if let Some(e) = region(app, ui, &painter, rect, view, snap) {
                         edit = Some(e);
@@ -490,6 +552,11 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
                 }
                 draw_playhead(&painter, rect, &app.view, playhead, false);
             });
+            let mut span = row.response.rect.y_range();
+            if track.show_automation {
+                span.max = automation_rows(app, ui, ti, track, snap, &map, grid);
+            }
+            spans.push((ti, span));
         }
 
         // Empty area below the tracks: drop target and quick "new track".
@@ -540,6 +607,7 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
         p.rect_stroke(area, 2.0, Stroke::new(1.0, theme::with_alpha(theme::ACCENT, 200)), StrokeKind::Inside);
     }
     app.view.rows = rows;
+    app.view.spans = spans;
 
     match edit {
         Some(Edit::Move { delta_t, delta_track, copy }) => {
@@ -547,6 +615,10 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
             app.act(Action::MoveRegions { regions, delta_secs: delta_t, delta_track, copy });
         }
         Some(Edit::Trim { region, start, end }) => app.act(Action::TrimRegion { region, start, end }),
+        Some(Edit::Stretch { region, length }) => {
+            let ps = opentake_engine::PitchStretch { length_secs: Some(length), ..Default::default() };
+            app.act(Action::PitchStretch { track: region.track, clip: region.index, ps });
+        }
         None => {}
     }
 
@@ -604,6 +676,28 @@ fn handle_zoom_scroll(app: &mut DawApp, ui: &egui::Ui) {
 }
 
 /// Draws one region and handles select / move / copy / trim / split.
+/// What an armed track is recording right now: a red region growing with the playhead (a
+/// cycle recording restarts it at the cycle start on every pass).
+fn recording_region(painter: &Painter, row: Rect, view: &View, start: f64, playhead: f64, project: &Project, ui: &egui::Ui) {
+    let start = if playhead < start && project.loop_enabled { project.loop_start_secs } else { start };
+    if playhead <= start {
+        return;
+    }
+    let rect = Rect::from_min_max(pos2(view.x_of(start), row.top() + 1.0), pos2(view.x_of(playhead), row.bottom() - 2.0)).intersect(row);
+    if rect.width() <= 0.0 {
+        return;
+    }
+    painter.rect_filled(rect, 5.0, theme::with_alpha(theme::RECORD, 60));
+    painter.rect_stroke(rect, 5.0, Stroke::new(1.0, theme::with_alpha(theme::RECORD, 200)), StrokeKind::Inside);
+    let bar = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 15.0));
+    painter.rect_filled(bar, egui::CornerRadius { nw: 5, ne: 5, sw: 0, se: 0 }, theme::with_alpha(theme::RECORD, 170));
+    // A slowly pulsing dot so it reads as live.
+    let pulse = (ui.input(|i| i.time) * 3.0).sin() as f32 * 0.5 + 0.5;
+    painter.circle_filled(pos2(bar.left() + 9.0, bar.center().y), 3.5, Color32::from_white_alpha((120.0 + 135.0 * pulse) as u8));
+    painter.with_clip_rect(bar).text(pos2(bar.left() + 17.0, bar.center().y), Align2::LEFT_CENTER, "Recording", FontId::proportional(10.5), Color32::WHITE);
+    ui.ctx().request_repaint();
+}
+
 fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, view: RegionView, snap: &Snapshot) -> Option<Edit> {
     let project = &snap.project;
     let r = view.r;
@@ -682,10 +776,23 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
         None => paint_region(painter, row, rect, shown, color, &app.view, look),
     }
     if app.tool == Tool::Pointer {
-        // Trim handles on hover.
+        // Trim handles on hover (accent: ⌥ stretches the end instead).
         if let Some(mode) = hover_x.and_then(near_edge) {
             let x = if mode == DragMode::TrimStart { rect.left() + 1.5 } else { rect.right() - 1.5 };
-            painter.vline(x, Rangef::new(rect.top() + 3.0, rect.bottom() - 3.0), Stroke::new(3.0, Color32::WHITE));
+            let stretch = mode == DragMode::TrimEnd && r.kind == RegionKind::Audio && ui.input(|i| i.modifiers.alt);
+            painter.vline(x, Rangef::new(rect.top() + 3.0, rect.bottom() - 3.0), Stroke::new(3.0, if stretch { theme::ACCENT } else { Color32::WHITE }));
+        }
+    }
+
+    // A take folder's badge picks the take that plays.
+    if let (Some((takes, active)), Some(badge)) = (view.takes(), take_badge(rect, row)) {
+        if drag.is_none() {
+            let b = ui.interact(badge, ui.make_persistent_id(("takes", r)), Sense::click());
+            widgets::label(&b, egui::Role::Button, &format!("Takes {}", view.name));
+            if b.hovered() {
+                painter.rect_stroke(badge, 4.0, Stroke::new(1.0, Color32::from_rgb(16, 16, 18)), StrokeKind::Inside);
+            }
+            egui::Popup::menu(&b).show(|ui| take_items(app, ui, r, takes, active));
         }
     }
 
@@ -694,6 +801,7 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
     let shift = ui.input(|i| i.modifiers.shift);
     if resp.clicked() {
         app.selected_track = Some(r.track);
+        app.view.auto_sel = None;
         match app.tool {
             Tool::Pointer if shift => {
                 if let Some(i) = app.selection.iter().position(|&s| s == r) {
@@ -736,11 +844,14 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
                     app.selection = vec![r];
                 }
             }
-            let mode = near_edge(p.x).unwrap_or(DragMode::Move);
+            let mut mode = near_edge(p.x).unwrap_or(DragMode::Move);
+            if mode == DragMode::TrimEnd && r.kind == RegionKind::Audio && ui.input(|i| i.modifiers.alt) {
+                mode = DragMode::StretchEnd;
+            }
             if mode != DragMode::Move {
                 app.selection = vec![r]; // trims apply to the grabbed region only
             }
-            let edge = if mode == DragMode::TrimEnd { view.end() } else { view.position };
+            let edge = if matches!(mode, DragMode::TrimEnd | DragMode::StretchEnd) { view.end() } else { view.position };
             app.view.drag = Some(RegionDrag {
                 grabbed: r,
                 mode,
@@ -758,13 +869,16 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
             let grab = app.view.drag.as_ref().map_or(0.0, |d| d.grab_offset);
             let t = app.view.t_of(p.x) - grab;
             let (orig_start, orig_end) = (view.position, view.end());
-            // Audio can't be extended past its source file.
-            let (source_start, source_end) = match view.content {
+            // Audio can't be extended past its source file (played `stretch` times as long),
+            // nor stretched beyond the stretch range.
+            let ((source_start, source_end), (min_len, max_len)) = match view.content {
                 Content::Audio(c) => {
-                    let s = c.position_secs - c.source_offset_secs;
-                    (s, wf.map_or(f64::INFINITY, |w| s + w.frames as f64 / w.sample_rate as f64))
+                    let s = c.position_secs - c.source_offset_secs * c.stretch;
+                    let (lo, hi) = opentake_engine::STRETCH_RANGE;
+                    let source = wf.map_or(f64::INFINITY, |w| s + w.frames as f64 / w.sample_rate as f64 * c.stretch);
+                    ((s, source), (c.length_secs * lo / c.stretch, c.length_secs * hi / c.stretch))
                 }
-                Content::Midi(_) => (0.0, f64::INFINITY),
+                Content::Midi(_) => ((0.0, f64::INFINITY), (0.0f64, f64::INFINITY)),
             };
             if mode == DragMode::Move {
                 // Snap the grabbed region; everything selected moves by the same offset,
@@ -793,6 +907,10 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
                     let e = snap_time(app, ui, t, project).min(source_end).max(orig_start + MIN_REGION_SECS);
                     (orig_start, e)
                 }
+                DragMode::StretchEnd => {
+                    let e = snap_time(app, ui, t, project).clamp(orig_start + min_len.max(MIN_REGION_SECS), orig_start + max_len);
+                    (orig_start, e)
+                }
             };
             if let Some(d) = app.view.drag.as_mut() {
                 d.start = start;
@@ -811,6 +929,7 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
                 }
                 DragMode::TrimStart if d.start != orig_start => Some(Edit::Trim { region: r, start: Some(d.start), end: None }),
                 DragMode::TrimEnd if d.end != orig_end => Some(Edit::Trim { region: r, start: None, end: Some(d.end) }),
+                DragMode::StretchEnd if d.end != orig_end => Some(Edit::Stretch { region: r, length: d.end - d.start }),
                 _ => None,
             };
         }
@@ -832,6 +951,15 @@ fn region_context_menu(app: &mut DawApp, ui: &mut egui::Ui, view: RegionView, sn
     if r.kind == RegionKind::Midi && !many && ui.button("Open in Piano Roll").clicked() {
         app.open_piano_roll(r);
         ui.close();
+    }
+    if let (Some((takes, active)), false) = (view.takes(), many) {
+        widgets::section(ui, "Takes");
+        take_items(app, ui, r, takes, active);
+        if ui.button(format!("Delete {}", takes[active].name)).clicked() {
+            app.act(Action::DeleteTake { track: r.track, clip: r.index, take: active });
+            ui.close();
+        }
+        ui.separator();
     }
     let playhead = snap.status.position_secs;
     let spans = |t: f64| {
@@ -868,6 +996,25 @@ fn region_context_menu(app: &mut DawApp, ui: &mut egui::Ui, view: RegionView, sn
     }
 }
 
+/// One entry per take; picking one makes it play.
+fn take_items(app: &mut DawApp, ui: &mut egui::Ui, r: RegionRef, takes: &[Take], active: usize) {
+    for (i, take) in takes.iter().enumerate() {
+        if ui.add(egui::Button::selectable(i == active, &take.name)).clicked() {
+            if i != active {
+                app.act(Action::SelectTake { track: r.track, clip: r.index, take: i });
+            }
+            ui.close();
+        }
+    }
+}
+
+/// Where a take folder shows its take, in the name bar's right end (if there's room).
+fn take_badge(rect: Rect, row: Rect) -> Option<Rect> {
+    let right = rect.right().min(row.right()) - 3.0;
+    let left = right - 44.0;
+    (left > rect.left().max(row.left()) + 24.0).then(|| Rect::from_min_max(pos2(left, rect.top() + 2.0), pos2(right, rect.top() + 13.0)))
+}
+
 #[derive(Default, Clone, Copy)]
 struct RegionLook {
     selected: bool,
@@ -895,13 +1042,32 @@ fn paint_region(painter: &Painter, row: Rect, rect: Rect, p: Painted, color: Col
     painter.rect_filled(rect, 5.0, theme::shade(color, body_shade));
     let name_bar = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 15.0));
     painter.rect_filled(name_bar, egui::CornerRadius { nw: 5, ne: 5, sw: 0, se: 0 }, theme::shade(color, if look.selected { 1.0 } else { 0.85 }));
-    painter.text(
+    let badge = p.view.takes().and_then(|t| Some((t, take_badge(rect, row)?)));
+    let name_clip = Rect::from_min_max(name_bar.min, pos2(badge.map_or(name_bar.right(), |(_, b)| b.left() - 2.0), name_bar.bottom()));
+    // Pitch-shifted / stretched audio says so after its name.
+    let name = match p.view.content {
+        Content::Audio(c) if c.is_flexed() => {
+            let pitch = (c.transpose() != 0.0).then(|| format!("{:+} st", (c.transpose() * 100.0).round() / 100.0));
+            let stretch = (c.stretch != 1.0).then(|| format!("{:.0}%", c.stretch * 100.0));
+            format!("{}  ·  {}", p.view.name, pitch.into_iter().chain(stretch).collect::<Vec<_>>().join(" "))
+        }
+        _ => p.view.name.to_string(),
+    };
+    painter.with_clip_rect(name_clip.intersect(painter.clip_rect())).text(
         pos2(name_bar.left().max(row.left()) + 5.0, name_bar.center().y),
         Align2::LEFT_CENTER,
-        p.view.name,
+        name,
         FontId::proportional(10.5),
         Color32::from_rgb(16, 16, 18),
     );
+    if let Some(((takes, active), b)) = badge {
+        painter.rect_filled(b, 4.0, theme::with_alpha(Color32::from_rgb(16, 16, 18), 70));
+        let ink = Color32::from_rgb(16, 16, 18);
+        let text = format!("{}/{}", active + 1, takes.len());
+        painter.text(b.center() - vec2(4.0, 0.0), Align2::CENTER_CENTER, text, FontId::proportional(9.5), ink);
+        let c = pos2(b.right() - 8.0, b.center().y + 1.0);
+        painter.add(egui::Shape::convex_polygon(vec![c + vec2(-3.0, -2.0), c + vec2(3.0, -2.0), c + vec2(0.0, 1.5)], ink, Stroke::NONE));
+    }
     let body = Rect::from_min_max(pos2(rect.left(), name_bar.bottom() + 1.0), pos2(rect.right(), rect.bottom() - 1.0));
     let ink = theme::shade(color, 0.22);
     match p.view.content {
@@ -911,8 +1077,10 @@ fn paint_region(painter: &Painter, row: Rect, rect: Rect, p: Painted, color: Col
                 let mut shown = c.clone();
                 shown.position_secs = p.start;
                 shown.length_secs = p.end - p.start;
-                if p.mode == Some(DragMode::TrimStart) {
-                    shown.source_offset_secs = c.source_offset_secs + (p.start - c.position_secs);
+                match p.mode {
+                    Some(DragMode::TrimStart) => shown.source_offset_secs = c.source_offset_secs + (p.start - c.position_secs) / c.stretch,
+                    Some(DragMode::StretchEnd) => shown.stretch = c.stretch * shown.length_secs / c.length_secs,
+                    _ => {}
                 }
                 draw_waveform(painter, body, row, view, &shown, wf, ink);
             }
@@ -962,12 +1130,17 @@ fn draw_waveform(painter: &Painter, rect: Rect, clip_to: Rect, view: &View, clip
     let mid = rect.center().y;
     let half = rect.height() * 0.47;
     let buckets_per_sec = wf.sample_rate as f64 / wf.frames_per_peak as f64;
-    let sec_per_px = 1.0 / view.px_per_sec as f64;
+    // In source seconds: a stretched region plays its source `stretch` times as long.
+    let sec_per_px = 1.0 / view.px_per_sec as f64 / clip.stretch;
     let stroke = Stroke::new(1.0, color);
     let (from, to) = (rect.left().max(clip_to.left()) + 1.0, rect.right().min(clip_to.right()) - 1.0);
     let mut x = from.floor();
     while x < to {
-        let t = view.t_of(x) - clip.position_secs + clip.source_offset_secs;
+        let t = (view.t_of(x) - clip.position_secs) / clip.stretch + clip.source_offset_secs;
+        if t + sec_per_px <= 0.0 {
+            x += 1.0; // before the file starts (a take that begins later than its folder)
+            continue;
+        }
         let b0 = (t * buckets_per_sec).floor().max(0.0) as usize;
         let b1 = (((t + sec_per_px) * buckets_per_sec).ceil() as usize).max(b0 + 1).min(wf.peaks.len());
         if b0 < b1 {
@@ -1422,14 +1595,39 @@ fn track_header(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, track: &Track, s
     let (rect, _) = ui.allocate_exact_size(vec2(HEADER_W, ROW_H), Sense::hover());
     // Registered before the header's widgets so the buttons/fader on top of it get their
     // clicks; only clicks on empty header space select the track.
-    let background = ui.interact(rect, ui.make_persistent_id(("track_header", ti)), Sense::click());
+    let background = ui.interact(rect, ui.make_persistent_id(("track_header", ti)), Sense::click_and_drag());
     if background.clicked() {
         app.selected_track = Some(ti);
     }
-    background.context_menu(|ui| track_context_menu(app, ui, ti));
+    background.context_menu(|ui| track_context_menu(app, ui, ti, track));
+    // Dragging the header moves the track; a line shows where it will land.
+    if background.drag_started() {
+        app.track_drag = Some(ti);
+        app.selected_track = Some(ti);
+    }
+    if app.track_drag == Some(ti) {
+        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        let last = snap.project.tracks.len().saturating_sub(1);
+        let target = ui.ctx().pointer_latest_pos().map_or(ti, |p| match app.view.track_at(p.y) {
+            Some(t) => t,
+            None if app.view.span_of(0).is_some_and(|r| p.y < r.min) => 0,
+            None => last,
+        });
+        if background.drag_stopped() {
+            app.track_drag = None;
+            if target != ti {
+                app.act(Action::MoveTrack { from: ti, to: target });
+            }
+        } else if let Some(row) = app.view.span_of(target).filter(|_| target != ti) {
+            let y = if target > ti { row.max } else { row.min };
+            let layer = egui::LayerId::new(egui::Order::Foreground, ui.make_persistent_id("track_drop"));
+            let x = Rangef::new(rect.left(), ui.ctx().content_rect().right());
+            ui.ctx().layer_painter(layer).hline(x, y, Stroke::new(2.0, theme::ACCENT));
+        }
+    }
 
     let selected = app.selected_track == Some(ti);
-    let color = theme::track_color(ti);
+    let color = theme::color_of(track, ti);
     let p = ui.painter();
     p.rect_filled(rect, 0.0, if selected { theme::BG_HEADER_SELECTED } else { theme::BG_HEADER });
     p.rect_filled(Rect::from_min_size(rect.min, vec2(4.0, rect.height())), 0.0, color);
@@ -1451,10 +1649,15 @@ fn track_header(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, track: &Track, s
             if name.clicked() {
                 app.selected_track = Some(ti);
             }
-            name.context_menu(|ui| track_context_menu(app, ui, ti));
+            name.context_menu(|ui| track_context_menu(app, ui, ti, track));
             if let Some(inst) = &track.instrument {
                 let short = super::short_plugin_name(&inst.name);
                 ui.label(RichText::new(short).size(10.0).color(theme::TEXT_FAINT));
+            }
+            if track.bus {
+                ui.label(RichText::new("BUS").size(9.5).strong().color(theme::BUS));
+            } else if let Some(b) = snap.project.output_of(ti) {
+                ui.label(RichText::new(format!("→ {}", snap.project.tracks[b].name)).size(10.0).color(theme::shade(theme::BUS, 0.85)));
             }
         });
         ui.horizontal(|ui| {
@@ -1465,33 +1668,57 @@ fn track_header(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, track: &Track, s
                 ("M", track.mute, theme::MUTE, "Mute", |v| TrackUpdate { mute: Some(v), ..Default::default() }),
                 ("S", track.solo, theme::SOLO, "Solo", |v| TrackUpdate { solo: Some(v), ..Default::default() }),
             ];
-            // Record/input apply to audio input; instrument tracks don't record MIDI yet.
-            if !track.is_instrument() {
+            // Record/input apply to audio input; instrument tracks don't record MIDI yet, and
+            // buses only mix.
+            let records = !track.is_instrument() && !track.bus;
+            if records {
                 chips.push(("R", track.armed, theme::RECORD, "Record Enable", |v| TrackUpdate { armed: Some(v), ..Default::default() }));
                 chips.push(("I", track.monitor_input, theme::INPUT, "Input Monitoring", |v| TrackUpdate {
                     monitor_input: Some(v),
                     ..Default::default()
                 }));
             }
+            // Automated controls show (and while stopped, edit) their lane's value at the playhead.
+            let playhead = snap.status.position_secs;
+            let auto = |target| track.automated(target, playhead);
+            let has_lane = |target| track.automation.iter().any(|l| l.target == target && l.mode != AutomationMode::Off);
+            chips[0].1 = auto(AutomationTarget::Mute).map_or(track.mute, |v| v >= 0.5);
             for (text, on, accent, a11y, update) in chips {
                 if widgets::chip(ui, on, text, accent, a11y, size).clicked() {
-                    app.act(Action::UpdateTrack(ti, update(!on)));
+                    let plain = Action::UpdateTrack(ti, update(!on));
+                    if text == "M" {
+                        app.control(&track.automation, Some(ti), AutomationTarget::Mute, if on { 0.0 } else { 1.0 }, plain);
+                    } else {
+                        app.act(plain);
+                    }
                 }
             }
-            if track.is_instrument() {
+            if !records {
                 ui.add_space(2.0 * 23.0);
             }
+            let a = widgets::chip(ui, track.show_automation, "A", theme::AUTOMATION, "Show Automation", size);
+            if a.clicked() {
+                app.act(Action::ShowAutomation { track: Some(ti), show: !track.show_automation });
+            }
             ui.add_space(6.0);
-            let mut gain = track.volume;
+            let mut gain = auto(AutomationTarget::Volume).map_or(track.volume, pos_to_gain);
             let fader_w = ui.available_width() - 26.0;
-            if widgets::hfader(ui, &mut gain, fader_w, "Volume").changed() {
-                app.act(Action::UpdateTrack(ti, TrackUpdate { volume: Some(gain), ..Default::default() }));
+            let r = widgets::hfader(ui, &mut gain, fader_w, "Volume");
+            // Held still, an automated fader keeps writing (Touch/Latch).
+            if r.changed() || (r.dragged() && has_lane(AutomationTarget::Volume)) {
+                app.control(&track.automation, Some(ti), AutomationTarget::Volume, gain_to_pos(gain), Action::UpdateTrack(ti, TrackUpdate { volume: Some(gain), ..Default::default() }));
+            }
+            if r.drag_stopped() && has_lane(AutomationTarget::Volume) {
+                app.act(Action::ReleaseControl { owner: Some(ti), target: AutomationTarget::Volume });
             }
             ui.add_space(2.0);
-            let mut pan = track.pan;
+            let mut pan = auto(AutomationTarget::Pan).map_or(track.pan, |v| v * 2.0 - 1.0);
             let r = widgets::knob(ui, &mut pan, -1.0, 1.0, 0.0, true, 20.0, "Pan");
-            if r.changed() {
-                app.act(Action::UpdateTrack(ti, TrackUpdate { pan: Some(pan), ..Default::default() }));
+            if r.changed() || (r.dragged() && has_lane(AutomationTarget::Pan)) {
+                app.control(&track.automation, Some(ti), AutomationTarget::Pan, (pan + 1.0) / 2.0, Action::UpdateTrack(ti, TrackUpdate { pan: Some(pan), ..Default::default() }));
+            }
+            if r.drag_stopped() && has_lane(AutomationTarget::Pan) {
+                app.act(Action::ReleaseControl { owner: Some(ti), target: AutomationTarget::Pan });
             }
             r.on_hover_text(format!("Pan {}", pan_label(pan)));
         });
@@ -1511,12 +1738,322 @@ fn track_header(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, track: &Track, s
     }
 }
 
-fn track_context_menu(app: &mut DawApp, ui: &mut egui::Ui, ti: usize) {
+fn track_context_menu(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, track: &Track) {
     app.selected_track = Some(ti);
+    let show = !track.show_automation;
+    if ui.add(egui::Button::new(if show { "Show Automation" } else { "Hide Automation" }).shortcut_text("A")).clicked() {
+        app.act(Action::ShowAutomation { track: Some(ti), show });
+        ui.close();
+    }
+    if ui.button("Add Automation Lane").clicked() {
+        app.act(Action::AddLane { owner: Some(ti), target: None });
+        ui.close();
+    }
+    if track.automation.iter().any(|l| !l.shown) && ui.button("Show All Automation Lanes").clicked() {
+        for (lane, _) in track.automation.iter().enumerate().filter(|(_, l)| !l.shown) {
+            app.act(Action::SetLaneShown { owner: Some(ti), lane, shown: true });
+        }
+        app.act(Action::ShowAutomation { track: Some(ti), show: true });
+        ui.close();
+    }
+    ui.separator();
     if ui.button("Delete Track").clicked() {
         app.act(Action::RemoveTrack(ti));
         ui.close();
     }
+}
+
+/// The automation lanes under a track (or a row offering to add one). Returns the bottom of
+/// the last row.
+fn automation_rows(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, track: &Track, snap: &Snapshot, map: &TempoMap, grid: Option<Grid>) -> f32 {
+    let params = snap.auto_params.get(&ti).map_or(&[][..], |p| p.as_slice());
+    let lanes: Vec<(usize, &AutomationLane)> = track.automation.iter().enumerate().filter(|(_, l)| l.shown).collect();
+    let mut bottom = ui.cursor().top();
+    if lanes.is_empty() {
+        let r = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+            let rect = lane_header_rect(app, ui);
+            lane_header_frame(ui, rect, theme::color_of(track, ti));
+            let at = Rect::from_min_size(pos2(rect.left() + 32.0, rect.center().y - 11.0), vec2(150.0, 22.0));
+            let mut child = ui.new_child(UiBuilder::new().id_salt(("add_lane", ti)).max_rect(at));
+            if child.button(RichText::new("+ Add Automation Lane").size(11.0)).clicked() {
+                app.act(Action::AddLane { owner: Some(ti), target: None });
+            }
+            let (resp, painter) = ui.allocate_painter(vec2(ui.available_width(), LANE_H), Sense::hover());
+            painter.rect_filled(resp.rect, 0.0, theme::shade(theme::BG_LANE, 0.85));
+            painter.hline(resp.rect.x_range(), resp.rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+        });
+        return r.response.rect.bottom();
+    }
+    for (li, lane) in lanes {
+        let r = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+            lane_header(app, ui, ti, li, lane, track, params, snap.status.position_secs);
+            lane_area(app, ui, ti, li, lane, track, snap, map, grid);
+        });
+        bottom = r.response.rect.bottom();
+    }
+    bottom
+}
+
+/// Room for a lane header: the lane area starts where the timeline does (as the region
+/// rows do), so lanes line up with the ruler.
+fn lane_header_rect(app: &DawApp, ui: &mut egui::Ui) -> Rect {
+    let w = (app.view.lanes().min - ui.cursor().left()).clamp(0.0, HEADER_W);
+    let (rect, _) = ui.allocate_exact_size(vec2(w, LANE_H), Sense::hover());
+    Rect::from_min_size(rect.min, vec2(HEADER_W, LANE_H))
+}
+
+fn lane_header_frame(ui: &egui::Ui, rect: Rect, color: Color32) {
+    let p = ui.painter();
+    p.rect_filled(rect, 0.0, theme::shade(theme::BG_HEADER, 0.9));
+    p.rect_filled(Rect::from_min_size(rect.min, vec2(4.0, rect.height())), 0.0, theme::with_alpha(color, 110));
+    p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+    p.vline(rect.right() - 0.5, rect.y_range(), Stroke::new(1.0, theme::BORDER));
+}
+
+/// A lane target's name, from the track's automatable parameters.
+fn lane_name(params: &[AutomationParam], target: AutomationTarget) -> String {
+    match params.iter().find(|p| p.target == target) {
+        Some(p) if p.slot.is_some() => format!("{}: {}", p.group.trim_start_matches("OpenTake "), p.name),
+        Some(p) => p.name.clone(),
+        None => format!("{target:?}"),
+    }
+}
+
+fn mode_color(mode: AutomationMode) -> Color32 {
+    match mode {
+        AutomationMode::Off => theme::TEXT_FAINT,
+        AutomationMode::Read => theme::AUTOMATION,
+        AutomationMode::Touch | AutomationMode::Latch => theme::AUTOMATION_WRITE,
+    }
+}
+
+/// Lane header: parameter picker, mode, the value at the playhead, add and remove.
+#[allow(clippy::too_many_arguments)]
+fn lane_header(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, li: usize, lane: &AutomationLane, track: &Track, params: &[AutomationParam], playhead: f64) {
+    let rect = lane_header_rect(app, ui);
+    lane_header_frame(ui, rect, theme::color_of(track, ti));
+    let owner = Some(ti);
+    let content = Rect::from_min_max(pos2(rect.left() + 32.0, rect.top() + 4.0), pos2(rect.right() - 10.0, rect.bottom() - 4.0));
+    // A child Ui, so nothing in the header can push the lane area aside.
+    let mut child = ui.new_child(UiBuilder::new().id_salt(("lane_header", ti, li)).max_rect(content).layout(Layout::top_down(Align::Min)));
+    {
+        let ui = &mut child;
+        ui.spacing_mut().item_spacing = vec2(4.0, 2.0);
+        ui.horizontal(|ui| {
+            let name = lane_name(params, lane.target);
+            // Long plug-in parameter names are cut so the mode stays in view.
+            let short: String = if name.chars().count() > 22 { name.chars().take(21).chain(['…']).collect() } else { name.clone() };
+            let picker = egui::ComboBox::from_id_salt(("lane_target", ti, li)).selected_text(RichText::new(short).size(11.0)).width(128.0).truncate().height(360.0).show_ui(ui, |ui| {
+                let mut group = "";
+                for p in params {
+                    if p.group != group {
+                        widgets::section(ui, &p.group);
+                        group = &p.group;
+                    }
+                    let taken = track.automation.iter().any(|l| l.target == p.target);
+                    let b = ui.add_enabled(!taken || p.target == lane.target, egui::Button::selectable(p.target == lane.target, &p.name));
+                    if b.clicked() && p.target != lane.target {
+                        app.act(Action::SetLaneTarget { owner, lane: li, target: p.target });
+                    }
+                }
+            });
+            widgets::label(&picker.response, egui::Role::ComboBox, &format!("Automation Parameter {name}"));
+            let mut mode = lane.mode;
+            let picker = egui::ComboBox::from_id_salt(("lane_mode", ti, li)).selected_text(RichText::new(lane.mode.label()).size(11.0).color(mode_color(lane.mode))).width(46.0).show_ui(ui, |ui| {
+                for m in AutomationMode::ALL {
+                    ui.selectable_value(&mut mode, m, RichText::new(m.label()).color(mode_color(m)));
+                }
+            });
+            widgets::label(&picker.response, egui::Role::ComboBox, &format!("Automation Mode {}", lane.mode.label()));
+            if mode != lane.mode {
+                app.act(Action::SetLaneMode { owner, lane: li, mode });
+            }
+        });
+        ui.horizontal(|ui| {
+            let value = lane.value_at(playhead).map_or("—".to_string(), |v| lane.target.format(v));
+            ui.label(RichText::new(value).size(10.5).monospace().color(theme::TEXT_DIM));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if widgets::icon_plain(ui, Icon::Close, theme::TEXT_DIM, "Remove Automation Lane", 14.0).on_hover_text("Remove this lane").clicked() {
+                    app.act(Action::RemoveLane { owner, lane: li });
+                }
+                if widgets::icon_plain(ui, Icon::Plus, theme::TEXT_DIM, "Add Automation Lane", 14.0).on_hover_text("Add another lane").clicked() {
+                    app.act(Action::AddLane { owner, target: None });
+                }
+            });
+        });
+    }
+}
+
+/// The envelope over the timeline. Click to add a point (snapped), drag points (Shift: fine),
+/// double-click or ⌫ to delete, right-click for curves and more.
+#[allow(clippy::too_many_arguments)]
+fn lane_area(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, li: usize, lane: &AutomationLane, track: &Track, snap: &Snapshot, map: &TempoMap, grid: Option<Grid>) {
+    let project = &snap.project;
+    let (resp, painter) = ui.allocate_painter(vec2(ui.available_width(), LANE_H), Sense::click_and_drag());
+    let name = lane_name(snap.auto_params.get(&ti).map_or(&[][..], |p| p.as_slice()), lane.target);
+    widgets::label(&resp, egui::Role::Group, &format!("Automation {} {name}", track.name));
+    let rect = resp.rect;
+    let painter = painter.with_clip_rect(rect);
+    painter.rect_filled(rect, 0.0, theme::shade(theme::BG_LANE, 0.85));
+    draw_grid(&painter, rect, &app.view, map, grid);
+    draw_loop_tint(&painter, rect, &app.view, project);
+    painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+
+    let plot = rect.shrink2(vec2(0.0, 6.0));
+    let y_of = |v: f32| plot.bottom() - v.clamp(0.0, 1.0) * plot.height();
+    let v_of = |y: f32| ((plot.bottom() - y) / plot.height()).clamp(0.0, 1.0);
+    let pts: Vec<Pos2> = lane.points.iter().map(|p| pos2(app.view.x_of(p.time_secs), y_of(p.value))).collect();
+    let at = |i: usize| pts[i];
+    let color = theme::color_of(track, ti);
+    let ink = if lane.mode == AutomationMode::Off { theme::shade(color, 0.45) } else { color };
+    let sel = |i: usize| app.view.auto_sel == Some(AutoSel { track: ti, lane: li, point: i });
+
+    // The curve (and a soft fill below it), sampled per pixel so every shape draws right.
+    let hover = resp.hover_pos();
+    if lane.points.is_empty() {
+        let v = match lane.target {
+            AutomationTarget::Volume => gain_to_pos(track.volume),
+            AutomationTarget::Pan => (track.pan + 1.0) / 2.0,
+            AutomationTarget::Mute => track.mute as u8 as f32,
+            AutomationTarget::Param { .. } => 0.5,
+        };
+        painter.hline(rect.x_range(), y_of(v), Stroke::new(1.0, theme::with_alpha(ink, 90)));
+        painter.text(rect.left_center() + vec2(10.0, 0.0), Align2::LEFT_CENTER, "Click to add automation points", FontId::proportional(11.0), theme::TEXT_FAINT);
+    } else {
+        let stepped = lane.target.stepped();
+        let line: Vec<Pos2> = (rect.left() as i32..=rect.right() as i32)
+            .map(|x| pos2(x as f32, y_of(envelope_at(&lane.points, app.view.t_of(x as f32), stepped).unwrap_or(0.0))))
+            .collect();
+        let mut mesh = egui::Mesh::default();
+        let fill = theme::with_alpha(ink, 34);
+        for (k, p) in line.iter().enumerate() {
+            mesh.colored_vertex(*p, fill);
+            mesh.colored_vertex(pos2(p.x, plot.bottom()), fill);
+            if k > 0 {
+                let i = (k as u32) * 2;
+                mesh.add_triangle(i - 2, i - 1, i);
+                mesh.add_triangle(i - 1, i, i + 1);
+            }
+        }
+        painter.add(egui::Shape::mesh(mesh));
+        painter.add(egui::Shape::line(line, Stroke::new(1.6, ink)));
+    }
+    let near = |p: Pos2| (0..lane.points.len()).filter(|&i| at(i).distance(p) <= POINT_GRAB).min_by(|&a, &b| at(a).distance(p).total_cmp(&at(b).distance(p)));
+    let hovered = hover.and_then(near);
+    for i in 0..lane.points.len() {
+        let c = at(i);
+        if !rect.expand(4.0).contains(c) {
+            continue;
+        }
+        let big = sel(i) || hovered == Some(i);
+        painter.circle_filled(c, if big { 4.5 } else { 3.2 }, if sel(i) { Color32::WHITE } else { ink });
+        painter.circle_stroke(c, if big { 4.5 } else { 3.2 }, Stroke::new(1.0, theme::shade(ink, 0.35)));
+    }
+    if hovered.is_some() {
+        ui.ctx().set_cursor_icon(CursorIcon::Grab);
+    }
+
+    // Value (and time) at the point being dragged or hovered.
+    let dragging = app.view.auto_drag.as_ref().filter(|d| d.sel.track == ti && d.sel.lane == li).map(|d| d.sel.point);
+    if let Some(i) = dragging.or(hovered).filter(|&i| i < lane.points.len()) {
+        let p = lane.points[i];
+        let text = format!("{}  ·  {:.2}s", lane.target.format(p.value), p.time_secs);
+        let c = at(i);
+        let galley = painter.layout_no_wrap(text, FontId::proportional(10.5), theme::TEXT);
+        let left = (c.x + 8.0).min(rect.right() - galley.size().x - 6.0);
+        let top = if c.y - rect.top() > galley.size().y + 6.0 { c.y - galley.size().y - 6.0 } else { c.y + 6.0 };
+        let r = Rect::from_min_size(pos2(left, top), galley.size()).expand2(vec2(4.0, 2.0));
+        painter.rect_filled(r, 3.0, theme::with_alpha(theme::BG_DEEP, 230));
+        painter.galley(pos2(left, top), galley, theme::TEXT);
+    }
+    draw_playhead(&painter, rect, &app.view, snap.status.position_secs, false);
+
+    // Interaction.
+    let owner = Some(ti);
+    let press = ui.input(|i| i.pointer.press_origin());
+    if resp.drag_started() {
+        if let Some(i) = press.and_then(near) {
+            let p = lane.points[i];
+            let sel = AutoSel { track: ti, lane: li, point: i };
+            app.view.auto_sel = Some(sel);
+            app.selection.clear();
+            app.view.auto_drag = Some(AutoDrag { sel, from: (p.time_secs, p.value), sent: (p.time_secs, p.value) });
+        }
+    }
+    if resp.dragged() {
+        let total = ui.input(|i| i.pointer.press_origin().zip(i.pointer.latest_pos()).map(|(a, b)| b - a)).unwrap_or_default();
+        let fine = ui.input(|i| i.modifiers.shift);
+        let scale = if fine { 0.2 } else { 1.0 };
+        if let Some(d) = app.view.auto_drag.as_mut().filter(|d| d.sel.track == ti && d.sel.lane == li) {
+            let t = d.from.0 + (total.x * scale / app.view.px_per_sec) as f64;
+            let t = if fine { t.max(0.0) } else { snap_to(app.snap_mode, ui, t, project, app.view.px_per_sec) };
+            let v = (d.from.1 - total.y * scale / plot.height()).clamp(0.0, 1.0);
+            if (t, v) != d.sent {
+                d.sent = (t, v);
+                let merge = format!("autodrag:{}:{li}:{}", track.id, d.sel.point);
+                let (lane, index) = (d.sel.lane, d.sel.point);
+                app.act(Action::MovePoint { owner, lane, index, time: t, value: v, merge });
+            }
+        }
+    }
+    if resp.drag_stopped() {
+        app.view.auto_drag = None;
+    }
+    let pointer = resp.interact_pointer_pos();
+    if resp.double_clicked() {
+        if let Some(i) = pointer.and_then(near) {
+            app.act(Action::DeletePoints { owner, lane: li, indices: vec![i] });
+        }
+    } else if resp.clicked() {
+        app.selected_track = Some(ti);
+        app.selection.clear();
+        if let Some(p) = pointer {
+            match near(p) {
+                Some(i) => app.view.auto_sel = Some(AutoSel { track: ti, lane: li, point: i }),
+                None => {
+                    let t = snap_time(app, ui, app.view.t_of(p.x), project);
+                    // On (or near) the line, the point goes on the line; elsewhere where clicked.
+                    let on_line = envelope_at(&lane.points, t, lane.target.stepped()).filter(|&v| (y_of(v) - p.y).abs() <= 5.0);
+                    app.act(Action::AddPoint { owner, lane: li, time: t, value: on_line.unwrap_or(v_of(p.y)) });
+                }
+            }
+        }
+    }
+    if resp.secondary_clicked() {
+        app.view.auto_context = pointer.and_then(near);
+    }
+    resp.context_menu(|ui| {
+        widgets::section(ui, &name);
+        if let Some(i) = app.view.auto_context.filter(|&i| i < lane.points.len()) {
+            ui.menu_button("Curve", |ui| {
+                for c in Curve::ALL {
+                    if ui.add(egui::Button::selectable(lane.points[i].curve == c, c.label())).clicked() {
+                        app.act(Action::SetPointCurve { owner, lane: li, index: i, curve: c });
+                        ui.close();
+                    }
+                }
+            });
+            if ui.add(egui::Button::new("Delete Point").shortcut_text("⌫")).clicked() {
+                app.act(Action::DeletePoints { owner, lane: li, indices: vec![i] });
+                ui.close();
+            }
+            ui.separator();
+        }
+        if ui.add_enabled(!lane.points.is_empty(), egui::Button::new("Clear Lane")).clicked() {
+            app.act(Action::ClearLane { owner, lane: li });
+            ui.close();
+        }
+        if ui.button("Hide Lane").clicked() {
+            app.act(Action::SetLaneShown { owner, lane: li, shown: false });
+            ui.close();
+        }
+        if ui.button("Remove Lane").clicked() {
+            app.act(Action::RemoveLane { owner, lane: li });
+            ui.close();
+        }
+    });
 }
 
 pub fn pan_label(v: f32) -> String {

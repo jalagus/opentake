@@ -3,6 +3,10 @@
 use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, Device, SampleFormat, Stream, StreamConfig};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use cpal::StreamInstant;
 use rtrb::{Consumer, Producer};
 use serde::{Deserialize, Serialize};
 
@@ -165,14 +169,21 @@ pub fn start(resolved: ResolvedConfig, mut mixer: Mixer) -> Result<AudioStreams>
     // ~0.5 s of interleaved input between the two callbacks.
     let ring_len = (in_channels * sample_rate as usize / 2).max(1);
     let (mut in_tx, mut in_rx): (Producer<f32>, Consumer<f32>) = rtrb::RingBuffer::new(ring_len);
+    let clock = Arc::new(InputClock::new(sample_rate));
+    let in_clock = clock.clone();
 
     let input_stream = match &input {
         Some((dev, cfg)) => {
+            let mut written = 0u64;
             let stream = dev.build_input_stream(
                 *cfg,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    if let Ok(chunk) = in_tx.write_chunk_uninit(data.len().min(in_tx.slots())) {
+                move |data: &[f32], info: &cpal::InputCallbackInfo| {
+                    in_clock.captured(written, info.timestamp().capture);
+                    let len = data.len().min(in_tx.slots());
+                    let len = len - len % in_channels;
+                    if let Ok(chunk) = in_tx.write_chunk_uninit(len) {
                         chunk.fill_from_iter(data.iter().copied());
+                        written += (len / in_channels) as u64;
                     }
                 },
                 |e| tracing::warn!("input stream: {e}"),
@@ -184,9 +195,11 @@ pub fn start(resolved: ResolvedConfig, mut mixer: Mixer) -> Result<AudioStreams>
     };
 
     let mut in_buf = vec![0.0f32; 16_384 * in_channels.max(1)];
+    // Input frames taken from the ring so far (the index of the next one).
+    let mut read = 0u64;
     let output_stream = out_dev.build_output_stream(
         out_cfg,
-        move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
             let frames = out.len() / out_channels;
             let wanted = (frames * in_channels).min(in_buf.len());
             let mut got = 0;
@@ -197,6 +210,7 @@ pub fn start(resolved: ResolvedConfig, mut mixer: Mixer) -> Result<AudioStreams>
                 if excess > 0 {
                     if let Ok(c) = in_rx.read_chunk(excess) {
                         c.commit_all();
+                        read += (excess / in_channels) as u64;
                     }
                 }
                 let avail = in_rx.slots().min(wanted);
@@ -207,6 +221,14 @@ pub fn start(resolved: ResolvedConfig, mut mixer: Mixer) -> Result<AudioStreams>
                     in_buf[a.len()..a.len() + b.len()].copy_from_slice(b);
                     got = a.len() + b.len();
                     c.commit_all();
+                }
+                if got > 0 {
+                    // The first input frame here is processed with the first output frame,
+                    // so the round trip is from its capture to that frame's playback.
+                    if let Some(frames) = clock.round_trip(read, info.timestamp().playback) {
+                        mixer.report_io_latency(frames);
+                    }
+                    read += (got / in_channels) as u64;
                 }
             }
             mixer.process(&in_buf[..got], in_channels, out, out_channels);
@@ -230,4 +252,68 @@ pub fn start(resolved: ResolvedConfig, mut mixer: Mixer) -> Result<AudioStreams>
         input_channels: in_channels,
         output_channels: out_channels,
     })
+}
+
+fn nanos(t: StreamInstant) -> Option<i64> {
+    (t != StreamInstant::ZERO).then(|| t.duration_since(StreamInstant::ZERO).as_nanos() as i64)
+}
+
+/// When the input frames passing through the ring were captured, for measuring the
+/// interface's round-trip latency. The input callback publishes when frame 0 of the ring's
+/// stream would have been captured (re-derived every callback, so dropped input and clock
+/// drift don't accumulate); the output side counts frames to find any frame's capture time.
+struct InputClock {
+    origin_ns: AtomicI64,
+    sample_rate: f64,
+}
+
+impl InputClock {
+    const UNKNOWN: i64 = i64::MIN;
+
+    fn new(sample_rate: u32) -> Self {
+        Self { origin_ns: AtomicI64::new(Self::UNKNOWN), sample_rate: sample_rate.max(1) as f64 }
+    }
+
+    fn frames_ns(&self, frames: u64) -> f64 {
+        frames as f64 * 1e9 / self.sample_rate
+    }
+
+    /// Ring frame `index` (the first of this callback) was captured at `capture`.
+    fn captured(&self, index: u64, capture: StreamInstant) {
+        if let Some(t) = nanos(capture) {
+            self.origin_ns.store(t - self.frames_ns(index) as i64, Ordering::Relaxed);
+        }
+    }
+
+    /// Frames from ring frame `index`'s capture to `playback`, if both are known and sane
+    /// (some hosts don't report timestamps).
+    fn round_trip(&self, index: u64, playback: StreamInstant) -> Option<f64> {
+        let origin = self.origin_ns.load(Ordering::Relaxed);
+        let played = nanos(playback)?;
+        if origin == Self::UNKNOWN {
+            return None;
+        }
+        let ns = played as f64 - (origin as f64 + self.frames_ns(index));
+        (0.0..1e9).contains(&ns).then(|| ns * self.sample_rate / 1e9)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn round_trip_from_capture_and_playback_times() {
+        let clock = InputClock::new(48_000);
+        let t = |ms: f64| StreamInstant::ZERO.checked_add(Duration::from_secs_f64(10.0 + ms / 1000.0)).unwrap();
+        assert_eq!(clock.round_trip(0, t(0.0)), None, "nothing captured yet");
+        // Frames 480.. were captured at 10 ms; frame 960 (at 20 ms) plays at 25 ms: 5 ms.
+        clock.captured(480, t(10.0));
+        let frames = clock.round_trip(960, t(25.0)).unwrap();
+        assert!((frames - 240.0).abs() < 0.01, "{frames}");
+        // A playback time before the capture is nonsense, and so is a missing timestamp.
+        assert_eq!(clock.round_trip(960, t(15.0)), None);
+        assert_eq!(clock.round_trip(960, StreamInstant::ZERO), None);
+    }
 }

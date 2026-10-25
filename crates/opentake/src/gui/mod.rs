@@ -8,6 +8,8 @@ mod menu;
 mod mixer;
 mod eq_view;
 mod export_view;
+mod flex_view;
+mod midi_import_view;
 mod fx_view;
 mod piano_roll;
 mod tab_view;
@@ -20,8 +22,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use opentake_engine::project::{Note, Project};
-use opentake_engine::{AudioConfig, DeviceList, Engine, EngineStatus, HistoryInfo, ParamView, RegionData, SlotRef, TrackUpdate, Waveform};
+use opentake_engine::project::{AutomationLane, AutomationMode, AutomationTarget, Curve, Note, Project};
+use opentake_engine::{AudioConfig, AutomationParam, DeviceList, Engine, EngineStatus, HistoryInfo, LaneOwner, ParamView, RegionData, SlotRef, TrackUpdate, Waveform};
 use opentake_vst3::ScannedPlugin;
 use eframe::egui;
 use egui::{Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
@@ -81,6 +83,8 @@ pub(crate) struct Snapshot {
     pub status: EngineStatus,
     pub waveforms: HashMap<PathBuf, Arc<Waveform>>,
     pub scanned: Vec<ScannedPlugin>,
+    /// Installed Audio Units (macOS).
+    pub audio_units: Vec<opentake_engine::AudioUnitInfo>,
     pub scan_errors: Vec<String>,
     pub plugin_paths: Vec<PathBuf>,
     /// Instruments for new instrument tracks: (display name, id for the engine).
@@ -94,6 +98,10 @@ pub(crate) struct Snapshot {
     pub taps: HashMap<(usize, SlotRef), Arc<opentake_engine::eq::Tap>>,
     /// Gain-reduction meters of built-in compressors/limiters whose windows are open.
     pub meters: HashMap<(usize, SlotRef), Arc<opentake_engine::dynamics::GainMeter>>,
+    /// Band meters of built-in multiband compressors whose windows are open.
+    pub multiband: HashMap<(usize, SlotRef), Arc<opentake_engine::multiband::MultibandMeter>>,
+    /// What can be automated, per track index, for tracks showing their automation.
+    pub auto_params: HashMap<usize, Vec<AutomationParam>>,
 }
 
 /// Copied regions (⌘C): each with its track offset from the top-most copied track, and
@@ -123,6 +131,7 @@ pub(crate) enum Action {
     SetTimeSignature((u32, u32)),
     SetTempoChanges { changes: Vec<opentake_engine::project::TempoChange>, merge: Option<String> },
     SetCountIn { bars: Option<u32>, on_play: Option<bool> },
+    SetAutoMonitor(bool),
     /// Make the project's tempo map follow an imported song's tempo.
     AdoptSongTempo,
     InsertMasterPlugin(String),
@@ -132,6 +141,10 @@ pub(crate) enum Action {
     SetMetronome { enabled: Option<bool>, volume: Option<f32> },
     StartAudio(AudioConfig),
     StopAudio,
+    /// Manual recording latency correction (ms) for the current device setup.
+    SetRecordOffset(f64),
+    /// Loopback-measure the recording latency on an input channel.
+    MeasureLatency(usize),
     RefreshDevices,
     NewProject,
     OpenProject(PathBuf),
@@ -140,6 +153,10 @@ pub(crate) enum Action {
     Redo,
     AddTrack,
     AddInstrumentTrack(String),
+    /// New bus, with these tracks routed to it.
+    AddBus(Vec<usize>),
+    /// Route a track to a bus (by index) or the master (`None`).
+    SetOutput(usize, Option<usize>),
     RemoveTrack(usize),
     UpdateTrack(usize, TrackUpdate),
     AddClip { track: Option<usize>, file: PathBuf, position: f64 },
@@ -147,11 +164,22 @@ pub(crate) enum Action {
     /// Move (or with `copy`, duplicate) regions by a time and track offset.
     MoveRegions { regions: Vec<RegionRef>, delta_secs: f64, delta_track: isize, copy: bool },
     SplitRegions { regions: Vec<RegionRef>, at: f64 },
+    /// Play another take of a take folder, or delete one.
+    SelectTake { track: usize, clip: usize, take: usize },
+    DeleteTake { track: usize, clip: usize, take: usize },
     TrimRegion { region: RegionRef, start: Option<f64>, end: Option<f64> },
+    /// Pitch-shift / time-stretch an audio region.
+    PitchStretch { track: usize, clip: usize, ps: opentake_engine::PitchStretch },
+    MoveTrack { from: usize, to: usize },
+    /// Region gain in dB, or normalize the region's peak to 0 dBFS.
+    ClipGain { track: usize, clip: usize, gain_db: f32 },
+    NormalizeClip { track: usize, clip: usize },
     /// Paste the clipboard with its top-most track at `track`, starting at `position`.
     Paste { track: usize, position: f64 },
     SetLoop { enabled: Option<bool>, start: Option<f64>, end: Option<f64> },
     ImportGuitarPro { path: PathBuf, options: opentake_engine::GuitarProImport },
+    ImportMidiFile { path: PathBuf, options: opentake_engine::MidiFileImport },
+    ExportMidiFile(PathBuf),
     AddMidiRegion { track: usize, position: f64, length: f64 },
     SetNotes { track: usize, clip: usize, notes: Vec<Note> },
     LiveNote { track: usize, pitch: u8, velocity: u8 },
@@ -164,6 +192,25 @@ pub(crate) enum Action {
     RemovePlugin(usize, SlotRef),
     SetBypass(usize, SlotRef, bool),
     SetParam(usize, SlotRef, u32, f64),
+    /// Show or hide automation under a track (`None` = every track).
+    ShowAutomation { track: Option<usize>, show: bool },
+    /// New lane for `target` (`None` = the next thing without one).
+    AddLane { owner: LaneOwner, target: Option<AutomationTarget> },
+    RemoveLane { owner: LaneOwner, lane: usize },
+    SetLaneTarget { owner: LaneOwner, lane: usize, target: AutomationTarget },
+    SetLaneMode { owner: LaneOwner, lane: usize, mode: AutomationMode },
+    SetLaneShown { owner: LaneOwner, lane: usize, shown: bool },
+    ClearLane { owner: LaneOwner, lane: usize },
+    AddPoint { owner: LaneOwner, lane: usize, time: f64, value: f32 },
+    /// Drag a point; `merge` makes the drag one undo step.
+    MovePoint { owner: LaneOwner, lane: usize, index: usize, time: f64, value: f32, merge: String },
+    DeletePoints { owner: LaneOwner, lane: usize, indices: Vec<usize> },
+    SetPointCurve { owner: LaneOwner, lane: usize, index: usize, curve: Curve },
+    /// A control with an automation lane moved (normalized value): the lane decides
+    /// (see `Engine::control_automation`), else `plain` applies.
+    AutomatedControl { owner: LaneOwner, target: AutomationTarget, value: f32, plain: Box<Action> },
+    /// An automated control was let go (ends a Touch write).
+    ReleaseControl { owner: LaneOwner, target: AutomationTarget },
 }
 
 pub(crate) struct DawApp {
@@ -188,17 +235,25 @@ pub(crate) struct DawApp {
     pub tab_paper: bool,
     pub piano: piano_roll::PianoRoll,
     pub open_plugins: Vec<(usize, SlotRef)>,
+    /// Track being dragged to a new place (lane headers or mixer strips).
+    pub track_drag: Option<usize>,
     devices: Option<DeviceList>,
     audio_cfg: AudioConfig,
     show_audio_settings: bool,
+    /// Input channel for the loopback latency measurement.
+    latency_channel: usize,
     show_mcp_info: bool,
     pub show_plugin_manager: bool,
     show_instrument_picker: bool,
     /// Open "Import Guitar Pro" dialog.
     pub gp_import: Option<GpImportDialog>,
+    /// Open "Import MIDI File" dialog.
+    pub midi_import: Option<midi_import_view::MidiImportDialog>,
     /// Open "Export Audio" dialog, and the export running in the background.
     pub export_dialog: Option<export_view::ExportDialog>,
     export_task: Option<export_view::ExportTask>,
+    /// A region pitch/stretch render running in the background.
+    flex_task: Option<flex_view::FlexTask>,
     /// Where settings are saved; `None` disables persistence (tests).
     settings_path: Option<PathBuf>,
     /// Recently opened/saved projects, newest first.
@@ -210,6 +265,8 @@ pub(crate) struct DawApp {
     name_buf: (Option<usize>, String),
     message: Option<(String, bool, Instant)>,
     actions: Vec<Action>,
+    /// Automatable parameters per track id: (slot ids they were listed for, when, list).
+    auto_params: HashMap<u64, (Vec<u32>, Instant, Vec<AutomationParam>)>,
 }
 
 /// State of the "Import Guitar Pro" dialog.
@@ -248,15 +305,19 @@ impl DawApp {
             tab_paper: false,
             piano: piano_roll::PianoRoll::default(),
             open_plugins: Vec::new(),
+            track_drag: None,
             devices: None,
             audio_cfg: AudioConfig::default(),
             show_audio_settings: false,
+            latency_channel: 0,
             show_mcp_info: false,
             show_plugin_manager: false,
             show_instrument_picker: false,
             gp_import: None,
+            midi_import: None,
             export_dialog: None,
             export_task: None,
+            flex_task: None,
             settings_path: None,
             recent: Vec::new(),
             seen_project_path: None,
@@ -265,11 +326,22 @@ impl DawApp {
             name_buf: (None, String::new()),
             message: None,
             actions: Vec::new(),
+            auto_params: HashMap::new(),
         }
     }
 
     pub(crate) fn act(&mut self, a: Action) {
         self.actions.push(a);
+    }
+
+    /// A control moved to `value` (normalized): through its automation lane if it has one
+    /// that isn't off, else `plain`.
+    pub(crate) fn control(&mut self, lanes: &[AutomationLane], owner: LaneOwner, target: AutomationTarget, value: f32, plain: Action) {
+        if lanes.iter().any(|l| l.target == target && l.mode != AutomationMode::Off) {
+            self.act(Action::AutomatedControl { owner, target, value, plain: Box::new(plain) });
+        } else {
+            self.act(plain);
+        }
     }
 
     fn info(&mut self, msg: impl Into<String>) {
@@ -295,6 +367,28 @@ impl DawApp {
         }
     }
 
+    /// Keep track-index state pointing at the same tracks after a track moved.
+    fn track_moved(&mut self, from: usize, to: usize) {
+        let map = |i: usize| match i {
+            i if i == from => to,
+            i if from < to && i > from && i <= to => i - 1,
+            i if to < from && i >= to && i < from => i + 1,
+            i => i,
+        };
+        self.selected_track = self.selected_track.map(map);
+        for r in &mut self.selection {
+            r.track = map(r.track);
+        }
+        for (t, _) in &mut self.open_plugins {
+            if *t != MASTER_UI {
+                *t = map(*t);
+            }
+        }
+        if let Some((t, _)) = &mut self.piano.region {
+            *t = map(*t);
+        }
+    }
+
     fn toggle_bottom(&mut self, tab: BottomTab) {
         self.bottom = if self.bottom == Some(tab) { None } else { Some(tab) };
         // Opening the piano roll edits the selected MIDI region, if any.
@@ -307,8 +401,26 @@ impl DawApp {
 
     fn snapshot(&mut self) -> Snapshot {
         let open = self.open_plugins.clone();
+        let mut cache = std::mem::take(&mut self.auto_params);
         let mut e = self.lock();
+        // Held and latched controls keep writing their lanes while playing.
+        if let Err(err) = e.automation_tick() {
+            tracing::warn!("automation: {err:#}");
+        }
         let project = e.project().clone();
+        // The parameter lists are re-read when the plug-ins change, and every few seconds.
+        let mut auto_params = HashMap::new();
+        for (i, t) in project.tracks.iter().enumerate().filter(|(_, t)| t.show_automation) {
+            let sig: Vec<u32> = t.slots().map(|s| s.id).collect();
+            if !cache.get(&t.id).is_some_and(|(s, at, _)| *s == sig && at.elapsed() < Duration::from_secs(3)) {
+                if let Ok(list) = e.automation_params(Some(i)) {
+                    cache.insert(t.id, (sig, Instant::now(), list));
+                }
+            }
+            if let Some((_, _, list)) = cache.get(&t.id) {
+                auto_params.insert(i, list.clone());
+            }
+        }
         let mut waveforms = HashMap::new();
         for clip in project.tracks.iter().flat_map(|t| &t.clips) {
             if !waveforms.contains_key(&clip.file) {
@@ -319,11 +431,13 @@ impl DawApp {
         }
         let taps = open.iter().filter_map(|&(t, s)| Some(((t, s), e.eq_tap(t, s)?))).collect();
         let meters = open.iter().filter_map(|&(t, s)| Some(((t, s), e.fx_meter(t, s)?))).collect();
+        let multiband = open.iter().filter_map(|&(t, s)| Some(((t, s), e.multiband_meter(t, s)?))).collect();
         let params = open.into_iter().filter_map(|(t, s)| Some(((t, s), e.slot_params(t, s).ok()?))).collect();
-        Snapshot {
+        let snap = Snapshot {
             project_path: e.project_path().map(|p| p.to_path_buf()),
             status: e.status(),
             scanned: e.scanned_plugins().to_vec(),
+            audio_units: e.audio_units().to_vec(),
             scan_errors: e.scan_errors().to_vec(),
             plugin_paths: e.plugin_search_paths().to_vec(),
             instruments: e.available_instruments(),
@@ -333,8 +447,13 @@ impl DawApp {
             params,
             taps,
             meters,
+            multiband,
+            auto_params,
             project,
-        }
+        };
+        drop(e);
+        self.auto_params = cache;
+        snap
     }
 
     fn apply_actions(&mut self) {
@@ -372,11 +491,25 @@ impl DawApp {
                 e.adopt_song_tempo()?;
             }
             Action::SetCountIn { bars, on_play } => e.set_count_in(bars, on_play)?,
+            Action::SetAutoMonitor(on) => e.set_auto_input_monitoring(on)?,
             Action::InsertMasterPlugin(query) => {
                 let slot = e.insert_master_plugin(&query, None)?;
                 self.open_plugins.push((MASTER_UI, SlotRef::Master(slot)));
             }
-            Action::SetParams(t, s, values, label) => e.set_slot_params(t, s, &values, &label)?,
+            Action::SetParams(t, s, values, label) => {
+                // Automated parameters go through their lanes, the rest as one step.
+                let owner = if matches!(s, SlotRef::Master(_)) { None } else { Some(t) };
+                let mut plain = Vec::new();
+                for (id, v) in values {
+                    let target = e.param_target(owner, s, id)?;
+                    if !e.control_automation(owner, target, v as f32)? {
+                        plain.push((id, v));
+                    }
+                }
+                if !plain.is_empty() {
+                    e.set_slot_params(t, s, &plain, &label)?;
+                }
+            }
             Action::SetMasterVolume(g) => e.set_master_volume(g)?,
             Action::SetMetronome { enabled, volume } => e.set_metronome(enabled, volume)?,
             Action::StartAudio(cfg) => {
@@ -389,6 +522,14 @@ impl DawApp {
                 ));
             }
             Action::StopAudio => e.stop_audio()?,
+            Action::SetRecordOffset(ms) => e.set_record_offset(ms)?,
+            Action::MeasureLatency(channel) => {
+                let r = e.measure_latency(channel)?;
+                self.info(format!(
+                    "Round trip {:.1} ms (device reports {:.1} ms) — recordings now move {:+.1} ms more",
+                    r.round_trip_ms, r.reported_ms, r.record_offset_ms
+                ));
+            }
             Action::RefreshDevices => self.devices = Some(e.list_devices()?),
             Action::NewProject => {
                 e.new_project("Untitled")?;
@@ -446,6 +587,11 @@ impl DawApp {
                 let t = e.add_instrument_track(&format!("Inst {n}"), &instrument)?;
                 self.selected_track = Some(t);
             }
+            Action::AddBus(tracks) => {
+                let name = format!("Bus {}", e.project().tracks.iter().filter(|t| t.bus).count() + 1);
+                self.selected_track = Some(if tracks.is_empty() { e.add_bus(&name)? } else { e.create_bus_from(&tracks, &name)? });
+            }
+            Action::SetOutput(t, to) => e.set_track_output(t, to)?,
             Action::RemoveTrack(t) => {
                 e.remove_track(t)?;
                 self.reset_selection(None);
@@ -478,6 +624,12 @@ impl DawApp {
                 }
                 self.selection = moved;
             }
+            Action::SelectTake { track, clip, take } => {
+                e.select_take(track, clip, take)?;
+            }
+            Action::DeleteTake { track, clip, take } => {
+                e.remove_take(track, clip, take)?;
+            }
             Action::SplitRegions { regions, at } => {
                 e.split_regions(&regions, at)?;
                 // Select the right-hand parts, like Logic. Splitting in index order shifts
@@ -504,6 +656,19 @@ impl DawApp {
                     }
                 }
             },
+            Action::PitchStretch { track, clip, ps } => self.apply_pitch_stretch(e, track, clip, ps)?,
+            Action::MoveTrack { from, to } => {
+                e.move_track(from, to)?;
+                self.track_moved(from, to);
+                self.view.auto_sel = None;
+            }
+            Action::ClipGain { track, clip, gain_db } => {
+                e.set_clip_gain(track, clip, gain_db)?;
+            }
+            Action::NormalizeClip { track, clip } => {
+                let c = e.normalize_clip(track, clip, 0.0)?;
+                self.info(format!("Normalized: region gain {:+.1} dB", 20.0 * c.gain.log10()));
+            }
             Action::Paste { track, position } => {
                 if let Some(clip) = self.clipboard.clone() {
                     let last = e.project().tracks.len().saturating_sub(1);
@@ -534,6 +699,16 @@ impl DawApp {
                     self.bottom = Some(BottomTab::Tab);
                 }
                 self.info(format!("Imported {} track(s) from {}", created.len(), path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()));
+            }
+            Action::ImportMidiFile { path, options } => {
+                let created = e.import_midi_file(&path, &options)?;
+                self.selection.clear();
+                self.selected_track = created.first().copied();
+                self.info(format!("Imported {} track(s) from {}", created.len(), path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()));
+            }
+            Action::ExportMidiFile(path) => {
+                let n = e.export_midi_file(&path)?;
+                self.info(format!("Exported {n} track(s) to {}", path.display()));
             }
             Action::AddMidiRegion { track, position, length } => {
                 let i = e.add_midi_clip(track, position, length, None)?;
@@ -581,8 +756,49 @@ impl DawApp {
             }
             Action::SetBypass(t, s, b) => e.set_slot_bypass(t, s, b)?,
             Action::SetParam(t, s, id, v) => {
-                e.set_slot_param(t, s, id, v)?;
+                let owner = if matches!(s, SlotRef::Master(_)) { None } else { Some(t) };
+                let target = e.param_target(owner, s, id)?;
+                if !e.control_automation(owner, target, v as f32)? {
+                    e.set_slot_param(t, s, id, v)?;
+                }
             }
+            Action::ShowAutomation { track, show } => e.set_automation_shown(track, show)?,
+            Action::AddLane { owner, target } => {
+                let target = match target {
+                    Some(t) => t,
+                    None => e.next_lane_target(owner)?,
+                };
+                e.add_lane(owner, target)?;
+            }
+            Action::RemoveLane { owner, lane } => {
+                e.remove_lane(owner, lane)?;
+                self.view.auto_sel = None;
+            }
+            Action::SetLaneTarget { owner, lane, target } => e.set_lane_target(owner, lane, target)?,
+            Action::SetLaneMode { owner, lane, mode } => e.set_lane_mode(owner, lane, mode)?,
+            Action::SetLaneShown { owner, lane, shown } => e.set_lane_shown(owner, lane, shown)?,
+            Action::ClearLane { owner, lane } => {
+                e.clear_automation(owner, lane, None, None)?;
+                self.view.auto_sel = None;
+            }
+            Action::AddPoint { owner, lane, time, value } => {
+                let point = e.insert_point(owner, lane, opentake_engine::project::AutomationPoint::new(time, value))?;
+                if let Some(track) = owner {
+                    self.view.auto_sel = Some(timeline::AutoSel { track, lane, point });
+                }
+            }
+            Action::MovePoint { owner, lane, index, time, value, merge } => e.move_point(owner, lane, index, time, value, Some(merge))?,
+            Action::DeletePoints { owner, lane, indices } => {
+                e.delete_points(owner, lane, &indices)?;
+                self.view.auto_sel = None;
+            }
+            Action::SetPointCurve { owner, lane, index, curve } => e.set_point_curve(owner, lane, index, curve)?,
+            Action::AutomatedControl { owner, target, value, plain } => {
+                if !e.control_automation(owner, target, value)? {
+                    self.apply(e, *plain)?;
+                }
+            }
+            Action::ReleaseControl { owner, target } => e.release_automation(owner, target)?,
         }
         Ok(())
     }
@@ -597,6 +813,9 @@ impl DawApp {
     /// After undo/redo, drop selections that no longer point at anything.
     fn validate_selection(&mut self, e: &Engine) {
         let p = e.project();
+        if self.view.auto_sel.is_some_and(|s| p.tracks.get(s.track).and_then(|t| t.automation.get(s.lane)).is_none_or(|l| s.point >= l.points.len())) {
+            self.view.auto_sel = None;
+        }
         if self.selected_track.is_some_and(|t| t >= p.tracks.len()) {
             self.selected_track = None;
         }
@@ -665,7 +884,7 @@ impl DawApp {
             return;
         }
         let plain = |i: &egui::InputState, k: egui::Key| i.key_pressed(k) && !i.modifiers.any();
-        let (space, rec, home, inspector, metronome, cycle, mixer, piano, tab, delete, escape, zoom_fit) = ui.input(|i| {
+        let (space, rec, home, inspector, metronome, cycle, mixer, piano, tab, delete, escape, zoom_fit, automation) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
                 plain(i, egui::Key::R),
@@ -679,8 +898,12 @@ impl DawApp {
                 (i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)).then_some(i.modifiers.command),
                 i.key_pressed(egui::Key::Escape),
                 plain(i, egui::Key::Z),
+                plain(i, egui::Key::A),
             )
         });
+        if automation {
+            self.toggle_automation(snap);
+        }
         if zoom_fit {
             self.zoom_to_fit(snap);
         }
@@ -728,8 +951,19 @@ impl DawApp {
         }
     }
 
-    /// Delete: selected notes in the open piano roll take priority over the selected region.
+    /// Show automation under every track, or hide it if any track shows it (Logic's "A").
+    fn toggle_automation(&mut self, snap: &Snapshot) {
+        let shown = snap.project.tracks.iter().any(|t| t.show_automation);
+        self.act(Action::ShowAutomation { track: None, show: !shown });
+    }
+
+    /// Delete: a selected automation point, then selected notes in the open piano roll, take
+    /// priority over the selected region.
     fn delete_selection(&mut self, snap: &Snapshot) {
+        if let Some(s) = self.view.auto_sel.take() {
+            self.act(Action::DeletePoints { owner: Some(s.track), lane: s.lane, indices: vec![s.point] });
+            return;
+        }
         if self.bottom == Some(BottomTab::PianoRoll) && !self.piano.selected.is_empty() {
             if let Some((t, c)) = self.piano.region {
                 if let Some(clip) = snap.project.tracks.get(t).and_then(|tr| tr.midi_clips.get(c)) {
@@ -884,6 +1118,8 @@ impl DawApp {
                 self.act(Action::OpenProject(f));
             } else if opentake_project::guitarpro::is_guitar_pro_path(&f) {
                 self.open_guitar_pro_dialog(f);
+            } else if opentake_engine::is_midi_file_path(&f) {
+                self.open_midi_file_dialog(f);
             } else {
                 self.act(Action::AddClip { track, file: f, position });
             }
@@ -897,6 +1133,8 @@ impl DawApp {
                 self.act(Action::OpenProject(f));
             } else if opentake_project::guitarpro::is_guitar_pro_path(&f) {
                 self.open_guitar_pro_dialog(f);
+            } else if opentake_engine::is_midi_file_path(&f) {
+                self.open_midi_file_dialog(f);
             } else {
                 self.act(Action::AddClip { track: None, file: f, position: snap.status.position_secs });
             }
@@ -908,6 +1146,7 @@ impl DawApp {
         if let Some(p) = rfd::FileDialog::new()
             .add_filter("OpenTake project", &[opentake_engine::PROJECT_EXTENSION])
             .add_filter("Reaper project", &["rpp"])
+            .add_filter("DAWproject (Bitwig, Studio One, Cubase)", &["dawproject"])
             .set_file_name(name)
             .save_file()
         {
@@ -933,10 +1172,18 @@ impl DawApp {
         });
     }
 
+    /// Quick view toggles, like Logic's control bar: inspector, mixer, piano roll, tablature.
     fn left_cluster(&mut self, ui: &mut egui::Ui) {
-        let r = widgets::icon_button(ui, Icon::Inspector, self.show_inspector, theme::ACCENT, "Inspector (I)", vec2(30.0, 26.0));
-        if r.clicked() {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let size = vec2(30.0, 26.0);
+        if widgets::icon_button(ui, Icon::Inspector, self.show_inspector, theme::ACCENT, "Inspector (I)", size).clicked() {
             self.show_inspector = !self.show_inspector;
+        }
+        let views = [(Icon::Mixer, BottomTab::Mixer, "Mixer (X)"), (Icon::PianoRoll, BottomTab::PianoRoll, "Piano Roll (P)"), (Icon::Tablature, BottomTab::Tab, "Tablature (T)")];
+        for (icon, tab, a11y) in views {
+            if widgets::icon_button(ui, icon, self.bottom == Some(tab), theme::ACCENT, a11y, size).clicked() {
+                self.toggle_bottom(tab);
+            }
         }
     }
 
@@ -957,10 +1204,12 @@ impl DawApp {
             mixer_visible: self.bottom == Some(BottomTab::Mixer),
             tab_visible: self.bottom == Some(BottomTab::Tab),
             piano_roll_visible: self.bottom == Some(BottomTab::PianoRoll),
+            automation_visible: snap.project.tracks.iter().any(|t| t.show_automation),
             snap_on: self.snap_mode != timeline::SnapMode::Off,
             metronome_on: snap.project.metronome_enabled,
             count_in_on: snap.project.count_in_bars > 0,
             count_in_on_play: snap.project.count_in_on_play,
+            auto_monitor: snap.project.auto_input_monitoring,
             audio_running: snap.status.audio_running,
             playing: snap.status.playing,
             undo: snap.history.undo.clone(),
@@ -1077,7 +1326,9 @@ impl DawApp {
         match cmd {
             MenuCommand::NewProject => self.act(Action::NewProject),
             MenuCommand::Open => {
-                if let Some(p) = rfd::FileDialog::new().add_filter("Project", &["otp", "rpp", "json"]).pick_file() {
+                let mut exts = vec!["otp", "rpp", "json"];
+                exts.extend(opentake_project::import::EXTENSIONS);
+                if let Some(p) = rfd::FileDialog::new().add_filter("Project", &exts).pick_file() {
                     self.act(Action::OpenProject(p));
                 }
             }
@@ -1121,6 +1372,12 @@ impl DawApp {
                     self.open_guitar_pro_dialog(path);
                 }
             }
+            MenuCommand::ImportMidi => {
+                if let Some(path) = rfd::FileDialog::new().add_filter("MIDI file", &["mid", "midi"]).pick_file() {
+                    self.open_midi_file_dialog(path);
+                }
+            }
+            MenuCommand::ExportMidi => self.export_midi_file(snap),
             MenuCommand::Undo | MenuCommand::Redo => {
                 if ui.egui_wants_keyboard_input() {
                     // A text field has focus: let it undo its own typing instead.
@@ -1156,6 +1413,13 @@ impl DawApp {
             }
             MenuCommand::NewTrack => self.act(Action::AddTrack),
             MenuCommand::NewInstrumentTrack => self.show_instrument_picker = true,
+            MenuCommand::NewBus => self.act(Action::AddBus(Vec::new())),
+            MenuCommand::NewBusFromSelection => {
+                let mut tracks: Vec<usize> = self.selected_track.into_iter().chain(self.selection.iter().map(|r| r.track)).collect();
+                tracks.sort_unstable();
+                tracks.dedup();
+                self.act(Action::AddBus(tracks));
+            }
             MenuCommand::DeleteTrack => {
                 if let Some(t) = self.selected_track {
                     self.act(Action::RemoveTrack(t));
@@ -1177,8 +1441,10 @@ impl DawApp {
                 let bars = (on && snap.project.count_in_bars == 0).then_some(1);
                 self.act(Action::SetCountIn { bars, on_play: Some(on) })
             }
+            MenuCommand::ToggleAutoMonitor => self.act(Action::SetAutoMonitor(!snap.project.auto_input_monitoring)),
             MenuCommand::ToggleInspector => self.show_inspector = !self.show_inspector,
             MenuCommand::ToggleMixer => self.toggle_bottom(BottomTab::Mixer),
+            MenuCommand::ToggleAutomation => self.toggle_automation(snap),
             MenuCommand::TogglePianoRoll => self.toggle_bottom(BottomTab::PianoRoll),
             MenuCommand::ToggleTab => self.toggle_bottom(BottomTab::Tab),
             MenuCommand::ZoomIn => self.view.zoom_by(timeline::ZOOM_STEP, snap.status.position_secs),
@@ -1259,7 +1525,8 @@ impl DawApp {
             .show(ctx, |ui| {
                 let defaults = opentake_vst3::scan::default_search_paths();
                 widgets::section(ui, "Scan Locations");
-                ui.label(RichText::new("VST3 plug-ins are searched recursively in these folders.").color(theme::TEXT_DIM));
+                let note = if cfg!(target_os = "macos") { " Audio Units are found through macOS." } else { "" };
+                ui.label(RichText::new(format!("VST3 plug-ins are searched recursively in these folders.{note}")).color(theme::TEXT_DIM));
                 ui.add_space(4.0);
                 egui::Frame::new().fill(theme::BG_DEEP).corner_radius(6).inner_margin(8).show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -1301,7 +1568,7 @@ impl DawApp {
                 });
 
                 ui.add_space(12.0);
-                widgets::section(ui, &format!("Plug-ins ({})", snap.scanned.len()));
+                widgets::section(ui, &format!("Plug-ins ({})", snap.scanned.len() + snap.audio_units.len()));
                 egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(220.0).show(ui, |ui| {
                     egui::Grid::new("plugin_list").num_columns(3).striped(true).spacing([16.0, 6.0]).show(ui, |ui| {
                         for p in &snap.scanned {
@@ -1310,8 +1577,14 @@ impl DawApp {
                             ui.label(RichText::new(p.class.sub_categories.replace('|', " · ")).color(theme::TEXT_FAINT));
                             ui.end_row();
                         }
+                        for a in &snap.audio_units {
+                            ui.label(RichText::new(&a.name).strong()).on_hover_text(&a.id);
+                            ui.label(RichText::new(&a.manufacturer).color(theme::TEXT_DIM));
+                            ui.label(RichText::new(if a.instrument { "Audio Unit · Instrument" } else { "Audio Unit · Effect" }).color(theme::TEXT_FAINT));
+                            ui.end_row();
+                        }
                     });
-                    if snap.scanned.is_empty() {
+                    if snap.scanned.is_empty() && snap.audio_units.is_empty() {
                         ui.label(RichText::new("No plug-ins found in these folders.").color(theme::TEXT_FAINT));
                     }
                     for err in &snap.scan_errors {
@@ -1605,6 +1878,7 @@ impl DawApp {
                 ui.label(RichText::new("No track selected").color(theme::TEXT_FAINT));
             }
         }
+        self.region_inspector(ui, snap);
         ui.add_space(6.0);
         ui.separator();
 
@@ -1668,7 +1942,7 @@ impl DawApp {
                     }
                     if let Some(kind) = fx.filter(|_| !params.is_empty()) {
                         let bpm = snap.project.tempo_map().tempo_at(snap.status.position_secs.max(0.0));
-                        fx_view::show(self, ui, t, s, kind, params, snap.meters.get(&(t, s)), bpm);
+                        fx_view::show(self, ui, t, s, kind, params, snap.meters.get(&(t, s)), snap.multiband.get(&(t, s)), bpm);
                         return;
                     }
                     if params.is_empty() {
@@ -1733,7 +2007,7 @@ impl DawApp {
         });
     }
 
-    fn audio_settings_window(&mut self, ctx: &egui::Context) {
+    fn audio_settings_window(&mut self, ctx: &egui::Context, snap: &Snapshot) {
         let mut open = self.show_audio_settings;
         egui::Window::new("Audio Settings").pivot(Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
             let Some(devices) = self.devices.clone() else {
@@ -1767,6 +2041,50 @@ impl DawApp {
                 ui.label(RichText::new("I/O Buffer Size").color(theme::TEXT_DIM));
                 option_combo(ui, "bs", &mut self.audio_cfg.buffer_size, &[32, 64, 128, 256, 512, 1024, 2048], |v| {
                     format!("{v} samples")
+                });
+                ui.end_row();
+
+                let status = &snap.status;
+                ui.label(RichText::new("Recording Latency").color(theme::TEXT_DIM));
+                ui.horizontal(|ui| {
+                    let measured = match status.io_latency_ms {
+                        Some(ms) => format!("{ms:.1} ms measured"),
+                        None if status.audio_running && status.input_channels > 0 => "not reported by the device".into(),
+                        None => "measured while audio runs".into(),
+                    };
+                    ui.label(measured).on_hover_text(
+                        "The interface's round trip, from the input to what you hear. Recordings are moved \
+                         earlier by this much so they line up with what you played along to.",
+                    );
+                    ui.label(RichText::new("+").color(theme::TEXT_DIM));
+                    let mut offset = status.record_offset_ms;
+                    let drag = egui::DragValue::new(&mut offset).range(-500.0..=500.0).speed(0.1).fixed_decimals(1).suffix(" ms");
+                    let resp = ui.add(drag).on_hover_text("Correction for this device setup if recordings still sit early (negative) or late (positive)");
+                    widgets::label(&resp, egui::Role::SpinButton, "Recording offset");
+                    if resp.changed() {
+                        self.act(Action::SetRecordOffset(offset));
+                    }
+                });
+                ui.end_row();
+
+                ui.label(RichText::new("Calibrate").color(theme::TEXT_DIM));
+                ui.horizontal(|ui| {
+                    let can = status.audio_running && status.input_channels > 0 && !status.recording;
+                    let channel = self.latency_channel.min(status.input_channels.max(1) - 1);
+                    ui.add_enabled_ui(can, |ui| {
+                        egui::ComboBox::from_id_salt("lat_ch").width(70.0).selected_text(format!("Input {}", channel + 1)).show_ui(ui, |ui| {
+                            for ch in 0..status.input_channels {
+                                ui.selectable_value(&mut self.latency_channel, ch, format!("Input {}", ch + 1));
+                            }
+                        });
+                        if ui.button("Measure Latency").on_hover_text(
+                            "Plays test chirps and listens for them on this input, which must hear the output: \
+                             a cable from an output to the input, or speakers turned up near a microphone. \
+                             Sets the correction for this device setup.",
+                        ).clicked() {
+                            self.act(Action::MeasureLatency(channel));
+                        }
+                    });
                 });
                 ui.end_row();
             });
@@ -1863,15 +2181,17 @@ impl eframe::App for DawApp {
         });
 
         self.plugin_windows(ui, &snap);
-        self.audio_settings_window(ui.ctx());
+        self.audio_settings_window(ui.ctx(), &snap);
         self.mcp_info_window(ui.ctx());
         self.plugin_manager_window(ui.ctx(), &snap);
         self.instrument_picker_window(ui.ctx(), &snap);
         self.guitar_pro_window(ui.ctx(), &snap);
+        self.midi_import_window(ui.ctx(), &snap);
         self.export_window(ui.ctx(), &snap);
         if self.export_task.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
+        self.poll_flex(ui.ctx());
         self.apply_actions();
         // Keep meters, playhead and agent-made changes live.
         ui.request_repaint_after(Duration::from_millis(33));
@@ -2092,6 +2412,34 @@ mod tests {
     }
 
     #[test]
+    fn option_drag_stretches_region_and_inspector_transposes() {
+        let (mut harness, engine, dir) = harness_with_region(); // 1.0 .. 5.0
+        let px = harness.state().view.px_per_sec;
+        let rect = harness.get_by_label("Region riff").rect();
+        let edge = egui::pos2(rect.right() - 2.0, rect.center().y);
+        press_drag(&mut harness, edge, edge + egui::vec2(2.0 * px, 0.0), egui::Modifiers::ALT);
+        let c = engine.lock().unwrap().project().tracks[0].clips[0].clone();
+        assert!((c.length_secs - 6.0).abs() < 0.05 && (c.stretch - 1.5).abs() < 0.02, "⌥-drag stretches: {} {}", c.length_secs, c.stretch);
+        assert_eq!((c.position_secs, c.source_offset_secs), (1.0, 0.0));
+
+        // The selected region's inspector: type a transposition.
+        assert_eq!(harness.state().selection, vec![RegionRef::audio(0, 0)]);
+        harness.get_by_role_and_label(egui::accesskit::Role::SpinButton, "Transpose").click();
+        harness.step();
+        harness.get_by_role_and_label(egui::accesskit::Role::SpinButton, "Transpose").type_text("-7");
+        harness.key_press(egui::Key::Enter);
+        harness.step();
+        harness.step();
+        let c = engine.lock().unwrap().project().tracks[0].clips[0].clone();
+        assert_eq!(c.pitch_semitones, -7, "inspector sets the pitch");
+        assert!((c.stretch - 1.5).abs() < 0.02, "stretch is kept");
+        click(&mut harness, "Reset Pitch & Stretch");
+        let c = engine.lock().unwrap().project().tracks[0].clips[0].clone();
+        assert!(!c.is_flexed() && (c.length_secs - 4.0).abs() < 1e-6, "reset restores the original length");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn cmd_drag_copies_region_and_keeps_original() {
         let (mut harness, engine, dir) = harness_with_region();
         let px = harness.state().view.px_per_sec;
@@ -2176,6 +2524,79 @@ mod tests {
         harness.step();
     }
 
+    fn click_at(harness: &mut Harness<'static, DawApp>, pos: egui::Pos2) {
+        harness.hover_at(pos);
+        for _ in 0..30 {
+            harness.step(); // no double-click with an earlier click
+        }
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+        }
+        harness.step();
+        harness.step();
+    }
+
+    #[test]
+    fn automation_lane_points_are_added_dragged_and_deleted() {
+        use opentake_engine::project::AutomationTarget;
+        let (mut harness, engine) = harness_with_track();
+        harness.state_mut().snap_mode = timeline::SnapMode::Off;
+        click(&mut harness, "Show Automation");
+        let lanes = |e: &SharedEngine| e.lock().unwrap().project().tracks[0].automation.clone();
+        assert!(engine.lock().unwrap().project().tracks[0].show_automation);
+        assert_eq!(lanes(&engine)[0].target, AutomationTarget::Volume, "showing a track's automation starts with a volume lane");
+        harness.step();
+        let lane = harness.get_by_label("Automation Guitar Volume").rect();
+        // The lane sits right under the track's own row, and belongs to the track.
+        let row = harness.get_by_label("Lane Guitar").rect();
+        assert!((lane.top() - row.bottom()).abs() < 1.0 && (lane.left() - harness.state().view.lanes().min).abs() < 1.0, "{lane:?} under {row:?}");
+        assert_eq!(harness.state().view.track_at(lane.center().y), Some(0));
+
+        // Click at 2 s, a quarter down the lane: a point at ~0.75.
+        let x = |h: &Harness<'static, DawApp>, t: f64| h.state().view.x(t);
+        let plot = |v: f32| lane.bottom() - 6.0 - v * (lane.height() - 12.0);
+        let at = egui::pos2(x(&harness, 2.0), plot(0.75));
+        click_at(&mut harness, at);
+        let p = lanes(&engine)[0].points.clone();
+        assert_eq!(p.len(), 1);
+        assert!((p[0].time_secs - 2.0).abs() < 0.03 && (p[0].value - 0.75).abs() < 0.03, "{p:?}");
+        assert!(harness.state().view.auto_sel.is_some(), "the new point is selected");
+
+        // Drag it later and down.
+        let from = egui::pos2(x(&harness, p[0].time_secs), plot(p[0].value));
+        drag(&mut harness, from, from + egui::vec2(48.0, 10.0));
+        let q = lanes(&engine)[0].points[0];
+        let px = harness.state().view.px_per_sec as f64;
+        assert!((q.time_secs - (p[0].time_secs + 48.0 / px)).abs() < 0.03, "{q:?}");
+        assert!(q.value < p[0].value - 0.1, "{q:?}");
+        assert_eq!(engine.lock().unwrap().history_info().undo.as_deref(), Some("Move Automation Point"));
+
+        // A second point, then ⌫ deletes the selected one and double-click the other.
+        let at = egui::pos2(x(&harness, 4.0), plot(0.2));
+        click_at(&mut harness, at);
+        assert_eq!(lanes(&engine)[0].points.len(), 2);
+        harness.key_press(egui::Key::Backspace);
+        harness.step();
+        harness.step();
+        assert_eq!(lanes(&engine)[0].points.len(), 1, "⌫ deletes the selected point, not the track");
+        assert_eq!(engine.lock().unwrap().project().tracks.len(), 1);
+        let at = egui::pos2(x(&harness, q.time_secs), plot(q.value));
+        double_click_at(&mut harness, at);
+        assert!(lanes(&engine)[0].points.is_empty());
+
+        // The header fader follows the lane; "+" adds another lane, "A" hides them all.
+        engine.lock().unwrap().set_automation_points(Some(0), 0, vec![opentake_engine::project::AutomationPoint::new(0.0, 0.0)], true).unwrap();
+        harness.step();
+        harness.step();
+        click(&mut harness, "Add Automation Lane");
+        assert_eq!(lanes(&engine).iter().map(|l| l.target).collect::<Vec<_>>(), vec![AutomationTarget::Volume, AutomationTarget::Pan]);
+        harness.key_press(egui::Key::A);
+        harness.step();
+        harness.step();
+        assert!(!engine.lock().unwrap().project().tracks[0].show_automation);
+        assert!(harness.query_by_label("Automation Guitar Volume").is_none());
+    }
+
     #[test]
     fn undo_and_redo_with_keyboard_and_menu() {
         let (mut harness, engine) = harness_with_track();
@@ -2193,6 +2614,142 @@ mod tests {
         let redo = format!("Redo New Track {}", MenuCommand::Redo.shortcut_text().unwrap());
         click(&mut harness, &redo);
         assert_eq!(engine.lock().unwrap().project().tracks.len(), 2);
+    }
+
+    #[test]
+    fn audio_settings_show_recording_latency() {
+        let engine: SharedEngine = Arc::new(Mutex::new(Engine::new()));
+        let app_engine = engine.clone();
+        let mut harness = Harness::builder().with_size([1000.0, 700.0]).build_eframe(move |cc| {
+            theme::apply(&cc.egui_ctx);
+            DawApp::new(app_engine, None)
+        });
+        let device = |name: &str| opentake_engine::DeviceInfo { id: name.into(), name: name.into(), is_default: true, default_channels: 2, max_channels: 2, default_sample_rate: 48_000 };
+        harness.state_mut().devices = Some(DeviceList { host: "CoreAudio".into(), inputs: vec![device("Interface In")], outputs: vec![device("Interface Out")] });
+        harness.state_mut().show_audio_settings = true;
+        engine.lock().unwrap().set_record_offset(-1.5).unwrap();
+        for _ in 0..4 {
+            harness.step();
+        }
+        harness.get_by_label("measured while audio runs");
+        harness.get_by_label("Measure Latency");
+        assert_eq!(harness.get_by_label("Recording offset").value().as_deref(), Some("-1.5 ms"));
+        harness.get_by_label("Recording offset").set_value_accesskit(4.0);
+        harness.step();
+        harness.step();
+        assert_eq!(engine.lock().unwrap().record_offset_ms(), 4.0);
+    }
+
+    #[test]
+    fn region_gain_and_normalize_in_the_inspector() {
+        let (mut harness, engine, dir) = harness_with_region();
+        harness.state_mut().selection = vec![RegionRef::audio(0, 0)];
+        harness.step();
+        harness.step();
+        harness.get_by_label("Region Gain").set_value_accesskit(-4.5);
+        harness.step();
+        harness.step();
+        assert!((engine.lock().unwrap().project().tracks[0].clips[0].gain - 10f32.powf(-4.5 / 20.0)).abs() < 1e-4);
+        click(&mut harness, "Normalize");
+        let mut e = engine.lock().unwrap();
+        let peak = e.clip_peak(0, 0).unwrap() * e.project().tracks[0].clips[0].gain;
+        assert!((peak - 1.0).abs() < 1e-3, "{peak}");
+        assert_eq!(e.history_info().undo.as_deref(), Some("Normalize Region"));
+        drop(e);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn control_bar_buttons_toggle_the_views() {
+        let (mut harness, _engine) = harness_with_track();
+        click(&mut harness, "Mixer (X)");
+        assert!(harness.state().bottom == Some(BottomTab::Mixer));
+        click(&mut harness, "Tablature (T)");
+        assert!(harness.state().bottom == Some(BottomTab::Tab));
+        click(&mut harness, "Tablature (T)");
+        assert!(harness.state().bottom.is_none());
+        click(&mut harness, "Piano Roll (P)");
+        assert!(harness.state().bottom == Some(BottomTab::PianoRoll));
+    }
+
+    #[test]
+    fn tracks_reorder_by_dragging_headers_and_mixer_strips() {
+        let (mut harness, engine) = harness_with_track();
+        for name in ["Bass", "Keys"] {
+            engine.lock().unwrap().add_track(name).unwrap();
+        }
+        harness.step();
+        harness.step();
+        let names = |e: &SharedEngine| e.lock().unwrap().project().tracks.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        // Lane view: drag Guitar's header (empty space right of its name) below Keys.
+        let lane = |h: &Harness<'static, DawApp>, name: &str| h.get_by_label(&format!("Lane {name}")).rect();
+        let header_x = lane(&harness, "Guitar").left() - 60.0;
+        let (from, to) = (lane(&harness, "Guitar").center().y, lane(&harness, "Keys").center().y);
+        drag(&mut harness, egui::pos2(header_x, from), egui::pos2(header_x, to));
+        assert_eq!(names(&engine), ["Bass", "Keys", "Guitar"]);
+        assert_eq!(harness.state().selected_track, Some(2), "the selection follows the track");
+
+        // Mixer: clicking a strip selects its track; dragging moves it.
+        harness.key_press(egui::Key::X);
+        harness.step();
+        harness.step();
+        let strip = |h: &Harness<'static, DawApp>, name: &str| h.get_by_label(&format!("Strip {name}")).rect();
+        let top = |r: egui::Rect| egui::pos2(r.center().x, r.top() + 4.0);
+        let p = top(strip(&harness, "Keys"));
+        harness.hover_at(p);
+        harness.step();
+        harness.drag_at(p);
+        harness.step();
+        harness.drop_at(p);
+        harness.step();
+        harness.step();
+        assert_eq!(harness.state().selected_track, Some(1));
+        let (a, b) = (top(strip(&harness, "Guitar")), top(strip(&harness, "Bass")));
+        drag(&mut harness, a, b);
+        assert_eq!(names(&engine), ["Guitar", "Bass", "Keys"]);
+        engine.lock().unwrap().undo().unwrap();
+        assert_eq!(names(&engine), ["Bass", "Keys", "Guitar"]);
+    }
+
+    #[test]
+    fn multiband_editor_moves_crossovers_and_solos_bands() {
+        let (mut harness, engine) = harness_with_track();
+        engine.lock().unwrap().insert_master_plugin("multiband", None).unwrap();
+        harness.state_mut().open_plugins.push((MASTER_UI, SlotRef::Master(0)));
+        harness.step();
+        harness.step();
+        let value = |e: &SharedEngine, id: u32| e.lock().unwrap().slot_params(0, SlotRef::Master(0)).unwrap().iter().find(|p| p.id == id).unwrap().value;
+        let before = value(&engine, opentake_engine::multiband::LOW_CROSSOVER);
+        let handle = harness.get_by_label("Low Crossover").rect().center();
+        drag(&mut harness, handle, handle + egui::vec2(60.0, 0.0));
+        assert!(value(&engine, opentake_engine::multiband::LOW_CROSSOVER) > before + 0.05, "dragging right raises the crossover");
+        click(&mut harness, "Solo Mid");
+        assert_eq!(value(&engine, opentake_engine::multiband::band_param(1, opentake_engine::multiband::SOLO)), 1.0);
+    }
+
+    #[test]
+    fn take_folder_badge_picks_the_take() {
+        let (mut harness, engine, dir) = harness_with_region();
+        {
+            // Three takes of one cycle recording in the same file.
+            let mut e = engine.lock().unwrap();
+            let mut folder = e.remove_clip(0, 0).unwrap();
+            let file = folder.file.clone();
+            folder.length_secs = 1.0;
+            folder.push_take("Take 2".into(), file.clone(), 1.0);
+            folder.push_take("Take 3".into(), file, 2.0);
+            e.insert_clip(0, folder).unwrap();
+        }
+        harness.state_mut().view.px_per_sec = 200.0;
+        harness.step();
+        harness.step();
+        click(&mut harness, "Takes riff");
+        click(&mut harness, "Take 1");
+        let e = engine.lock().unwrap();
+        let c = &e.project().tracks[0].clips[0];
+        assert_eq!((c.active_take, c.source_offset_secs), (0, 0.0));
+        assert_eq!(e.history_info().undo.as_deref(), Some("Select Take"));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -2434,6 +2991,36 @@ mod tests {
     }
 
     #[test]
+    fn midi_file_import_dialog_creates_instrument_tracks() {
+        // A MIDI file with a keys part and a drum part, written by the engine's exporter.
+        let path = std::env::temp_dir().join(format!("opentake-gui-midi-{}.mid", std::process::id()));
+        let mut src = Engine::new();
+        for (name, inst, pitch) in [("Keys", "synth", 60), ("Beat", "drums", 36)] {
+            let t = src.add_instrument_track(name, inst).unwrap();
+            let c = src.add_midi_clip(t, 0.0, 2.0, None).unwrap();
+            src.set_midi_notes(t, c, vec![Note { start_secs: 0.0, length_secs: 0.5, pitch, velocity: 100, tab: None }]).unwrap();
+        }
+        src.export_midi_file(&path).unwrap();
+
+        let (mut harness, engine) = harness_with_track();
+        harness.state_mut().open_midi_file_dialog(path.clone());
+        harness.step();
+        harness.step();
+        // Untick the drums, then import.
+        click(&mut harness, "Beat");
+        click(&mut harness, "Import");
+        let e = engine.lock().unwrap();
+        let names: Vec<_> = e.project().tracks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["Guitar", "Keys"], "existing track + imported keys only");
+        let imported = &e.project().tracks[1];
+        assert!(imported.is_instrument() && imported.midi_clips[0].notes.len() == 1);
+        drop(e);
+        assert!(harness.state().midi_import.is_none(), "dialog closes after import");
+        assert_eq!(harness.state().selected_track, Some(1));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn tablature_view_follows_the_timeline_and_click_seeks() {
         let (mut harness, engine) = harness_with_track();
         let fixture = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../opentake-project/tests/fixtures/simple.gp"));
@@ -2501,6 +3088,35 @@ mod tests {
         click(&mut harness, "Track");
         click(&mut harness, &menu_label(MenuCommand::DeleteTrack));
         assert_eq!(engine.lock().unwrap().project().tracks.len(), 1);
+    }
+
+    #[test]
+    fn buses_from_the_track_menu_and_the_output_selector() {
+        let (mut harness, engine) = harness_with_track();
+        let output = |e: &SharedEngine| e.lock().unwrap().project().output_of(0);
+        click(&mut harness, "Guitar");
+        click(&mut harness, "Track");
+        click(&mut harness, &menu_label(MenuCommand::NewBusFromSelection));
+        assert!(engine.lock().unwrap().project().tracks[1].bus);
+        assert_eq!(output(&engine), Some(1));
+        // The new bus is selected; neither its header nor its strip can record.
+        assert_eq!(harness.state().selected_track, Some(1));
+        assert_eq!(harness.query_all_by_label("Record Enable").count(), 1, "only the guitar's header");
+
+        // The guitar's Output selector in the inspector: back to Stereo Out, then a new bus.
+        harness.state_mut().selected_track = Some(0);
+        harness.step();
+        click(&mut harness, "Output: Bus 1");
+        harness.get_by_role_and_label(egui::Role::Button, "Stereo Out").click();
+        harness.step();
+        harness.step();
+        assert_eq!(output(&engine), None);
+        click(&mut harness, "Output: Stereo Out");
+        click(&mut harness, "New Bus");
+        assert_eq!(output(&engine), Some(2));
+        assert_eq!(harness.state().selected_track, Some(2));
+        engine.lock().unwrap().undo().unwrap();
+        assert_eq!(engine.lock().unwrap().project().tracks.len(), 2);
     }
 
     #[test]
@@ -2775,9 +3391,10 @@ mod tests {
         let out = std::env::var("OPENTAKE_SCREENSHOT").unwrap_or_else(|_| "opentake-ui.png".into());
         let dir = std::env::temp_dir().join(format!("opentake-shot-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let (drums, bass) = (dir.join("Drums.wav"), dir.join("Bass.wav"));
+        let (drums, bass, vocal) = (dir.join("Drums.wav"), dir.join("Bass.wav"), dir.join("Vocal.wav"));
         write_tone(&drums, 70.0, 8.73, 14.0);
         write_tone(&bass, 55.0, 8.73, 3.0);
+        write_tone(&vocal, 330.0, 8.73, 1.2);
 
         let engine: SharedEngine = Arc::new(Mutex::new(Engine::new()));
         {
@@ -2807,8 +3424,27 @@ mod tests {
                 notes.push(Note { start_secs: (bar as f64 * 4.0 + 2.0) * beat, length_secs: beat, pitch: chord[2] + 5, velocity: 110, tab: None });
             }
             e.set_midi_notes(keys, clip, notes).unwrap();
-            e.add_track("Audio 4").unwrap();
-            e.set_loop(Some(true), Some(2.0 * 4.0 * beat), Some(3.0 * 4.0 * beat)).unwrap();
+            // A vocal take folder from cycle recording over the loop, and a bus for bass and keys.
+            let (start, bar) = (2.0 * 4.0 * beat, 4.0 * beat);
+            let v = e.add_track("Vocal").unwrap();
+            e.add_clip(v, &vocal, 0.0).unwrap();
+            let mut folder = e.remove_clip(v, 0).unwrap();
+            (folder.name, folder.position_secs, folder.length_secs) = ("Vocal".into(), start, bar);
+            for take in 2..=3 {
+                folder.push_take(format!("Take {take}"), vocal.clone(), (take - 1) as f64 * bar);
+            }
+            e.insert_clip(v, folder).unwrap();
+            e.create_bus_from(&[1, 2], "Music Bus").unwrap();
+            // A volume ride on the bass, shown under its track.
+            {
+                use opentake_engine::project::automation::{AutomationPoint, AutomationTarget, Curve, gain_to_pos};
+                let lane = e.add_lane(Some(1), AutomationTarget::Volume).unwrap();
+                let point = |bars: f64, db: f32, curve| AutomationPoint { time_secs: bars * bar, value: gain_to_pos(10f32.powf(db / 20.0)), curve };
+                let points = vec![point(0.0, 0.0, Curve::Linear), point(1.5, 0.0, Curve::Smooth), point(2.0, -9.0, Curve::Linear), point(2.6, -9.0, Curve::Smooth), point(3.4, 2.0, Curve::Linear)];
+                e.set_automation_points(Some(1), lane, points, true).unwrap();
+                e.set_automation_shown(Some(1), true).unwrap();
+            }
+            e.set_loop(Some(true), Some(start), Some(start + bar)).unwrap();
             // A tempo change into 3/4 at bar 5.
             let change = opentake_engine::project::TempoChange { at_secs: 16.0 * beat, bpm: 96.0, time_signature: Some((3, 4)) };
             e.set_tempo_changes(vec![change], None).unwrap();
@@ -2817,7 +3453,7 @@ mod tests {
 
         let app_engine = engine.clone();
         let mut harness = Harness::builder()
-            .with_size([1360.0, 900.0])
+            .with_size([1360.0, 1020.0])
             .with_pixels_per_point(2.0)
             .with_step_dt(1.0 / 60.0)
             .wgpu()
@@ -2919,6 +3555,28 @@ mod tests {
             harness.step();
         }
         harness.render().expect("render").save(out.replace(".png", "-eq.png")).expect("save png");
+
+        // The multiband compressor working on a bass-heavy mix.
+        {
+            use opentake_engine::mixer::Processor;
+            let slot = engine.lock().unwrap().insert_master_plugin("multiband", None).unwrap();
+            let meter = engine.lock().unwrap().multiband_meter(0, SlotRef::Master(slot)).expect("meter");
+            let mut mb = opentake_engine::multiband::Multiband::new(48_000.0, Some(meter));
+            harness.state_mut().open_plugins = vec![(MASTER_UI, SlotRef::Master(slot))];
+            let tau = std::f32::consts::TAU;
+            for f in 0..8 {
+                let x: Vec<f32> = (0..4800)
+                    .map(|i| {
+                        let t = (f * 4800 + i) as f32 / 48_000.0;
+                        0.7 * (t * 70.0 * tau).sin() * (-(t % 0.5) * 6.0).exp() + 0.25 * (t * 900.0 * tau).sin() + 0.04 * (t * 7000.0 * tau).sin()
+                    })
+                    .collect();
+                let (mut l, mut r) = (vec![0.0; 4800], vec![0.0; 4800]);
+                mb.process(&[&x, &x], &mut [&mut l, &mut r], 4800, &Default::default(), &[]);
+                harness.step();
+            }
+            harness.render().expect("render").save(out.replace(".png", "-multiband.png")).expect("save png");
+        }
         if std::env::var("OPENTAKE_SCREENSHOT_EXPORT").is_ok() {
             harness.state_mut().open_plugins.clear();
             harness.state_mut().export_dialog = Some(export_view::ExportDialog { stems: true, ..Default::default() });

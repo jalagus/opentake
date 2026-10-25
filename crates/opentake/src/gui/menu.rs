@@ -16,7 +16,9 @@ pub enum MenuCommand {
     SaveAs,
     ImportAudio,
     ImportGuitarPro,
+    ImportMidi,
     ExportAudio,
+    ExportMidi,
     Undo,
     Redo,
     SplitAtPlayhead,
@@ -27,18 +29,22 @@ pub enum MenuCommand {
     ToggleSnap,
     NewTrack,
     NewInstrumentTrack,
+    NewBus,
+    NewBusFromSelection,
     DeleteTrack,
     PlayStop,
     Record,
     ToggleMetronome,
     ToggleCountIn,
     ToggleCountInOnPlay,
+    ToggleAutoMonitor,
     ToggleCycle,
     GoToStart,
     ToggleInspector,
     ToggleMixer,
     TogglePianoRoll,
     ToggleTab,
+    ToggleAutomation,
     ZoomIn,
     ZoomOut,
     ZoomToFit,
@@ -67,13 +73,18 @@ impl MenuCommand {
             Self::SaveAs => "save_as",
             Self::ImportAudio => "import_audio",
             Self::ImportGuitarPro => "import_guitar_pro",
+            Self::ImportMidi => "import_midi",
+            Self::ExportMidi => "export_midi",
             Self::ExportAudio => "export_audio",
             Self::Undo => "undo",
             Self::Redo => "redo",
             Self::NewInstrumentTrack => "new_instrument_track",
+            Self::NewBus => "new_bus",
+            Self::NewBusFromSelection => "new_bus_from_selection",
             Self::ToggleMixer => "toggle_mixer",
             Self::TogglePianoRoll => "toggle_piano_roll",
             Self::ToggleTab => "toggle_tab",
+            Self::ToggleAutomation => "toggle_automation",
             Self::ZoomIn => "zoom_in",
             Self::ZoomOut => "zoom_out",
             Self::ZoomToFit => "zoom_to_fit",
@@ -90,6 +101,7 @@ impl MenuCommand {
             Self::ToggleMetronome => "toggle_metronome",
             Self::ToggleCountIn => "toggle_count_in",
             Self::ToggleCountInOnPlay => "toggle_count_in_on_play",
+            Self::ToggleAutoMonitor => "toggle_auto_input_monitoring",
             Self::ToggleCycle => "toggle_cycle",
             Self::GoToStart => "go_to_start",
             Self::ToggleInspector => "toggle_inspector",
@@ -113,13 +125,18 @@ impl MenuCommand {
             Self::SaveAs => "Save As…",
             Self::ImportAudio => "Import Audio File…",
             Self::ImportGuitarPro => "Import Guitar Pro…",
+            Self::ImportMidi => "Import MIDI File…",
+            Self::ExportMidi => "Export MIDI File…",
             Self::ExportAudio => "Export Audio…",
             Self::Undo => "Undo",
             Self::Redo => "Redo",
             Self::NewInstrumentTrack => "New Instrument Track…",
+            Self::NewBus => "New Bus",
+            Self::NewBusFromSelection => "Create Bus from Selection",
             Self::ToggleMixer => "Mixer",
             Self::TogglePianoRoll => "Piano Roll",
             Self::ToggleTab => "Tablature",
+            Self::ToggleAutomation => "Show Automation",
             Self::ZoomIn => "Zoom In",
             Self::ZoomOut => "Zoom Out",
             Self::ZoomToFit => "Zoom to Fit",
@@ -136,6 +153,7 @@ impl MenuCommand {
             Self::ToggleMetronome => "Metronome",
             Self::ToggleCountIn => "Count-in When Recording",
             Self::ToggleCountInOnPlay => "Count-in When Playing",
+            Self::ToggleAutoMonitor => "Auto Input Monitoring",
             Self::ToggleCycle => "Cycle",
             Self::GoToStart => "Go to Beginning",
             Self::ToggleInspector => "Show Inspector",
@@ -186,6 +204,7 @@ impl MenuCommand {
             Self::ToggleMixer => "X",
             Self::TogglePianoRoll => "P",
             Self::ToggleTab => "T",
+            Self::ToggleAutomation => "A",
             Self::ZoomIn => if mac { "⌘→" } else { "Ctrl+→" },
             Self::ZoomOut => if mac { "⌘←" } else { "Ctrl+←" },
             Self::ZoomToFit => "Z",
@@ -221,7 +240,7 @@ impl MenuCommand {
 pub const MENUS: &[(&str, &[Option<MenuCommand>])] = {
     use MenuCommand::*;
     &[
-        ("File", &[Some(NewProject), Some(Open), Some(RecentMenu), None, Some(Save), Some(SaveAs), None, Some(ImportAudio), Some(ImportGuitarPro), None, Some(ExportAudio)]),
+        ("File", &[Some(NewProject), Some(Open), Some(RecentMenu), None, Some(Save), Some(SaveAs), None, Some(ImportAudio), Some(ImportGuitarPro), Some(ImportMidi), None, Some(ExportAudio), Some(ExportMidi)]),
         (
             "Edit",
             &[
@@ -238,9 +257,9 @@ pub const MENUS: &[(&str, &[Option<MenuCommand>])] = {
                 Some(ToggleSnap),
             ],
         ),
-        ("Track", &[Some(NewTrack), Some(NewInstrumentTrack), None, Some(DeleteTrack)]),
-        ("Transport", &[Some(PlayStop), Some(Record), Some(GoToStart), None, Some(ToggleCycle), Some(ToggleMetronome), Some(ToggleCountIn), Some(ToggleCountInOnPlay)]),
-        ("View", &[Some(ToggleInspector), Some(ToggleMixer), Some(TogglePianoRoll), Some(ToggleTab), None, Some(ZoomIn), Some(ZoomOut), Some(ZoomToFit)]),
+        ("Track", &[Some(NewTrack), Some(NewInstrumentTrack), Some(NewBus), Some(NewBusFromSelection), None, Some(DeleteTrack)]),
+        ("Transport", &[Some(PlayStop), Some(Record), Some(GoToStart), None, Some(ToggleCycle), Some(ToggleMetronome), Some(ToggleCountIn), Some(ToggleCountInOnPlay), Some(ToggleAutoMonitor)]),
+        ("View", &[Some(ToggleInspector), Some(ToggleMixer), Some(TogglePianoRoll), Some(ToggleTab), Some(ToggleAutomation), None, Some(ZoomIn), Some(ZoomOut), Some(ZoomToFit)]),
         ("Audio", &[Some(AudioSettings), None, Some(ToggleAudioEngine)]),
         ("Plug-ins", &[Some(PluginManager), None, Some(RescanPlugins)]),
     ]
@@ -257,6 +276,8 @@ pub struct MenuState {
     pub mixer_visible: bool,
     pub tab_visible: bool,
     pub piano_roll_visible: bool,
+    /// Some track shows its automation lanes.
+    pub automation_visible: bool,
     /// Labels of the steps undo/redo would apply.
     pub undo: Option<String>,
     pub redo: Option<String>,
@@ -266,6 +287,7 @@ pub struct MenuState {
     pub metronome_on: bool,
     pub count_in_on: bool,
     pub count_in_on_play: bool,
+    pub auto_monitor: bool,
     pub audio_running: bool,
     pub playing: bool,
 }
@@ -274,6 +296,7 @@ impl MenuState {
     fn enabled(&self, cmd: MenuCommand) -> bool {
         match cmd {
             MenuCommand::DeleteTrack => self.has_selected_track,
+            MenuCommand::NewBusFromSelection => self.has_selected_track || self.has_selected_region,
             MenuCommand::DeleteRegion | MenuCommand::CopyRegion | MenuCommand::DuplicateRegion => self.has_selected_region,
             MenuCommand::PasteRegion => self.has_clipboard,
             MenuCommand::Record => self.audio_running,
@@ -290,10 +313,12 @@ impl MenuState {
             MenuCommand::ToggleMetronome => Some(self.metronome_on),
             MenuCommand::ToggleCountIn => Some(self.count_in_on),
             MenuCommand::ToggleCountInOnPlay => Some(self.count_in_on_play),
+            MenuCommand::ToggleAutoMonitor => Some(self.auto_monitor),
             MenuCommand::ToggleCycle => Some(self.cycle_on),
             MenuCommand::ToggleMixer => Some(self.mixer_visible),
             MenuCommand::TogglePianoRoll => Some(self.piano_roll_visible),
             MenuCommand::ToggleTab => Some(self.tab_visible),
+            MenuCommand::ToggleAutomation => Some(self.automation_visible),
             _ => None,
         }
     }
@@ -434,10 +459,12 @@ mod native {
                                     | MenuCommand::ToggleMetronome
                                     | MenuCommand::ToggleCountIn
                                     | MenuCommand::ToggleCountInOnPlay
+                                    | MenuCommand::ToggleAutoMonitor
                                     | MenuCommand::ToggleCycle
                                     | MenuCommand::ToggleMixer
                                     | MenuCommand::TogglePianoRoll
                                     | MenuCommand::ToggleTab
+                                    | MenuCommand::ToggleAutomation
                             ) {
                                 let item = CheckMenuItem::with_id(cmd.id(), cmd.label(), true, true, accel);
                                 sub.append(&item)?;

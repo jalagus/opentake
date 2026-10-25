@@ -2,8 +2,12 @@
 //!
 //! Supported: tempo/time signature, sample rate, tracks (name, volume, pan, mute,
 //! solo, record arm, input, monitoring), audio items (position, length, source
-//! offset, gain, mute, file) and FX chain references (VST2/VST3/CLAP, bypass,
-//! opaque state). Everything else in the file is ignored on import.
+//! offset, gain, mute, file), FX chain references (VST2/VST3/CLAP, bypass,
+//! opaque state), buses (as receives; folders import as buses) and volume, pan and mute
+//! automation (`VOLENV2`/`PANENV2`/`MUTEENV`; volume envelopes in Reaper's fader scaling
+//! are skipped). Plug-in parameter envelopes (`PARMENV`) aren't carried over: Reaper
+//! numbers parameters by position, which needs the plug-in loaded. Everything else in the
+//! file is ignored on import.
 
 pub mod tree;
 
@@ -11,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::automation::{AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, Curve, gain_to_pos, pos_to_gain};
 use crate::model::{Clip, PluginFormat, PluginSlot, Project, Track};
 use tree::{Entry, Node};
 
@@ -90,8 +95,38 @@ pub fn from_str(text: &str, base_dir: &Path) -> Result<Project, RppError> {
     if let (Some(a), Some(b)) = (root.value::<f64>("SELECTION", 0), root.value::<f64>("SELECTION", 1)) {
         (project.loop_start_secs, project.loop_end_secs) = (a.min(b), a.max(b));
     }
-    project.tracks = root.chunks("TRACK").map(|t| import_track(t, base_dir)).collect();
+    let nodes: Vec<&Node> = root.chunks("TRACK").collect();
+    project.tracks = nodes.iter().map(|t| import_track(t, base_dir)).collect();
+    import_routing(&nodes, &mut project.tracks);
     Ok(project)
+}
+
+/// Buses: a track without items or instrument that receives (`AUXRECV`) from tracks whose
+/// master send is off, or a folder parent without them, becomes a bus its sources feed
+/// (outputs as track indices, see `Project::outputs_from_indices`). Other sends are ignored.
+fn import_routing(nodes: &[&Node], tracks: &mut [Track]) {
+    let can_bus = |t: &Track| t.clips.is_empty() && t.instrument.is_none();
+    let mut parents: Vec<usize> = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        if let Some(&parent) = parents.last().filter(|&&p| can_bus(&tracks[p])) {
+            tracks[parent].bus = true;
+            tracks[i].output = Some(parent as u64);
+        }
+        match (node.value::<i32>("ISBUS", 0), node.value::<i32>("ISBUS", 1)) {
+            (Some(1), _) => parents.push(i),
+            (Some(2), Some(depth)) => parents.truncate(parents.len().saturating_sub(depth.unsigned_abs() as usize)),
+            _ => {}
+        }
+    }
+    for (dst, node) in nodes.iter().enumerate() {
+        for line in node.lines().filter(|l| l.key() == "AUXRECV") {
+            let Some(src) = line.tokens().get(1).and_then(|s| s.parse::<usize>().ok()).filter(|&s| s < tracks.len() && s != dst) else { continue };
+            if nodes[src].value::<u8>("MAINSEND", 0) == Some(0) && tracks[src].output.is_none() && can_bus(&tracks[dst]) {
+                tracks[dst].bus = true;
+                tracks[src].output = Some(dst as u64);
+            }
+        }
+    }
 }
 
 fn import_track(node: &Node, base_dir: &Path) -> Track {
@@ -118,7 +153,65 @@ fn import_track(node: &Node, base_dir: &Path) -> Track {
         track.plugins = chain;
     }
     track.clips = node.chunks("ITEM").filter_map(|i| import_item(i, base_dir)).collect();
+    for (name, target) in ENVELOPES {
+        if let Some(lane) = node.chunk(name).and_then(|env| import_envelope(env, target)) {
+            track.automation.push(lane);
+        }
+    }
+    track.show_automation = track.automation.iter().any(|l| l.shown);
     track
+}
+
+/// Track envelopes Reaper and OpenTake share.
+const ENVELOPES: [(&str, AutomationTarget); 3] = [("VOLENV2", AutomationTarget::Volume), ("PANENV2", AutomationTarget::Pan), ("MUTEENV", AutomationTarget::Mute)];
+
+/// Reaper's point values: volume as amplitude, pan from 1 (left) to -1 (right), mute 1 for
+/// playing and 0 for muted.
+fn to_reaper(target: AutomationTarget, v: f32) -> f32 {
+    match target {
+        AutomationTarget::Volume => pos_to_gain(v),
+        AutomationTarget::Pan => 1.0 - 2.0 * v,
+        _ => 1.0 - v.round(),
+    }
+}
+
+fn from_reaper(target: AutomationTarget, v: f32) -> f32 {
+    match target {
+        AutomationTarget::Volume => gain_to_pos(v),
+        AutomationTarget::Pan => (1.0 - v) / 2.0,
+        _ => (v < 0.5) as u8 as f32,
+    }
+}
+
+/// Point shapes: linear, square, slow start/end, fast start, fast end (Bézier is linear here).
+const SHAPES: [Curve; 5] = [Curve::Linear, Curve::Hold, Curve::Smooth, Curve::FastStart, Curve::FastEnd];
+
+fn import_envelope(env: &Node, target: AutomationTarget) -> Option<AutomationLane> {
+    if target == AutomationTarget::Volume && env.value::<u8>("VOLTYPE", 0) == Some(1) {
+        return None;
+    }
+    let mut lane = AutomationLane::new(target);
+    lane.mode = if env.value::<u8>("ACT", 0) == Some(0) { AutomationMode::Off } else { AutomationMode::Read };
+    lane.shown = env.value::<u8>("VIS", 0) != Some(0);
+    let points = env.lines().filter(|l| l.key() == "PT").filter_map(|l| {
+        let t = l.tokens();
+        let (time, value) = (t.get(1)?.parse::<f64>().ok()?, t.get(2)?.parse::<f32>().ok()?);
+        let curve = t.get(3).and_then(|s| s.parse::<usize>().ok()).and_then(|i| SHAPES.get(i).copied()).unwrap_or_default();
+        Some(AutomationPoint { curve, ..AutomationPoint::new(time, from_reaper(target, value)) })
+    });
+    lane.set_points(points);
+    (!lane.points.is_empty()).then_some(lane)
+}
+
+fn export_envelope(lane: &AutomationLane, name: &str) -> Node {
+    let mut env = Node::new(name);
+    env.push_line(&["ACT", bool01(lane.mode != AutomationMode::Off), "-1"]).push_line(&["VIS", bool01(lane.shown), "1", "1"]);
+    env.push_line(&["ARM", "0"]).push_line(&["DEFSHAPE", if lane.target.stepped() { "1" } else { "0" }, "-1", "-1"]);
+    for p in &lane.points {
+        let shape = SHAPES.iter().position(|&c| c == p.curve).unwrap_or(0);
+        env.push_line(&["PT".to_string(), fmt_f64(p.time_secs), fmt_f32(to_reaper(lane.target, p.value)), shape.to_string()]);
+    }
+    env
 }
 
 fn import_fx_chain(node: &Node) -> Vec<PluginSlot> {
@@ -136,6 +229,7 @@ fn import_fx_chain(node: &Node) -> Vec<PluginSlot> {
                     "VST" if p(0).starts_with("VST3") => (PluginFormat::Vst3, p(1), p(4)),
                     "VST" => (PluginFormat::Vst2, p(1), p(4)),
                     "CLAP" => (PluginFormat::Clap, String::new(), p(1)),
+                    "AU" => (PluginFormat::AudioUnit, p(1), au_uid(&n.params)),
                     _ => (PluginFormat::Other, p(1), String::new()),
                 };
                 plugins.push(PluginSlot {
@@ -146,6 +240,7 @@ fn import_fx_chain(node: &Node) -> Vec<PluginSlot> {
                     bypass,
                     state: n.lines().map(|l| l.raw.clone()).collect(),
                     params: Vec::new(),
+                    id: 0,
                     instance: 0,
                 });
                 bypass = false;
@@ -160,6 +255,12 @@ fn import_item(node: &Node, base_dir: &Path) -> Option<Clip> {
     let file = find_source_file(node.chunk("SOURCE")?)?;
     let file = PathBuf::from(file);
     let file = if file.is_relative() { base_dir.join(file) } else { file };
+    // PLAYRATE rate preserve_pitch pitch_semitones ...: without preserve pitch the rate
+    // also transposes (varispeed).
+    let rate = node.value("PLAYRATE", 0).filter(|r: &f64| *r > 0.0).unwrap_or(1.0);
+    let preserve = node.value::<u8>("PLAYRATE", 1).unwrap_or(1) != 0;
+    let pitch = node.value("PLAYRATE", 2).unwrap_or(0.0) + if preserve { 0.0 } else { 12.0 * rate.log2() };
+    let cents = (pitch * 100.0).round() as i32;
     Some(Clip {
         name: node.string("NAME").unwrap_or_default(),
         file,
@@ -168,6 +269,11 @@ fn import_item(node: &Node, base_dir: &Path) -> Option<Clip> {
         source_offset_secs: node.value("SOFFS", 0).unwrap_or(0.0),
         gain: node.value("VOLPAN", 0).unwrap_or(1.0),
         mute: node.value::<u8>("MUTE", 0).unwrap_or(0) != 0,
+        takes: Vec::new(),
+        active_take: 0,
+        pitch_semitones: cents / 100,
+        pitch_cents: cents % 100,
+        stretch: 1.0 / rate,
     })
 }
 
@@ -176,7 +282,9 @@ fn find_source_file(source: &Node) -> Option<String> {
     source.string("FILE").or_else(|| source.chunk("SOURCE").and_then(find_source_file))
 }
 
-/// Serialize to RPP text. Media paths under `base_dir` are written relative to it.
+/// Serialize to RPP text. Media paths under `base_dir` are written relative to it. Track
+/// outputs are track indices (see `Project::outputs_to_indices`); a bus becomes a track that
+/// receives from its sources, whose master send is off.
 pub fn to_string(project: &Project, base_dir: &Path) -> String {
     let mut root = Node::new("REAPER_PROJECT").with_params(&["0.1", "7.0/OpenTake", "0"]);
     let (num, den) = project.time_signature;
@@ -201,13 +309,14 @@ pub fn to_string(project: &Project, base_dir: &Path) -> String {
         }
         root.push_chunk(env);
     }
-    for track in &project.tracks {
-        root.push_chunk(export_track(track, base_dir));
+    for (i, track) in project.tracks.iter().enumerate() {
+        let sources: Vec<usize> = (0..project.tracks.len()).filter(|&s| project.tracks[s].output == Some(i as u64)).collect();
+        root.push_chunk(export_track(track, base_dir, &sources));
     }
     tree::write(&root)
 }
 
-fn export_track(track: &Track, base_dir: &Path) -> Node {
+fn export_track(track: &Track, base_dir: &Path, sources: &[usize]) -> Node {
     let mut node = Node::new("TRACK");
     node.push_line(&["NAME", &track.name]);
     node.push_line(&["VOLPAN", &fmt_f32(track.volume), &fmt_f32(track.pan), "-1", "-1", "1"]);
@@ -220,6 +329,13 @@ fn export_track(track: &Track, base_dir: &Path) -> Node {
         "0", "0", "0", "0", "0",
     ]);
     node.push_line(&["NCHAN", "2"]);
+    if track.output.is_some() {
+        node.push_line(&["MAINSEND", "0", "0"]);
+    }
+    // Post-fader receives at unity, stereo.
+    for src in sources {
+        node.push_line(&["AUXRECV", &src.to_string(), "0", "1", "0", "0", "0", "0", "0", "0", "-1:U", "0", "-1", "''"]);
+    }
 
     // Instrument first (as Reaper does); built-in plugins can't be represented.
     let chain: Vec<&PluginSlot> =
@@ -231,6 +347,11 @@ fn export_track(track: &Track, base_dir: &Path) -> Node {
             fx.push_line(&["BYPASS", bool01(plugin.bypass), "0", "0"]);
             let mut chunk = match plugin.format {
                 PluginFormat::Clap => Node::new("CLAP").with_params(&[plugin.name.as_str(), &plugin.uid, ""]),
+                PluginFormat::AudioUnit => {
+                    let mut params = vec![plugin.name.clone(), plugin.path.clone(), String::new()];
+                    params.extend(au_codes(&plugin.uid));
+                    Node::new("AU").with_params(&params)
+                }
                 _ => {
                     // Reaper looks plugins up by bundle file name.
                     let file = Path::new(&plugin.path).file_name().map_or(plugin.path.clone(), |f| f.to_string_lossy().into_owned());
@@ -245,6 +366,12 @@ fn export_track(track: &Track, base_dir: &Path) -> Node {
         node.push_chunk(fx);
     }
 
+    for (name, target) in ENVELOPES {
+        if let Some(lane) = track.automation.iter().find(|l| l.target == target && !l.points.is_empty()) {
+            node.push_chunk(export_envelope(lane, name));
+        }
+    }
+
     for clip in &track.clips {
         let mut item = Node::new("ITEM");
         item.push_line(&["POSITION", &fmt_f64(clip.position_secs)]);
@@ -253,6 +380,9 @@ fn export_track(track: &Track, base_dir: &Path) -> Node {
         item.push_line(&["NAME", &clip.name]);
         item.push_line(&["VOLPAN", &fmt_f32(clip.gain), "0", "1", "-1"]);
         item.push_line(&["SOFFS", &fmt_f64(clip.source_offset_secs)]);
+        if clip.is_flexed() {
+            item.push_line(&["PLAYRATE", &fmt_f64(1.0 / clip.stretch), "1", &fmt_f64(clip.transpose()), "-1", "0", "0.0025"]);
+        }
         let file = clip.file.strip_prefix(base_dir).unwrap_or(&clip.file);
         let mut source = Node::new("SOURCE").with_params(&[source_type(&clip.file)]);
         source.push_line(&["FILE", &file.to_string_lossy()]);
@@ -263,7 +393,29 @@ fn export_track(track: &Track, base_dir: &Path) -> Node {
 }
 
 fn is_instrument_name(name: &str) -> bool {
-    name.starts_with("VSTi:") || name.starts_with("VST3i:")
+    name.starts_with("VSTi:") || name.starts_with("VST3i:") || name.starts_with("AUi:")
+}
+
+/// Reaper stores an AU's type, subtype and manufacturer as decimal codes
+/// (`<AU "AU: AUDelay (Apple)" "Apple: AUDelay" "" 1635083896<inline> ...`); ours is
+/// "aufx:dely:appl".
+fn au_uid(params: &[String]) -> String {
+    let codes: Vec<String> = params
+        .iter()
+        .skip(3)
+        .take(3)
+        .filter_map(|t| t.split('<').next()?.parse::<u32>().ok())
+        .map(|c| c.to_be_bytes().iter().map(|&b| b as char).collect())
+        .collect();
+    if codes.len() == 3 { codes.join(":") } else { String::new() }
+}
+
+fn au_codes(uid: &str) -> Vec<String> {
+    let chars: Vec<char> = uid.chars().collect();
+    if chars.len() != 14 {
+        return Vec::new();
+    }
+    [0, 5, 10].iter().map(|&at| chars[at..at + 4].iter().fold(0u32, |v, &c| (v << 8) | (c as u32 & 0xff)).to_string() + "<inline>").collect()
 }
 
 fn source_type(path: &Path) -> &'static str {
@@ -377,5 +529,93 @@ mod tests {
         assert!(text.contains("FILE Audio/vox-01.wav"));
         let p2 = from_str(&text, base).unwrap();
         assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn pitch_and_stretch_as_playrate() {
+        let base = Path::new("/proj");
+        let mut p = from_str(SAMPLE, base).unwrap();
+        let c = &mut p.tracks[0].clips[0];
+        (c.stretch, c.pitch_semitones, c.pitch_cents) = (1.25, -3, -20);
+        let text = to_string(&p, base);
+        assert!(text.contains("PLAYRATE 0.8 1 -3.2"), "{text}");
+        let c = &from_str(&text, base).unwrap().tracks[0].clips[0];
+        assert_eq!((c.stretch, c.pitch_semitones, c.pitch_cents), (1.25, -3, -20));
+        // Varispeed (pitch not preserved): double rate is an octave up at half length.
+        let vari = text.replace("PLAYRATE 0.8 1 -3.2", "PLAYRATE 2 0 0");
+        let c = &from_str(&vari, base).unwrap().tracks[0].clips[0];
+        assert_eq!((c.stretch, c.pitch_semitones, c.pitch_cents), (0.5, 12, 0));
+    }
+
+    #[test]
+    fn buses_round_trip_as_receives_and_folders_import_as_buses() {
+        let mut p = from_str(SAMPLE, Path::new("/proj")).unwrap();
+        p.tracks.push(Track::new_bus("Vox Bus"));
+        p.tracks[0].output = Some(1);
+        let text = to_string(&p, Path::new("/proj"));
+        assert!(text.contains("MAINSEND 0 0") && text.contains("AUXRECV 0 0 1"), "{text}");
+        assert_eq!(from_str(&text, Path::new("/proj")).unwrap(), p);
+
+        let folder = "<REAPER_PROJECT 0.1\n<TRACK\nNAME Drums\nISBUS 1 1\n>\n<TRACK\nNAME Kick\n>\n<TRACK\nNAME Snare\nISBUS 2 -1\n>\n<TRACK\nNAME Bass\n>\n>\n";
+        let p = from_str(folder, Path::new("/proj")).unwrap();
+        assert!(p.tracks[0].bus);
+        assert_eq!(p.tracks.iter().map(|t| t.output).collect::<Vec<_>>(), vec![None, Some(0), Some(0), None]);
+    }
+
+    #[test]
+    fn volume_pan_and_mute_envelopes_round_trip() {
+        let base = Path::new("/proj");
+        let mut p = from_str(SAMPLE, base).unwrap();
+        let t = &mut p.tracks[0];
+        let mut vol = AutomationLane::new(AutomationTarget::Volume);
+        vol.set_points([AutomationPoint { curve: Curve::Smooth, ..AutomationPoint::new(0.0, gain_to_pos(1.0)) }, AutomationPoint::new(2.0, gain_to_pos(0.5))]);
+        let mut pan = AutomationLane::new(AutomationTarget::Pan);
+        pan.set_points([AutomationPoint::new(1.0, 0.0)]);
+        pan.mode = AutomationMode::Off;
+        let mut mute = AutomationLane::new(AutomationTarget::Mute);
+        mute.set_points([AutomationPoint::new(0.0, 0.0), AutomationPoint::new(3.0, 1.0)]);
+        mute.shown = false;
+        t.automation = vec![vol, pan, mute];
+        t.show_automation = true;
+        let text = to_string(&p, base);
+        assert!(text.contains("<VOLENV2") && text.contains("PT 2 0.5 0") && text.contains("PT 0 1 2"), "{text}");
+        assert!(text.contains("<PANENV2") && text.contains("PT 1 1 0"), "full left is 1 in Reaper");
+        assert!(text.contains("PT 3 0 0"), "muted is 0 in Reaper");
+        let back = from_str(&text, base).unwrap();
+        let lanes = &back.tracks[0].automation;
+        assert_eq!(lanes.len(), 3);
+        assert!(lanes.iter().zip(&p.tracks[0].automation).all(|(a, b)| a.target == b.target && a.mode == b.mode && a.shown == b.shown));
+        for (a, b) in lanes.iter().flat_map(|l| &l.points).zip(p.tracks[0].automation.iter().flat_map(|l| &l.points)) {
+            assert!((a.time_secs - b.time_secs).abs() < 1e-9 && (a.value - b.value).abs() < 1e-4 && a.curve == b.curve, "{a:?} vs {b:?}");
+        }
+        // Fader-scaled volume envelopes aren't guessed at.
+        let faderscaled = text.replace("<VOLENV2", "<VOLENV2\nVOLTYPE 1");
+        assert_eq!(from_str(&faderscaled, base).unwrap().tracks[0].automation.len(), 2);
+    }
+
+    #[test]
+    fn audio_units_use_reapers_chunk() {
+        let base = Path::new("/proj");
+        let au = |name: &str, path: &str, uid: &str| PluginSlot {
+            name: name.into(),
+            format: PluginFormat::AudioUnit,
+            path: path.into(),
+            uid: uid.into(),
+            bypass: false,
+            state: vec!["YnBsaXN0".into()],
+            params: Vec::new(),
+            id: 0,
+            instance: 0,
+        };
+        let mut p = Project::default();
+        let mut t = Track::new("Keys");
+        t.instrument = Some(au("AUi: DLSMusicDevice (Apple)", "Apple: DLSMusicDevice", "aumu:dls :appl"));
+        t.plugins = vec![au("AU: AUDelay (Apple)", "Apple: AUDelay", "aufx:dely:appl")];
+        p.tracks.push(t);
+        let text = to_string(&p, base);
+        assert!(text.contains(r#"<AU "AU: AUDelay (Apple)" "Apple: AUDelay" "" 1635083896<inline> 1684368505<inline> 1634758764<inline>"#), "{text}");
+        let back = from_str(&text, base).unwrap();
+        assert_eq!(back.tracks[0].instrument, p.tracks[0].instrument);
+        assert_eq!(back.tracks[0].plugins, p.tracks[0].plugins);
     }
 }

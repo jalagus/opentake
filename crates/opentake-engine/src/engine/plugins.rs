@@ -16,17 +16,34 @@ use crate::drums::{self, DrumSynth};
 use crate::delay::{self, Delay};
 use crate::dynamics::{self, Compressor, GainMeter, Limiter, comp, limiter};
 use crate::eq::{self, Eq};
+use crate::multiband::{self, Multiband, MultibandMeter};
 use crate::synth::{self, Synth};
 
 pub(super) enum Loaded {
     Vst3(Vst3Plugin),
+    #[cfg(target_os = "macos")]
+    Au(opentake_au::AuPlugin),
     Synth,
     Drums,
     /// The tap feeds the editor's analyzer (shared by every processor of this instance).
     Eq(std::sync::Arc<eq::Tap>),
     Compressor(std::sync::Arc<GainMeter>),
     Limiter(std::sync::Arc<GainMeter>),
+    Multiband(std::sync::Arc<MultibandMeter>),
     Delay,
+}
+
+impl Loaded {
+    /// Tell a hosted plug-in itself about a parameter value (the processor is told
+    /// separately); built-ins keep theirs in the project only.
+    pub(super) fn set_param(&self, id: u32, value: f64) {
+        match self {
+            Loaded::Vst3(plugin) => plugin.set_param_on_controller(id, value),
+            #[cfg(target_os = "macos")]
+            Loaded::Au(plugin) => plugin.set_param(id, value),
+            _ => {}
+        }
+    }
 }
 
 /// The built-in effect a query names: (name, path).
@@ -38,9 +55,10 @@ fn builtin_effect_for(query: &str) -> Option<(&'static str, &'static str)> {
         "comp" | "compressor" => Some((comp::NAME, comp::PATH)),
         "limiter" | "brickwall" | "brickwall limiter" => Some((limiter::NAME, limiter::PATH)),
         "delay" | "echo" => Some((delay::NAME, delay::PATH)),
-        _ => [eq::NAME, comp::NAME, limiter::NAME, delay::NAME]
+        "multiband" | "multiband compressor" | "multiband comp" | "mbc" => Some((multiband::NAME, multiband::PATH)),
+        _ => [eq::NAME, comp::NAME, limiter::NAME, delay::NAME, multiband::NAME]
             .into_iter()
-            .zip([eq::PATH, comp::PATH, limiter::PATH, delay::PATH])
+            .zip([eq::PATH, comp::PATH, limiter::PATH, delay::PATH, multiband::PATH])
             .find(|(n, _)| n.to_lowercase() == q),
     }
 }
@@ -51,6 +69,7 @@ fn builtin_effect_instance(path: &str) -> Option<Loaded> {
         eq::PATH => Loaded::Eq(eq::Tap::new()),
         comp::PATH => Loaded::Compressor(GainMeter::new()),
         limiter::PATH => Loaded::Limiter(GainMeter::new()),
+        multiband::PATH => Loaded::Multiband(MultibandMeter::new()),
         delay::PATH => Loaded::Delay,
         _ => return None,
     })
@@ -63,6 +82,7 @@ fn builtin_effect_params(loaded: &Loaded) -> Option<(ParamList, fn(u32, f64) -> 
         Loaded::Eq(_) => (eq::params(), eq::display),
         Loaded::Compressor(_) => (dynamics::comp_params(), dynamics::comp_display),
         Loaded::Limiter(_) => (dynamics::limiter_params(), dynamics::limiter_display),
+        Loaded::Multiband(_) => (multiband::params(), multiband::display),
         Loaded::Delay => (delay::params(), delay::display),
         _ => return None,
     })
@@ -132,6 +152,7 @@ fn builtin_slot(name: &str, path: &str) -> PluginSlot {
         bypass: false,
         state: Vec::new(),
         params: Vec::new(),
+        id: 0,
         instance: 0,
     }
 }
@@ -192,6 +213,7 @@ impl Engine {
             })
             .collect();
         self.scan_errors = errors.clone();
+        self.audio_units = super::au::scan();
         (self.scanned.clone(), errors)
     }
 
@@ -241,7 +263,7 @@ impl Engine {
         Ok(Vst3Plugin::new(module, class)?)
     }
 
-    fn add_to_pool(&mut self, loaded: Loaded) -> u64 {
+    pub(super) fn add_to_pool(&mut self, loaded: Loaded) -> u64 {
         let id = self.next_id();
         self.pool.insert(id, loaded);
         id
@@ -267,7 +289,13 @@ impl Engine {
             slot.instance = self.add_to_pool(builtin_effect_instance(path).expect("known built-in"));
             return Ok(slot);
         }
-        let (bundle, cid) = self.resolve_plugin(query, instrument)?;
+        if let Some(au) = self.find_audio_unit(query, instrument, false) {
+            return self.new_au_slot(&au);
+        }
+        let (bundle, cid) = match self.resolve_plugin(query, instrument) {
+            Ok(found) => found,
+            Err(e) => return self.find_audio_unit(query, instrument, true).map_or(Err(e), |au| self.new_au_slot(&au)),
+        };
         let plugin = self.instantiate(&bundle, cid.as_deref(), None)?;
         let kind = if plugin.is_instrument() { "VST3i" } else { "VST3" };
         let mut slot = PluginSlot {
@@ -278,6 +306,7 @@ impl Engine {
             bypass: false,
             state: Vec::new(),
             params: Vec::new(),
+            id: 0,
             instance: 0,
         };
         slot.instance = self.add_to_pool(Loaded::Vst3(plugin));
@@ -293,6 +322,7 @@ impl Engine {
                 return Ok(self.add_to_pool(builtin_effect_instance(&slot.path).expect("known built-in")));
             }
             PluginFormat::Vst3 => {}
+            PluginFormat::AudioUnit => return self.load_au_slot(slot),
             _ => bail!("unsupported plugin format"),
         }
         let plugin = self.instantiate_vst3_slot(slot)?;
@@ -331,6 +361,7 @@ impl Engine {
             (PluginFormat::Builtin, eq::PATH) => Box::new(Eq::new(sr)),
             (PluginFormat::Builtin, comp::PATH) => Box::new(Compressor::new(sr, None)),
             (PluginFormat::Builtin, limiter::PATH) => Box::new(Limiter::new(sr, None)),
+            (PluginFormat::Builtin, multiband::PATH) => Box::new(Multiband::new(sr, None)),
             (PluginFormat::Builtin, delay::PATH) => Box::new(Delay::new(sr)),
             (PluginFormat::Vst3, _) => {
                 let plugin = self.instantiate_vst3_slot(slot)?;
@@ -341,6 +372,7 @@ impl Engine {
                 let latency = p.latency_samples() as usize;
                 return Ok(Box::new(Vst3Insert { processor: p, notes: Vec::with_capacity(1024), latency }));
             }
+            (PluginFormat::AudioUnit, _) => return self.offline_au_processor(slot, sr),
             _ => bail!("'{}' can't be rendered offline", slot.name),
         };
         Ok(with_params(p, &slot.params))
@@ -361,6 +393,8 @@ impl Engine {
                 let latency = p.latency_samples() as usize;
                 Box::new(Vst3Insert { processor: p, notes: Vec::with_capacity(1024), latency })
             }
+            #[cfg(target_os = "macos")]
+            Some(Loaded::Au(plugin)) => Box::new(super::au::AuInsert::new(plugin, sr as f64)?),
             Some(Loaded::Synth) => {
                 let mut s = Synth::new(sr as f64);
                 for &(id, value) in &slot.params {
@@ -378,6 +412,7 @@ impl Engine {
             Some(Loaded::Eq(tap)) => with_params(Box::new(Eq::with_tap(sr as f64, Some(tap.clone()))), &slot.params),
             Some(Loaded::Compressor(meter)) => with_params(Box::new(Compressor::new(sr as f64, Some(meter.clone()))), &slot.params),
             Some(Loaded::Limiter(meter)) => with_params(Box::new(Limiter::new(sr as f64, Some(meter.clone()))), &slot.params),
+            Some(Loaded::Multiband(meter)) => with_params(Box::new(Multiband::new(sr as f64, Some(meter.clone()))), &slot.params),
             Some(Loaded::Delay) => with_params(Box::new(Delay::new(sr as f64)), &slot.params),
             None => return Ok(None),
         };
@@ -407,7 +442,9 @@ impl Engine {
             order: Box::new(order),
             new: Box::new(new),
             target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)),
-        })
+        })?;
+        // Envelopes address processors by instance.
+        self.sync_automation(Some(index))
     }
 
     /// Bring the audio thread's master insert chain in line with the project.
@@ -431,7 +468,8 @@ impl Engine {
             order: Box::new(order),
             new: Box::new(new),
             target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)),
-        })
+        })?;
+        self.sync_automation(None)
     }
 
     /// Mixer id for a slot's commands: the master bus or the track.
@@ -461,12 +499,12 @@ impl Engine {
         if let Some(s) = slot {
             self.send(Command::SetPluginBypass { track: id, instance: s.instance, bypass: s.bypass })?;
         }
-        Ok(())
+        self.sync_automation(Some(index))
     }
 
     // ---------------------------------------------------------------- slots
 
-    fn slot_ref(&self, track: usize, which: SlotRef) -> Result<&PluginSlot> {
+    pub(super) fn slot_ref(&self, track: usize, which: SlotRef) -> Result<&PluginSlot> {
         if let SlotRef::Master(s) = which {
             return self.project.master_plugins.get(s).ok_or_else(|| anyhow!("the master bus has no plugin at slot {s}"));
         }
@@ -520,6 +558,15 @@ impl Engine {
         }
     }
 
+    /// The band meters of a built-in multiband compressor slot.
+    pub fn multiband_meter(&self, track: usize, which: SlotRef) -> Option<std::sync::Arc<MultibandMeter>> {
+        let slot = self.slot_ref(track, which).ok()?;
+        match self.pool.get(&slot.instance) {
+            Some(Loaded::Multiband(m)) => Some(m.clone()),
+            _ => None,
+        }
+    }
+
     /// The analyzer tap of a built-in EQ slot.
     pub fn eq_tap(&self, track: usize, which: SlotRef) -> Option<std::sync::Arc<eq::Tap>> {
         let slot = self.slot_ref(track, which).ok()?;
@@ -529,13 +576,14 @@ impl Engine {
         }
     }
 
-    /// Effects available to insert: the built-in EQ plus scanned VST3 effects.
+    /// Effects available to insert: the built-ins plus scanned VST3 and AU effects.
     pub fn available_effects(&self) -> Vec<(String, String)> {
         let mut list: Vec<(String, String)> =
-            [(eq::NAME, eq::PATH), (comp::NAME, comp::PATH), (limiter::NAME, limiter::PATH), (delay::NAME, delay::PATH)].iter().map(|(n, p)| (n.to_string(), p.to_string())).collect();
+            [(eq::NAME, eq::PATH), (comp::NAME, comp::PATH), (multiband::NAME, multiband::PATH), (limiter::NAME, limiter::PATH), (delay::NAME, delay::PATH)].iter().map(|(n, p)| (n.to_string(), p.to_string())).collect();
         for p in self.scanned.iter().filter(|p| !p.class.is_instrument()) {
             list.push((format!("{} — {}", p.class.name, p.class.vendor), p.bundle.to_string_lossy().into_owned()));
         }
+        list.extend(self.audio_units.iter().filter(|a| !a.instrument).map(|a| (format!("{} — {} (AU)", a.name, a.manufacturer), a.id.clone())));
         list
     }
 
@@ -582,7 +630,35 @@ impl Engine {
         self.slot_params(track, SlotRef::Effect(slot))
     }
 
+    /// A plug-in's parameters; automated ones show their value at the playhead.
     pub fn slot_params(&self, track: usize, which: SlotRef) -> Result<Vec<ParamView>> {
+        let mut params = self.slot_params_static(track, which)?;
+        let owner = if matches!(which, SlotRef::Master(_)) { None } else { Some(track) };
+        let slot = self.slot_ref(track, which)?;
+        for p in &mut params {
+            let target = opentake_project::AutomationTarget::Param { slot: slot.id, param: p.id };
+            if let Some(v) = self.automated_value(owner, target) {
+                p.value = v as f64;
+                if let Some(d) = self.param_display(slot, p.id, p.value) {
+                    p.display = Some(d);
+                }
+            }
+        }
+        Ok(params)
+    }
+
+    /// How a plug-in shows a parameter value (`None` if it can't say).
+    pub(super) fn param_display(&self, slot: &PluginSlot, id: u32, value: f64) -> Option<String> {
+        match self.pool.get(&slot.instance)? {
+            Loaded::Vst3(plugin) => plugin.param_display(id, value),
+            Loaded::Synth => Some(synth::display(id, value)),
+            Loaded::Drums => Some(drums::display(id, value)),
+            loaded => builtin_effect_params(loaded).map(|(_, display)| display(id, value)),
+        }
+    }
+
+    /// A plug-in's parameters with their set values (automation aside).
+    pub(super) fn slot_params_static(&self, track: usize, which: SlotRef) -> Result<Vec<ParamView>> {
         let slot = self.slot_ref(track, which)?;
         match self.pool.get(&slot.instance) {
             Some(Loaded::Vst3(plugin)) => Ok(plugin
@@ -601,6 +677,8 @@ impl Engine {
                     }
                 })
                 .collect()),
+            #[cfg(target_os = "macos")]
+            Some(Loaded::Au(plugin)) => Ok(super::au::param_views(plugin)),
             Some(Loaded::Synth) => Ok(synth::PARAMS
                 .iter()
                 .map(|&(id, title, units, default, steps)| {
@@ -631,7 +709,7 @@ impl Engine {
                     }
                 })
                 .collect()),
-            Some(builtin @ (Loaded::Eq(_) | Loaded::Compressor(_) | Loaded::Limiter(_) | Loaded::Delay)) => {
+            Some(builtin @ (Loaded::Eq(_) | Loaded::Compressor(_) | Loaded::Limiter(_) | Loaded::Multiband(_) | Loaded::Delay)) => {
                 let (list, display) = builtin_effect_params(builtin).expect("checked");
                 Ok(list
                     .into_iter()
@@ -653,7 +731,7 @@ impl Engine {
     pub fn set_slot_param(&mut self, track: usize, which: SlotRef, id: u32, value: f64) -> Result<Option<String>> {
         let index = if matches!(which, SlotRef::Master(_)) { track } else { self.track_index(track)? };
         let value = value.clamp(0.0, 1.0);
-        let params = self.slot_params(track, which)?;
+        let params = self.slot_params_static(track, which)?;
         let current = params.iter().find(|p| p.id == id).ok_or_else(|| anyhow!("plugin has no parameter with id {id}"))?.value;
         // Store the current value first (outside the undo step) so undo restores it.
         {
@@ -675,7 +753,7 @@ impl Engine {
     /// dragging it). Repeated calls with the same `label` and ids merge into one step.
     pub fn set_slot_params(&mut self, track: usize, which: SlotRef, values: &[(u32, f64)], label: &str) -> Result<()> {
         let index = if matches!(which, SlotRef::Master(_)) { track } else { self.track_index(track)? };
-        let params = self.slot_params(track, which)?;
+        let params = self.slot_params_static(track, which)?;
         for &(id, _) in values {
             let current = params.iter().find(|p| p.id == id).ok_or_else(|| anyhow!("plugin has no parameter with id {id}"))?.value;
             let slot = self.slot_mut(track, which)?;
@@ -701,8 +779,8 @@ impl Engine {
             None => slot.params.push((id, value)),
         }
         let instance = slot.instance;
-        if let Some(Loaded::Vst3(plugin)) = self.pool.get(&instance) {
-            plugin.set_param_on_controller(id, value);
+        if let Some(plugin) = self.pool.get(&instance) {
+            plugin.set_param(id, value);
         }
         let target = self.slot_target(index, which);
         self.send(Command::SetPluginParam { track: target, instance, id, value })
@@ -711,7 +789,7 @@ impl Engine {
     // ---------------------------------------------------------------- instruments
 
     /// Set (or with `None`, remove) a track's instrument: "synth" for the built-in synth,
-    /// or a VST3 instrument name / bundle path.
+    /// or a VST3 / AU instrument name, bundle path or AU id ("au:aumu:dls :appl").
     pub fn set_instrument(&mut self, track: usize, query: Option<&str>) -> Result<Option<PluginSlot>> {
         let index = self.track_index(track)?;
         let slot = match query {
@@ -726,12 +804,13 @@ impl Engine {
         })
     }
 
-    /// Instruments available: the built-in synth plus scanned VST3 instruments.
+    /// Instruments available: the built-ins plus scanned VST3 and AU instruments.
     pub fn available_instruments(&self) -> Vec<(String, String)> {
         let mut list = vec![(synth::NAME.to_string(), "synth".to_string()), (drums::NAME.to_string(), "drums".to_string())];
         for p in self.scanned.iter().filter(|p| p.class.is_instrument()) {
             list.push((format!("{} — {}", p.class.name, p.class.vendor), p.bundle.to_string_lossy().into_owned()));
         }
+        list.extend(self.audio_units.iter().filter(|a| a.instrument).map(|a| (format!("{} — {} (AU)", a.name, a.manufacturer), a.id.clone())));
         list
     }
 }
