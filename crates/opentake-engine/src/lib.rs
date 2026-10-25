@@ -14,6 +14,8 @@ pub mod multiband;
 pub mod reverb;
 pub mod gate;
 pub mod deesser;
+pub mod chorus;
+pub mod phaser;
 mod filter;
 pub mod eq;
 pub mod synth;

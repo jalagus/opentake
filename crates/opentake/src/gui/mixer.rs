@@ -454,6 +454,8 @@ fn add_fx_button(app: &mut DawApp, ui: &mut egui::Ui, t: usize, w: f32, snap: &S
             (opentake_engine::reverb::NAME, opentake_engine::reverb::PATH),
             (opentake_engine::gate::NAME, opentake_engine::gate::PATH),
             (opentake_engine::deesser::NAME, opentake_engine::deesser::PATH),
+            (opentake_engine::chorus::NAME, opentake_engine::chorus::PATH),
+            (opentake_engine::phaser::NAME, opentake_engine::phaser::PATH),
         ];
         for (name, path) in builtins {
             if ui.button(name).clicked() {

@@ -6,11 +6,11 @@
 use std::sync::Arc;
 
 use eframe::egui;
-use egui::{Align2, Color32, FontId, Rect, RichText, Sense, Shape, Stroke, pos2, vec2};
+use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, pos2, vec2};
 use opentake_engine::delay;
 use opentake_engine::multiband::{self, MultibandMeter};
 use opentake_engine::reverb;
-use opentake_engine::{deesser, gate};
+use opentake_engine::{chorus, deesser, gate, phaser};
 use opentake_engine::dynamics::{self, CompSettings, GainMeter, comp, limiter};
 use opentake_engine::{ParamView, SlotRef};
 
@@ -26,6 +26,8 @@ pub enum Kind {
     Reverb,
     Gate,
     DeEsser,
+    Chorus,
+    Phaser,
 }
 
 impl Kind {
@@ -38,6 +40,8 @@ impl Kind {
             reverb::PATH => Some(Kind::Reverb),
             gate::PATH => Some(Kind::Gate),
             deesser::PATH => Some(Kind::DeEsser),
+            chorus::PATH => Some(Kind::Chorus),
+            phaser::PATH => Some(Kind::Phaser),
             _ => None,
         }
     }
@@ -51,6 +55,8 @@ impl Kind {
             Kind::Reverb => [770.0, 360.0],
             Kind::Gate => [560.0, 500.0],
             Kind::DeEsser => [560.0, 420.0],
+            Kind::Chorus => [620.0, 330.0],
+            Kind::Phaser => [620.0, 330.0],
         }
     }
 }
@@ -65,6 +71,8 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, kind: Kin
         Kind::Reverb => reverb_view(app, ui, t, s, params, meter),
         Kind::Gate => gate_view(app, ui, t, s, params, meter),
         Kind::DeEsser => deesser_view(app, ui, t, s, params, meter),
+        Kind::Chorus => chorus_view(app, ui, t, s, params),
+        Kind::Phaser => phaser_view(app, ui, t, s, params),
     }
 }
 
@@ -423,6 +431,72 @@ fn deesser_view(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, param
     });
     ui.add_space(8.0);
     history(ui, ui.make_persistent_id(("deesser_history", t, s)), raw.0, raw.1);
+}
+
+fn chorus_view(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params: &[ParamView]) {
+    let values: Vec<(u32, f64)> = params.iter().map(|p| (p.id, p.value)).collect();
+    let set = chorus::Settings::from_params(&values);
+    // Each voice's delay over two LFO cycles.
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 110.0), Sense::hover());
+    widgets::label(&resp, egui::Role::Image, "Chorus Voices");
+    let p = ui.painter().with_clip_rect(rect);
+    p.rect_filled(rect, 6.0, theme::BG_DEEP);
+    // The scale fits the sweep, so its movement shows at any setting.
+    let max_ms = ((set.delay_ms + set.depth_ms) * 1.25).max(5.0);
+    let step = [1.0, 2.0, 5.0, 10.0, 20.0].into_iter().find(|s| max_ms / s <= 5.0).unwrap_or(20.0);
+    let y_of = |ms: f64| rect.bottom() - 8.0 - (ms / max_ms) as f32 * (rect.height() - 16.0);
+    for ms in (1..).map(|k| k as f64 * step).take_while(|&ms| ms < max_ms) {
+        p.hline(rect.x_range(), y_of(ms), Stroke::new(1.0, theme::HAIRLINE));
+        p.text(pos2(rect.right() - 4.0, y_of(ms)), Align2::RIGHT_BOTTOM, format!("{ms:.0} ms"), FontId::proportional(9.0), theme::TEXT_FAINT);
+    }
+    let colors = [theme::ACCENT, theme::TEMPO, Color32::from_rgb(170, 120, 255), theme::PLAY];
+    for v in 0..set.voices {
+        let pts: Vec<_> = (0..=200)
+            .map(|i| {
+                let f = i as f64 / 200.0;
+                pos2(rect.left() + f as f32 * rect.width(), y_of(set.voice_delay(v, f * 4.0 * std::f64::consts::PI)))
+            })
+            .collect();
+        p.add(Shape::line(pts, Stroke::new(1.6, colors[v % colors.len()])));
+    }
+    p.text(rect.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, format!("{} voice{} · {:.2} Hz", set.voices, if set.voices == 1 { "" } else { "s" }, set.rate_hz), FontId::proportional(10.0), theme::TEXT_DIM);
+    ui.add_space(8.0);
+    knob_row(app, ui, t, s, params, &[chorus::RATE, chorus::DEPTH, chorus::DELAY, chorus::VOICES]);
+    knob_row(app, ui, t, s, params, &[chorus::WIDTH, chorus::FEEDBACK, chorus::TONE, chorus::MIX]);
+}
+
+fn phaser_view(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params: &[ParamView]) {
+    let values: Vec<(u32, f64)> = params.iter().map(|p| (p.id, p.value)).collect();
+    let set = phaser::Settings::from_params(&values);
+    let sr = 48_000.0;
+    // The response at both ends of the sweep (thin) and at its centre (bold), with the
+    // swept range shaded.
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 110.0), Sense::hover());
+    widgets::label(&resp, egui::Role::Image, "Phaser Response");
+    let p = ui.painter().with_clip_rect(rect);
+    p.rect_filled(rect, 6.0, theme::BG_DEEP);
+    let x_of = |hz: f64| rect.left() + ((hz / 20.0).ln() / 1000f64.ln()) as f32 * rect.width();
+    let hz_of = |x: f32| 20.0 * 1000f64.powf(((x - rect.left()) / rect.width()) as f64);
+    let y_of = |db: f64| rect.top() + 8.0 + ((6.0 - db.clamp(-36.0, 6.0)) / 42.0) as f32 * (rect.height() - 16.0);
+    let (lo, hi) = (set.corner(-1.0, sr), set.corner(1.0, sr));
+    p.rect_filled(Rect::from_x_y_ranges(x_of(lo)..=x_of(hi), rect.y_range()), 0.0, theme::with_alpha(theme::ACCENT, 22));
+    for hz in [100.0, 1000.0, 10_000.0] {
+        p.vline(x_of(hz), rect.y_range(), Stroke::new(1.0, theme::HAIRLINE));
+        p.text(pos2(x_of(hz) + 3.0, rect.bottom() - 3.0), Align2::LEFT_BOTTOM, if hz >= 1000.0 { format!("{}k", hz / 1000.0) } else { format!("{hz}") }, FontId::proportional(9.0), theme::TEXT_FAINT);
+    }
+    p.hline(rect.x_range(), y_of(0.0), Stroke::new(1.0, theme::HAIRLINE));
+    let curve = |corner: f64| -> Vec<Pos2> { (0..=rect.width() as usize).map(|i| {
+        let x = rect.left() + i as f32;
+        pos2(x, y_of(set.response_db(hz_of(x), corner, sr)))
+    }).collect() };
+    for corner in [lo, hi] {
+        p.add(Shape::line(curve(corner), Stroke::new(1.0, theme::with_alpha(theme::ACCENT, 110))));
+    }
+    p.add(Shape::line(curve(set.corner(0.0, sr)), Stroke::new(2.0, theme::ACCENT)));
+    p.text(rect.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, format!("{} stages · {:.2} Hz", set.stages, set.rate_hz), FontId::proportional(10.0), theme::TEXT_DIM);
+    ui.add_space(8.0);
+    knob_row(app, ui, t, s, params, &[phaser::RATE, phaser::DEPTH, phaser::CENTER, phaser::FEEDBACK]);
+    knob_row(app, ui, t, s, params, &[phaser::STAGES, phaser::SPREAD, phaser::MIX]);
 }
 
 fn reverb_view(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params: &[ParamView], meter: Option<&Arc<GainMeter>>) {

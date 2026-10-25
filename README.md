@@ -18,7 +18,7 @@ you watch the changes appear live — and undo anything you don't like.
 
 - 🎙️ Multitrack recording from any audio interface (CoreAudio, WASAPI, ALSA/JACK via cpal), latency-compensated with a built-in loopback measurement
 - 🎹 Instrument tracks, piano roll, a built-in synth and GM drum kit; VST3 instruments and effects, plus Audio Units on macOS
-- 🎛️ Built-in EQ, compressor, multiband compressor, limiter, delay, reverb, gate and de-esser on any track or the master bus; plug-in delay compensation
+- 🎛️ Built-in EQ, compressor, multiband compressor, limiter, delay, reverb, gate, de-esser, chorus and phaser on any track or the master bus; plug-in delay compensation
 - 🔀 Buses and sends: route tracks into a bus, or send them pre/post-fader to a shared reverb or delay bus
 - 📈 Automation of volume, pan, mute and any plug-in parameter, in lanes under each track, with Read, Touch and Latch modes
 - ⏱️ Project tempo map (tempo and time-signature changes), metronome with count-in
@@ -118,11 +118,13 @@ agent.
   becomes an instrument track (channel 10 on the drum kit). File → Export MIDI File… writes
   the MIDI regions back out.
 - **Mix**: an inspector and a mixer (**I**, **X**), plus built-in EQ, compressor, multiband compressor, limiter,
-  delay, reverb, gate and de-esser alongside VST3 and Audio Unit effects. The reverb (pre-delay,
+  delay, reverb, gate, de-esser, chorus and phaser alongside VST3 and Audio Unit effects. The reverb (pre-delay,
   size, decay, damping, low cut, width, diffusion, modulation) shows its decay tail as you turn
   the knobs; it starts 100% wet for a reverb bus, so turn Mix down when using it as an insert.
   The gate (threshold, hysteresis, hold, range, key filters) and de-esser (frequency, threshold,
   range; split or wideband, Listen to hear the detected band) show their gain reduction over time.
+  The chorus (1–4 voices) shows each voice's sweeping delay, and the phaser (2–12 stages) its
+  notches across the swept range.
   Plug-in latency is compensated automatically.
 - **Buses**: Track → New Bus (or Create Bus from Selection), then pick a track's Output in
   the inspector or mixer; effects on the bus process the whole group.
