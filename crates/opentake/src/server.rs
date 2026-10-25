@@ -475,7 +475,7 @@ impl DawServer {
         self.with_engine(move |e| e.load_project(&PathBuf::from(a.path)).map(|w| json!({ "warnings": w }))).await
     }
 
-    #[tool(description = "Save the project. Use a .rpp extension to write a Reaper project, otherwise JSON. Plugin parameter values set via set_plugin_param are only preserved in JSON.")]
+    #[tool(description = "Save the project. Use .otp (OpenTake project; added when no extension is given) or .rpp for a Reaper project. Plugin parameter values, MIDI and built-in plug-ins are only preserved in .otp.")]
     async fn save_project(&self, Parameters(a): Parameters<OptionalPathArgs>) -> ToolResult {
         self.with_engine(move |e| e.save_project(a.path.as_deref().map(std::path::Path::new))).await
     }
@@ -536,6 +536,15 @@ impl DawServer {
                 }
                 _ => anyhow::bail!("give either secs or bar"),
             }
+        })
+        .await
+    }
+
+    #[tool(description = "Make the project's tempo map follow an imported song's tempo and time-signature changes (for a Guitar Pro song imported without set_tempo). Undoable.")]
+    async fn adopt_song_tempo(&self) -> ToolResult {
+        self.with_engine(move |e| {
+            let adopted = e.adopt_song_tempo()?;
+            Ok(json!({ "adopted": adopted, "changes": e.project().tempo_changes.len() }))
         })
         .await
     }

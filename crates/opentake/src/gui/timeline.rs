@@ -370,6 +370,18 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
             toolbar(app, ui, snap);
         });
         ui.painter().text(pos2(bar.right() - 10.0, bar.bottom() - TEMPO_ROW_H / 2.0), Align2::RIGHT_CENTER, "Tempo", FontId::proportional(10.0), theme::TEXT_FAINT);
+        // An imported song with its own tempo the project doesn't follow: offer to adopt it.
+        if snap.song_tempo_differs {
+            let at = Rect::from_min_size(pos2(bar.left() + 8.0, bar.bottom() - TEMPO_ROW_H + 1.0), vec2(118.0, TEMPO_ROW_H - 2.0));
+            let mut child = ui.new_child(UiBuilder::new().id_salt("use_song_tempo").max_rect(at));
+            let text = RichText::new("Use song tempo").size(10.0).color(theme::TEMPO);
+            let b = child.add(egui::Button::new(text).frame(false)).on_hover_text(
+                "The imported song has its own tempo changes that the project (bars, grid, metronome) doesn't follow yet. Click to adopt the song's tempo map.",
+            );
+            if b.clicked() {
+                app.act(Action::AdoptSongTempo);
+            }
+        }
 
         let (resp, painter) = ui.allocate_painter(vec2(ui.available_width(), ruler_h), Sense::hover());
         let full_rect = resp.rect;
@@ -1133,6 +1145,21 @@ fn draw_ruler(painter: &Painter, rect: Rect, view: &View, map: &TempoMap) {
     painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
 }
 
+/// Imported songs' tempo marks (absolute seconds, bpm) from unmuted regions, merged.
+fn song_tempo_marks(project: &Project) -> Vec<(f64, f64)> {
+    let mut marks: Vec<(f64, f64)> = project
+        .tracks
+        .iter()
+        .filter(|t| !t.mute)
+        .flat_map(|t| &t.midi_clips)
+        .filter(|c| !c.mute)
+        .flat_map(|c| c.tempos.iter().filter(|m| m.start_secs < c.length_secs).map(|m| (c.position_secs + m.start_secs, m.bpm)))
+        .collect();
+    marks.sort_by(|a, b| a.0.total_cmp(&b.0));
+    marks.dedup_by(|b, a| (b.0 - a.0).abs() < 1e-3 && (b.1 - a.1).abs() < 1e-6);
+    marks
+}
+
 /// Common time signatures offered in menus.
 const SIGNATURES: [(u32, u32); 9] = [(2, 4), (3, 4), (4, 4), (5, 4), (6, 4), (6, 8), (7, 8), (9, 8), (12, 8)];
 
@@ -1158,6 +1185,13 @@ fn tempo_track(app: &mut DawApp, ui: &egui::Ui, painter: &Painter, rect: Rect, p
         p.vline(x, Rangef::new(rect.top() + 2.0, rect.bottom()), Stroke::new(1.0, color));
     }
     draw_tempo_labels(&p, rect.x_range(), rect.center().y, &marks, current, bg);
+    // The song's own tempo marks where the project doesn't follow them: faint ticks.
+    for (t, bpm) in song_tempo_marks(project) {
+        if (map.tempo_at(t + 1e-6) - bpm).abs() > 0.05 {
+            let x = app.view.x_of(t);
+            p.vline(x, Rangef::new(rect.top() + 1.0, rect.top() + 6.0), Stroke::new(1.0, theme::with_alpha(theme::TEMPO, 110)));
+        }
+    }
     p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
 
     let resp = ui.interact(rect, ui.make_persistent_id("tempo_track"), Sense::click_and_drag());
@@ -1294,6 +1328,10 @@ fn tempo_track(app: &mut DawApp, ui: &egui::Ui, painter: &Painter, rect: Rect, p
                 app.act(Action::SetTempoChanges { changes: c, merge: None });
                 ui.close();
             }
+        }
+        if !song_tempo_marks(project).is_empty() && ui.button("Use Song's Tempo Map").clicked() {
+            app.act(Action::AdoptSongTempo);
+            ui.close();
         }
         if !changes.is_empty() && ui.button("Remove All Tempo Changes").clicked() {
             app.act(Action::SetTempoChanges { changes: Vec::new(), merge: None });

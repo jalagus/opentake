@@ -23,7 +23,7 @@ you watch the changes appear live — and undo anything you don't like.
 - ✂️ Region editing: select, move, copy, split, trim, snap, cycle/loop
 - 🎚️ Full mixer, metronome, undo/redo for everything
 - 🤖 MCP server (stdio or HTTP) with 53 tools — the agent and you share one session
-- 📂 Opens and saves Reaper `.rpp` projects as well as its own `.json` format
+- 📂 Its own `.otp` project files (double-click to open), and Reaper `.rpp` projects
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
 - 🦀 Real-time safe audio engine: no locks or allocation on the audio thread
 
@@ -91,6 +91,9 @@ A dark, Logic Pro–inspired interface. The GUI and the MCP server share one eng
 process, so anything an agent does (adding tracks, inserting plugins, moving regions,
 recording) appears live in the window and vice versa.
 
+- **Project files**: OpenTake saves `.otp` files (OpenTake Project; JSON inside). On macOS
+  the app registers the type, so double-clicking an `.otp` (or using Open With on a `.gp` or
+  `.rpp`) opens it in OpenTake; on other systems use Open With, or `opentake song.otp`.
 - **Recent projects**: the app reopens the last project on start (unless `--project` is
   given) and lists recent projects under File → Open Recent (with Clear Menu). Projects
   opened or saved by an agent are added too; missing files drop off the list.
@@ -146,9 +149,11 @@ recording) appears live in the window and vice versa.
   + = add the built-in EQ or a scanned VST3), pan, dB/peak readouts, fader and stereo meter.
   Stereo Out has its own Audio FX slots for the master bus.
 - **EQ** (built-in **OpenTake EQ**): low cut, low shelf, two bells, high shelf, high cut and
-  output gain. Its window shows the response curve: drag a band's point to set frequency and
-  gain, scroll on a bell to change its width, double-click a point to switch the band on/off;
-  knobs below for exact values. Each drag is one undo step.
+  output gain. Every band has a Q (how tight: bell width, shelf knee, cut resonance) and the
+  cuts have a 12/24/48 dB/oct slope. Its window shows the response curve over a live
+  analyzer of the audio going in (grey) and coming out (teal): drag a band's point to set
+  frequency and gain, scroll on it for Q, double-click it to switch the band on/off; knobs
+  below for exact values. Each drag is one undo step.
 - **Mixer** (X): every track's channel strip side by side, Stereo Out pinned on the right,
   in the editor area below the tracks.
 - **Instrument tracks & MIDI**: create one from the "+" above the track list or
@@ -227,7 +232,8 @@ Recording: arm a track (`update_track` with `armed: true` and `input_channel`), 
 
 ## Reaper projects
 
-`load_project`/`save_project` pick the format from the extension (`.rpp` vs `.json`).
+`load_project`/`save_project` pick the format from the extension (`.rpp` vs `.otp`;
+`.json` files from earlier versions still open).
 Supported: tempo/time signature and the tempo map (tempo envelope), sample rate, master volume, loop range (`LOOP`/`SELECTION`), track name/volume/pan/mute/solo/
 record-arm/input/monitoring, audio items (position, length, source offset, gain, mute,
 media file) and FX chain references. VST3 plugins in a Reaper project are matched by
@@ -246,7 +252,7 @@ back on export, but they aren't applied to the loaded plugin.
   objects (some plugins need them for processor ↔ controller messaging). Plugin
   parameters are saved by value in our JSON format, but full state chunks aren't saved yet.
 - Plugin parameter values, MIDI regions, the built-in synth/drums/EQ and master-bus effects
-  are saved in `.json` projects only (`.rpp` export skips them; VST3 instruments are exported).
+  are saved in `.otp` projects only (`.rpp` export skips them; VST3 instruments are exported).
 - Guitar Pro: only GP7/8 (`.gp`, `.gpif`); `.gp3`–`.gp5` and `.gpx` are recognised but not
   imported yet. Bends, slides and vibrato aren't played back (no pitch bend yet).
   `cargo run -p opentake-project --example gpinfo -- song.gp` prints what the reader sees.

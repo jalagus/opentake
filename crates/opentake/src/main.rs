@@ -1,4 +1,5 @@
 mod gui;
+mod open_files;
 mod server;
 mod settings;
 
@@ -32,9 +33,13 @@ struct Cli {
     #[arg(long, global = true)]
     no_mcp: bool,
 
-    /// Open this project (.rpp or .json) on startup.
+    /// Open this project (.otp, .rpp or .json) on startup.
     #[arg(long, global = true)]
     project: Option<PathBuf>,
+
+    /// A file to open: a project (.otp, .rpp, .json), or with the GUI a Guitar Pro song or
+    /// WAV to import (this is how "Open with" and file associations launch OpenTake).
+    file: Option<PathBuf>,
 
     /// Start audio with default devices on startup.
     #[arg(long, global = true)]
@@ -71,7 +76,15 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    // A project passed as a plain argument opens like --project; other files go to the GUI.
+    if let Some(file) = cli.file.take() {
+        if cli.project.is_none() && opentake_engine::is_project_path(&file) {
+            cli.project = Some(file);
+        } else {
+            open_files::push(file);
+        }
+    }
     let mut engine = Engine::new();
     // Saved scan folders (from the Plug-in Manager); --plugin-path adds to them for this run.
     let settings_path = settings::default_path();
@@ -97,6 +110,10 @@ fn main() -> Result<()> {
     }
 
     let gui = matches!(command, Cmd::Gui);
+    if gui {
+        // Before the app finishes launching, so a double-clicked document isn't missed.
+        open_files::install();
+    }
     // The GUI reopens the last project unless one was given on the command line.
     let last_project = (gui && cli.project.is_none())
         .then(|| settings_path.as_deref().map(settings::Settings::load).and_then(|s| s.existing_recent().into_iter().next()))

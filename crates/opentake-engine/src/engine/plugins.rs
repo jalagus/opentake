@@ -20,7 +20,8 @@ pub(super) enum Loaded {
     Vst3(Vst3Plugin),
     Synth,
     Drums,
-    Eq,
+    /// The tap feeds the editor's analyzer (shared by every processor of this instance).
+    Eq(std::sync::Arc<eq::Tap>),
 }
 
 /// Which plugin: a track's instrument or effect slot, or a slot on the master bus (the
@@ -208,7 +209,7 @@ impl Engine {
                 bail!("{} is an effect, not an instrument", eq::NAME);
             }
             let mut slot = builtin_slot(eq::NAME, eq::PATH);
-            slot.instance = self.add_to_pool(Loaded::Eq);
+            slot.instance = self.add_to_pool(Loaded::Eq(eq::Tap::new()));
             return Ok(slot);
         }
         let (bundle, cid) = self.resolve_plugin(query, instrument)?;
@@ -233,7 +234,7 @@ impl Engine {
         match slot.format {
             PluginFormat::Builtin if slot.path == synth::PATH => return Ok(self.add_to_pool(Loaded::Synth)),
             PluginFormat::Builtin if slot.path == drums::PATH => return Ok(self.add_to_pool(Loaded::Drums)),
-            PluginFormat::Builtin if slot.path == eq::PATH => return Ok(self.add_to_pool(Loaded::Eq)),
+            PluginFormat::Builtin if slot.path == eq::PATH => return Ok(self.add_to_pool(Loaded::Eq(eq::Tap::new()))),
             PluginFormat::Vst3 => {}
             _ => bail!("unsupported plugin format"),
         }
@@ -284,8 +285,8 @@ impl Engine {
                 }
                 Box::new(d)
             }
-            Some(Loaded::Eq) => {
-                let mut q = Eq::new(sr as f64);
+            Some(Loaded::Eq(tap)) => {
+                let mut q = Eq::with_tap(sr as f64, Some(tap.clone()));
                 for &(id, value) in &slot.params {
                     q.set_param(id, value);
                 }
@@ -423,6 +424,15 @@ impl Engine {
         })
     }
 
+    /// The analyzer tap of a built-in EQ slot.
+    pub fn eq_tap(&self, track: usize, which: SlotRef) -> Option<std::sync::Arc<eq::Tap>> {
+        let slot = self.slot_ref(track, which).ok()?;
+        match self.pool.get(&slot.instance) {
+            Some(Loaded::Eq(tap)) => Some(tap.clone()),
+            _ => None,
+        }
+    }
+
     /// Effects available to insert: the built-in EQ plus scanned VST3 effects.
     pub fn available_effects(&self) -> Vec<(String, String)> {
         let mut list = vec![(eq::NAME.to_string(), eq::PATH.to_string())];
@@ -524,7 +534,7 @@ impl Engine {
                     }
                 })
                 .collect()),
-            Some(Loaded::Eq) => Ok(eq::params()
+            Some(Loaded::Eq(_)) => Ok(eq::params()
                 .into_iter()
                 .map(|(id, title, units, default, steps)| {
                     let value = slot.params.iter().find(|(pid, _)| *pid == id).map_or(default, |p| p.1);

@@ -72,13 +72,24 @@ fn song_tempo_map(score: &Score, perf: &timeline::Performance, start: f64) -> (f
         }
         prev_sig = Some(sig);
     }
-    points.sort_by(|a, b| a.0.total_cmp(&b.0));
     let first_bpm = perf.tempos.first().map_or(120.0, |t| t.1);
     let first_sig = score.master_bars.first().map_or((4, 4), |m| (m.numerator, m.denominator));
+    tempo_map_from_points(points, first_bpm, first_sig, start)
+}
+
+/// Opening tempo/signature and changes from song-relative points (time, tempo change,
+/// signature change), placed at `start` seconds on the timeline.
+fn tempo_map_from_points(
+    mut points: Vec<(f64, Option<f64>, Option<(u32, u32)>)>,
+    first_bpm: f64,
+    first_sig: (u32, u32),
+    start: f64,
+) -> (f64, (u32, u32), Vec<TempoChange>) {
+    points.sort_by(|a, b| a.0.total_cmp(&b.0));
     let (mut bpm, mut changes): (f64, Vec<TempoChange>) = (first_bpm, Vec::new());
     if start > 1e-9 {
-        // The song's first bar starts at the import position.
-        changes.push(TempoChange { at_secs: start, bpm: first_bpm, time_signature: Some(first_sig) });
+        // The song's first bar starts at its position on the timeline.
+        changes.push(TempoChange { at_secs: start, bpm: first_bpm.clamp(20.0, 999.0), time_signature: Some(first_sig) });
     }
     let mut i = 0;
     while i < points.len() {
@@ -94,6 +105,55 @@ fn song_tempo_map(score: &Score, perf: &timeline::Performance, start: f64) -> (f
         }
     }
     (first_bpm.clamp(20.0, 999.0), first_sig, changes)
+}
+
+impl Engine {
+    /// True when an imported song's own tempo (kept on its regions) differs from the
+    /// project's tempo map, e.g. it was imported without adopting it.
+    pub fn song_tempo_differs(&self) -> bool {
+        let map = self.project.tempo_map();
+        self.project.tracks.iter().flat_map(|t| &t.midi_clips).any(|c| {
+            c.tempos.iter().filter(|m| m.start_secs < c.length_secs).any(|m| (map.tempo_at(c.position_secs + m.start_secs + 1e-6) - m.bpm).abs() > 0.05)
+        })
+    }
+
+    /// Make the project's tempo map follow an imported song's tempo (from its regions'
+    /// tempo marks and tab bars), so bars, grid and metronome match the song. One undo step.
+    /// Returns false when there's no song tempo to adopt.
+    pub fn adopt_song_tempo(&mut self) -> Result<bool> {
+        // Prefer a region with tab bars (they carry the time signatures).
+        let regions = self.project.tracks.iter().flat_map(|t| &t.midi_clips).filter(|c| !c.tempos.is_empty());
+        let Some(clip) = regions.clone().find(|c| c.tab.is_some()).or_else(|| regions.clone().next()).cloned() else {
+            return Ok(false);
+        };
+        let mut points: Vec<(f64, Option<f64>, Option<(u32, u32)>)> = clip.tempos.iter().map(|m| (m.start_secs, Some(m.bpm), None)).collect();
+        let mut first_sig = self.project.time_signature;
+        if let Some(tab) = &clip.tab {
+            let mut prev = None;
+            for bar in &tab.bars {
+                let sig = (bar.numerator, bar.denominator);
+                if prev.is_none() {
+                    first_sig = sig;
+                }
+                if prev != Some(sig) {
+                    points.push((bar.start_secs, None, Some(sig)));
+                }
+                prev = Some(sig);
+            }
+        }
+        let first_bpm = clip.tempos[0].bpm;
+        let (bpm, sig, changes) = tempo_map_from_points(points, first_bpm, first_sig, clip.position_secs);
+        self.record("Use Song Tempo", None, |e| {
+            if clip.position_secs <= 1e-9 {
+                e.project.tempo_bpm = bpm;
+                e.project.time_signature = sig;
+            }
+            e.project.tempo_changes = changes;
+            let cmd = e.tempo_command();
+            e.send(cmd)
+        })?;
+        Ok(true)
+    }
 }
 
 pub fn summarize(score: &Score) -> GuitarProSummary {
@@ -276,6 +336,19 @@ mod tests {
         assert_eq!(e.history_info().undo.as_deref(), Some("Import Guitar Pro"));
         e.undo().unwrap();
         assert_eq!(e.project().tracks.len(), 1, "undo removes every imported track");
+    }
+
+    #[test]
+    fn adopts_the_song_tempo_of_a_song_imported_without_it() {
+        let mut e = Engine::new();
+        let opts = GuitarProImport { set_tempo: false, ..Default::default() };
+        e.import_guitar_pro(Path::new(FIXTURE), &opts).unwrap();
+        assert!(e.project().tempo_changes.is_empty());
+        assert!(e.song_tempo_differs(), "the song slows to 60 at 8 s; the project stays at 120");
+        assert!(e.adopt_song_tempo().unwrap());
+        assert!(!e.song_tempo_differs());
+        assert_eq!(e.project().tempo_map().tempo_at(9.0), 60.0);
+        assert_eq!(e.history_info().undo.as_deref(), Some("Use Song Tempo"));
     }
 
     #[test]

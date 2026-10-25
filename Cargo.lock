@@ -3092,6 +3092,7 @@ dependencies = [
  "egui_kittest",
  "hound",
  "muda",
+ "objc2 0.6.5",
  "opentake-engine",
  "opentake-project",
  "opentake-vst3",

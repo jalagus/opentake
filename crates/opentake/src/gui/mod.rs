@@ -49,6 +49,8 @@ pub fn run(engine: SharedEngine, mcp_url: Option<String>, settings_path: Option<
         options,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
+            crate::open_files::set_context(&cc.egui_ctx);
+            crate::open_files::install();
             let has_tracks = !engine.lock().map(|e| e.project().tracks.is_empty()).unwrap_or(true);
             let mut app = DawApp::new(engine, mcp_url);
             let settings = settings_path.as_deref().map(crate::settings::Settings::load).unwrap_or_default();
@@ -82,8 +84,12 @@ pub(crate) struct Snapshot {
     /// Instruments for new instrument tracks: (display name, id for the engine).
     pub instruments: Vec<(String, String)>,
     pub history: HistoryInfo,
+    /// An imported song's own tempo differs from the project's tempo map.
+    pub song_tempo_differs: bool,
     /// Parameters of plugins whose windows are open, keyed by (track, slot).
     pub params: HashMap<(usize, SlotRef), Vec<ParamView>>,
+    /// Analyzer taps of built-in EQs whose windows are open.
+    pub taps: HashMap<(usize, SlotRef), Arc<opentake_engine::eq::Tap>>,
 }
 
 /// Copied regions (⌘C): each with its track offset from the top-most copied track, and
@@ -113,6 +119,8 @@ pub(crate) enum Action {
     SetTimeSignature((u32, u32)),
     SetTempoChanges { changes: Vec<opentake_engine::project::TempoChange>, merge: Option<String> },
     SetCountIn { bars: Option<u32>, on_play: Option<bool> },
+    /// Make the project's tempo map follow an imported song's tempo.
+    AdoptSongTempo,
     InsertMasterPlugin(String),
     /// Several parameters as one undo step: (track, slot, values, label).
     SetParams(usize, SlotRef, Vec<(u32, f64)>, String),
@@ -300,6 +308,7 @@ impl DawApp {
                 }
             }
         }
+        let taps = open.iter().filter_map(|&(t, s)| Some(((t, s), e.eq_tap(t, s)?))).collect();
         let params = open.into_iter().filter_map(|(t, s)| Some(((t, s), e.slot_params(t, s).ok()?))).collect();
         Snapshot {
             project_path: e.project_path().map(|p| p.to_path_buf()),
@@ -309,8 +318,10 @@ impl DawApp {
             plugin_paths: e.plugin_search_paths().to_vec(),
             instruments: e.available_instruments(),
             history: e.history_info(),
+            song_tempo_differs: e.song_tempo_differs(),
             waveforms,
             params,
+            taps,
             project,
         }
     }
@@ -346,6 +357,9 @@ impl DawApp {
             Action::SetTempo(bpm) => e.set_tempo(bpm, None)?,
             Action::SetTimeSignature(sig) => e.set_tempo(e.project().tempo_bpm, Some(sig))?,
             Action::SetTempoChanges { changes, merge } => e.set_tempo_changes(changes, merge)?,
+            Action::AdoptSongTempo => {
+                e.adopt_song_tempo()?;
+            }
             Action::SetCountIn { bars, on_play } => e.set_count_in(bars, on_play)?,
             Action::InsertMasterPlugin(query) => {
                 let slot = e.insert_master_plugin(&query, None)?;
@@ -855,7 +869,9 @@ impl DawApp {
             }
         }
         for f in files.iter().map(|f| f.path().to_path_buf()) {
-            if opentake_project::guitarpro::is_guitar_pro_path(&f) {
+            if opentake_engine::is_project_path(&f) {
+                self.act(Action::OpenProject(f));
+            } else if opentake_project::guitarpro::is_guitar_pro_path(&f) {
                 self.open_guitar_pro_dialog(f);
             } else {
                 self.act(Action::AddClip { track, file: f, position });
@@ -863,10 +879,23 @@ impl DawApp {
         }
     }
 
+    /// Files the OS asked us to open (double-click, "Open with", command line).
+    fn handle_open_requests(&mut self, snap: &Snapshot) {
+        for f in crate::open_files::take() {
+            if opentake_engine::is_project_path(&f) {
+                self.act(Action::OpenProject(f));
+            } else if opentake_project::guitarpro::is_guitar_pro_path(&f) {
+                self.open_guitar_pro_dialog(f);
+            } else {
+                self.act(Action::AddClip { track: None, file: f, position: snap.status.position_secs });
+            }
+        }
+    }
+
     fn save_as(&mut self, snap: &Snapshot) {
-        let name = format!("{}.json", snap.project.name);
+        let name = format!("{}.{}", snap.project.name, opentake_engine::PROJECT_EXTENSION);
         if let Some(p) = rfd::FileDialog::new()
-            .add_filter("OpenTake project", &["json"])
+            .add_filter("OpenTake project", &[opentake_engine::PROJECT_EXTENSION])
             .add_filter("Reaper project", &["rpp"])
             .set_file_name(name)
             .save_file()
@@ -1036,7 +1065,7 @@ impl DawApp {
         match cmd {
             MenuCommand::NewProject => self.act(Action::NewProject),
             MenuCommand::Open => {
-                if let Some(p) = rfd::FileDialog::new().add_filter("Project", &["json", "rpp"]).pick_file() {
+                if let Some(p) = rfd::FileDialog::new().add_filter("Project", &["otp", "rpp", "json"]).pick_file() {
                     self.act(Action::OpenProject(p));
                 }
             }
@@ -1474,7 +1503,9 @@ impl DawApp {
         // hovering/dragging shows (and edits) the project tempo again.
         let song = snap.project.song_tempo_at(s.position_secs).filter(|t| (t - bpm).abs() > 0.05);
         let hint = match song {
-            Some(t) => format!("Song tempo {t:.1} at the playhead (from the imported score).\nProject tempo {bpm:.1} — drag to change it (Shift = fine)"),
+            Some(t) => format!(
+                "Song tempo {t:.1} at the playhead (from the imported score); the project, grid and metronome are at {bpm:.1}.\nClick \"Use song tempo\" in the Tempo row to make them follow the song. Drag here to change the project tempo (Shift = fine)."
+            ),
             None if section.is_some() => "Tempo at the playhead (from the tempo track) — drag to change it (Shift = fine)".to_string(),
             None => "Drag to change tempo (Shift = fine)".to_string(),
         };
@@ -1605,7 +1636,7 @@ impl DawApp {
                     ui.add_space(6.0);
                     let params = snap.params.get(&(t, s)).map(Vec::as_slice).unwrap_or_default();
                     if is_eq && !params.is_empty() {
-                        eq_view::show(self, ui, t, s, params, snap.status.sample_rate as f64);
+                        eq_view::show(self, ui, t, s, params, snap.status.sample_rate as f64, snap.taps.get(&(t, s)));
                         return;
                     }
                     if params.is_empty() {
@@ -1755,6 +1786,7 @@ impl eframe::App for DawApp {
         self.track_recent(&snap);
         self.handle_shortcuts(ui, &snap);
         self.handle_dropped_files(ui, &snap);
+        self.handle_open_requests(&snap);
 
         let mut commands = self.native_menu_commands(&snap);
         commands.extend(self.clipboard_shortcuts(ui));
@@ -2712,7 +2744,8 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../opentake-project/tests/fixtures/simple.gp")));
         let at: f64 = std::env::var("OPENTAKE_SCREENSHOT_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(8.5);
-        let opts = opentake_engine::GuitarProImport { set_tempo: false, ..Default::default() };
+        let adopt = std::env::var("OPENTAKE_SCREENSHOT_ADOPT").is_ok();
+        let opts = opentake_engine::GuitarProImport { set_tempo: adopt, ..Default::default() };
         let created = engine.lock().unwrap().import_guitar_pro(&fixture, &opts).unwrap();
         engine.lock().unwrap().seek(at).unwrap();
         let pick: usize = std::env::var("OPENTAKE_SCREENSHOT_TRACK").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -2746,6 +2779,32 @@ mod tests {
             e.set_slot_param(0, m, eq::param_id(3, Field::Gain), eq::norm_gain(5.0)).unwrap();
             e.set_slot_param(0, m, eq::param_id(3, Field::Q), eq::norm_q(2.0)).unwrap();
             e.set_slot_param(0, m, eq::param_id(4, Field::Gain), eq::norm_gain(2.0)).unwrap();
+        }
+        // Run some noise through an EQ with the same settings into the slot's analyzer tap.
+        {
+            use opentake_engine::mixer::Processor;
+            let e = engine.lock().unwrap();
+            let tap = e.eq_tap(0, SlotRef::Master(0)).expect("EQ tap");
+            let mut eq = opentake_engine::eq::Eq::with_tap(48_000.0, Some(tap));
+            for &(id, v) in &e.project().master_plugins[0].params {
+                eq.set_param(id, v);
+            }
+            let mut seed = 0x1234_5678u32;
+            let mut brown = 0.0f32;
+            for _ in 0..20 {
+                let x: Vec<f32> = (0..480)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        let white = seed as f32 / u32::MAX as f32 * 2.0 - 1.0;
+                        brown = (brown + white * 0.05).clamp(-1.0, 1.0) * 0.995;
+                        brown * 0.5 + white * 0.05
+                    })
+                    .collect();
+                let (mut l, mut r) = (vec![0.0; 480], vec![0.0; 480]);
+                eq.process(&[&x, &x], &mut [&mut l, &mut r], 480, &Default::default(), &[]);
+            }
         }
         harness.state_mut().bottom = Some(BottomTab::Mixer);
         harness.state_mut().open_plugins = vec![(MASTER_UI, SlotRef::Master(0))];

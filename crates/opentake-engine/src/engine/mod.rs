@@ -937,10 +937,13 @@ impl Engine {
 
     /// Save as Reaper `.rpp` or native `.json`, chosen by extension.
     pub fn save_project(&mut self, path: Option<&Path>) -> Result<PathBuf> {
-        let path = match path {
+        let mut path = match path {
             Some(p) => std::path::absolute(p)?,
             None => self.project_path.clone().ok_or_else(|| anyhow!("project has never been saved; give a path"))?,
         };
+        if path.extension().is_none() {
+            path.set_extension(PROJECT_EXTENSION);
+        }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -1039,6 +1042,15 @@ fn track_params(t: &Track) -> TrackParams {
         monitor: t.monitor_input,
         input_channel: t.input_channel as usize,
     }
+}
+
+/// OpenTake's own project file extension (JSON inside).
+pub const PROJECT_EXTENSION: &str = "otp";
+
+/// Files `load_project` opens: OpenTake projects (`.otp`, or `.json` from earlier versions)
+/// and Reaper projects (`.rpp`).
+pub fn is_project_path(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "otp" | "json" | "rpp"))
 }
 
 fn is_rpp(path: &Path) -> bool {

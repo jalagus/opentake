@@ -11,5 +11,5 @@ pub mod synth;
 
 pub use audio::{AudioConfig, DeviceInfo, DeviceList};
 pub use opentake_project as project;
-pub use engine::{GuitarProImport, GuitarProSummary, inspect_guitar_pro};
+pub use engine::{GuitarProImport, GuitarProSummary, PROJECT_EXTENSION, inspect_guitar_pro, is_project_path};
 pub use engine::{Engine, EngineStatus, HistoryInfo, MidiClipUpdate, ParamView, RegionData, RegionKind, RegionRef, SlotRef, TrackUpdate, Waveform};
