@@ -121,13 +121,31 @@ impl Engine {
     /// tempo marks and tab bars), so bars, grid and metronome match the song. One undo step.
     /// Returns false when there's no song tempo to adopt.
     pub fn adopt_song_tempo(&mut self) -> Result<bool> {
-        // Prefer a region with tab bars (they carry the time signatures).
-        let regions = self.project.tracks.iter().flat_map(|t| &t.midi_clips).filter(|c| !c.tempos.is_empty());
-        let Some(clip) = regions.clone().find(|c| c.tab.is_some()).or_else(|| regions.clone().next()).cloned() else {
+        let Some((position, bpm, sig, changes)) = song_tempo_of(&self.project) else {
             return Ok(false);
         };
+        self.record("Use Song Tempo", None, |e| {
+            if position <= 1e-9 {
+                e.project.tempo_bpm = bpm;
+                e.project.time_signature = sig;
+            }
+            e.project.tempo_changes = changes;
+            let cmd = e.tempo_command();
+            e.send(cmd)
+        })?;
+        Ok(true)
+    }
+}
+
+/// An imported song's tempo map from its regions (tempo marks and tab bars):
+/// (song position, opening tempo, opening signature, changes).
+fn song_tempo_of(project: &opentake_project::Project) -> Option<(f64, f64, (u32, u32), Vec<TempoChange>)> {
+    // Prefer a region with tab bars (they carry the time signatures).
+    let regions = project.tracks.iter().flat_map(|t| &t.midi_clips).filter(|c| !c.tempos.is_empty());
+    let clip = regions.clone().find(|c| c.tab.is_some()).or_else(|| regions.clone().next())?;
+    {
         let mut points: Vec<(f64, Option<f64>, Option<(u32, u32)>)> = clip.tempos.iter().map(|m| (m.start_secs, Some(m.bpm), None)).collect();
-        let mut first_sig = self.project.time_signature;
+        let mut first_sig = project.time_signature;
         if let Some(tab) = &clip.tab {
             let mut prev = None;
             for bar in &tab.bars {
@@ -143,17 +161,25 @@ impl Engine {
         }
         let first_bpm = clip.tempos[0].bpm;
         let (bpm, sig, changes) = tempo_map_from_points(points, first_bpm, first_sig, clip.position_secs);
-        self.record("Use Song Tempo", None, |e| {
-            if clip.position_secs <= 1e-9 {
-                e.project.tempo_bpm = bpm;
-                e.project.time_signature = sig;
-            }
-            e.project.tempo_changes = changes;
-            let cmd = e.tempo_command();
-            e.send(cmd)
-        })?;
-        Ok(true)
+        Some((clip.position_secs, bpm, sig, changes))
     }
+}
+
+/// Projects saved before OpenTake had a tempo map could only adopt a song's opening tempo.
+/// When a loaded project looks like that (no tempo changes, the opening tempo equals a song
+/// region's at the start, and the song has changes), give it the song's whole tempo map.
+/// Returns true when the project was changed.
+pub(super) fn upgrade_song_tempo(project: &mut opentake_project::Project) -> bool {
+    if !project.tempo_changes.is_empty() {
+        return false;
+    }
+    let Some((position, bpm, sig, changes)) = song_tempo_of(project) else { return false };
+    if position > 1e-9 || (bpm - project.tempo_bpm).abs() > 0.05 || changes.is_empty() {
+        return false;
+    }
+    project.time_signature = sig;
+    project.tempo_changes = changes;
+    true
 }
 
 pub fn summarize(score: &Score) -> GuitarProSummary {
@@ -349,6 +375,30 @@ mod tests {
         assert!(!e.song_tempo_differs());
         assert_eq!(e.project().tempo_map().tempo_at(9.0), 60.0);
         assert_eq!(e.history_info().undo.as_deref(), Some("Use Song Tempo"));
+    }
+
+    #[test]
+    fn projects_from_before_the_tempo_map_get_the_song_tempo_on_load() {
+        let dir = std::env::temp_dir().join(format!("opentake-upgrade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Like an old save: the song's opening tempo adopted, no tempo changes.
+        let mut e = Engine::new();
+        e.import_guitar_pro(Path::new(FIXTURE), &GuitarProImport::default()).unwrap();
+        e.set_tempo_changes(Vec::new(), None).unwrap();
+        let old = dir.join("old.otp");
+        e.save_project(Some(&old)).unwrap();
+        let mut fresh = Engine::new();
+        let warnings = fresh.load_project(&old).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("tempo")), "{warnings:?}");
+        assert_eq!(fresh.project().tempo_map().tempo_at(9.0), 60.0);
+        assert!(fresh.history_info().undo.is_none(), "part of loading, not an edit");
+
+        // A project with its own, different tempo is left alone.
+        e.set_tempo(100.0, None).unwrap();
+        e.save_project(Some(&old)).unwrap();
+        fresh.load_project(&old).unwrap();
+        assert!(fresh.project().tempo_changes.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

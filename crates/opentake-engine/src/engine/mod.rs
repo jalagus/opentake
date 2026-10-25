@@ -991,6 +991,9 @@ impl Engine {
             }
         }
 
+        if guitarpro::upgrade_song_tempo(&mut project) {
+            warnings.push("The imported song's tempo changes were added to the project's tempo map".into());
+        }
         for slot in &mut project.master_plugins {
             slot.instance = match self.load_slot(slot) {
                 Ok(instance) => instance,
