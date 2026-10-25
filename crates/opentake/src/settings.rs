@@ -12,6 +12,12 @@ pub struct Settings {
     /// Most recently opened/saved projects, newest first.
     #[serde(default)]
     pub recent_projects: Vec<PathBuf>,
+    /// Notation/tab view size (1.0 = normal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_scale: Option<f32>,
+    /// Notation/tab view on a white page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_paper: Option<bool>,
 }
 
 pub const MAX_RECENT: usize = 10;
@@ -81,7 +87,7 @@ mod tests {
     fn round_trip_and_missing_file() {
         let path = std::env::temp_dir().join(format!("opentake-settings-{}/settings.json", std::process::id()));
         assert_eq!(Settings::load(&path), Settings::default());
-        let s = Settings { plugin_paths: Some(vec!["/tmp/plugs".into()]), recent_projects: vec!["/tmp/a.json".into()] };
+        let s = Settings { plugin_paths: Some(vec!["/tmp/plugs".into()]), recent_projects: vec!["/tmp/a.json".into()], tab_scale: Some(1.5), tab_paper: Some(true) };
         s.save(&path).unwrap();
         assert_eq!(Settings::load(&path), s);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();

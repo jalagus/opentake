@@ -18,18 +18,27 @@ you watch the changes appear live — and undo anything you don't like.
 
 - 🎙️ Multitrack recording from any audio interface (CoreAudio, WASAPI, ALSA/JACK via cpal)
 - 🎹 Instrument tracks, piano roll, a built-in synth and GM drum kit; VST3 instruments and effects
+- 🎛️ Built-in parametric EQ on any track or the master bus, with a draggable curve
+- ⏱️ Project tempo map (tempo and time-signature changes), metronome with count-in
 - ✂️ Region editing: select, move, copy, split, trim, snap, cycle/loop
 - 🎚️ Full mixer, metronome, undo/redo for everything
-- 🤖 MCP server (stdio or HTTP) with 45 tools — the agent and you share one session
+- 🤖 MCP server (stdio or HTTP) with 53 tools — the agent and you share one session
 - 📂 Opens and saves Reaper `.rpp` projects as well as its own `.json` format
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
 - 🦀 Real-time safe audio engine: no locks or allocation on the audio thread
 
 ## Download
 
-Prebuilt binaries for Linux, Windows and macOS (Apple Silicon and Intel) are on the
-[Releases page](https://github.com/jalagus/opentake/releases): the **Nightly build** is
-rebuilt from `main` on every push, and tagged versions (`v*`) get their own release.
+Latest build (rebuilt from `main` on every push):
+
+| Platform | Download |
+|---|---|
+| macOS — Apple Silicon | [opentake-macos-arm64.zip](https://github.com/jalagus/opentake/releases/download/nightly/opentake-macos-arm64.zip) |
+| macOS — Intel | [opentake-macos-x86_64.zip](https://github.com/jalagus/opentake/releases/download/nightly/opentake-macos-x86_64.zip) |
+| Windows (x86_64) | [opentake-windows-x86_64.zip](https://github.com/jalagus/opentake/releases/download/nightly/opentake-windows-x86_64.zip) |
+| Linux (x86_64) | [opentake-linux-x86_64.tar.gz](https://github.com/jalagus/opentake/releases/download/nightly/opentake-linux-x86_64.tar.gz) |
+
+Tagged versions (`v*`) get their own [release](https://github.com/jalagus/opentake/releases).
 
 The builds aren't signed yet:
 
@@ -92,12 +101,21 @@ recording) appears live in the window and vice versa.
   platforms the same menus appear as an in-window menu bar.
 - **Control bar**: inspector toggle on the left; a centered Logic-style transport (go to
   start, back/forward one bar, stop, play, record), an LCD with bar·beat·division, clock
-  time, tempo (drag to change, Shift = fine) and signature — its light pulses on each beat —
+  time, tempo and signature at the playhead (drag the tempo to change that section, Shift =
+  fine) — its light pulses on each beat —
   and the metronome button; audio status, MCP status and audio settings on the right.
-- **Metronome**: click with an accented downbeat that follows tempo and time signature.
+- **Metronome**: click with an accented downbeat that follows the tempo map.
   Toggle with the button next to the LCD, Transport → Metronome or **K**; right-click the
-  button for its volume. It isn't recorded and doesn't go through the master fader;
-  on/off and level are saved with the project.
+  button for its volume and the **count-in** (off, 1, 2 or 4 bars before recording, and
+  optionally before playback — also in the Transport menu). The count-in clicks even with
+  the metronome off, and the display shows COUNT-IN. The click isn't recorded and doesn't
+  go through the master fader; settings are saved with the project.
+- **Tempo map**: the **Tempo** row under the ruler shows the tempo changes. Drag a section
+  up/down to change its tempo (Shift = fine), drag a change sideways to move it, double-click
+  to add one, right-click to type a tempo, set a time signature, add or delete changes. Bars,
+  the grid, snapping, the metronome and plug-ins follow it; time-signature changes appear in
+  the ruler. Region and note times stay in seconds.
+- **Playback** stops by itself after the last region (not while recording or cycling).
 - **Tracks**: numbered headers with the track colour, Logic-style **M S R I** buttons
   (mute, solo, record enable, input monitoring), a volume fader (double-click = 0 dB),
   a pan knob (drag vertically, double-click = center) and a level meter.
@@ -125,7 +143,12 @@ recording) appears live in the window and vice versa.
 - New projects start with one empty audio track.
 - **Inspector** (I): channel strips for the selected track and Stereo Out — input (or
   instrument), Audio FX slots (power = bypass, click name = open plug-in window, × = remove,
-  + = add from scanned VST3s), pan, dB/peak readouts, fader and stereo meter.
+  + = add the built-in EQ or a scanned VST3), pan, dB/peak readouts, fader and stereo meter.
+  Stereo Out has its own Audio FX slots for the master bus.
+- **EQ** (built-in **OpenTake EQ**): low cut, low shelf, two bells, high shelf, high cut and
+  output gain. Its window shows the response curve: drag a band's point to set frequency and
+  gain, scroll on a bell to change its width, double-click a point to switch the band on/off;
+  knobs below for exact values. Each drag is one undo step.
 - **Mixer** (X): every track's channel strip side by side, Stereo Out pinned on the right,
   in the editor area below the tracks.
 - **Instrument tracks & MIDI**: create one from the "+" above the track list or
@@ -139,10 +162,10 @@ recording) appears live in the window and vice versa.
   **OpenTake Drums** kit, a small synthesised GM kit for previewing drum parts). Each Guitar Pro track
   becomes an instrument track with one MIDI region; repeats and alternate endings, tempo
   changes, ties, tuplets, triplet feel, let ring, tremolo picking, grace notes and strums are
-  applied. The song's tempo and time signature can be adopted. One undo step. The song's
-  tempo changes are kept with the regions and shown as **Song Tempo** markings in a ruler
-  row, in the tablature view, and in the transport display (orange "SONG TEMPO") while the
-  song plays — hover the display to see/drag the project tempo.
+  applied. The song's tempo map (tempo and time-signature changes) can be adopted as the
+  project's, so the bars, grid and metronome match the song. One undo step. If you don't
+  adopt it, the song's tempo still shows in the tablature view and in the transport display
+  (orange "SONG TEMPO") while the song plays.
 - **Tablature** (T, or View → Tablature): the imported tabs and/or standard notation (choose
   Tab, Notes or Notes + Tab), under the arrangement and drawn on the same timeline, so you can
   read along while you record or play. Notation is written an octave up (treble 8vb, or bass
@@ -150,7 +173,8 @@ recording) appears live in the window and vice versa.
   signatures and fret numbers line up with the regions and scroll and zoom with them; the
   notes under the playhead light up. Pick the guitar/bass track at the top, click to move the
   playhead. It opens by itself after a Guitar Pro import. Notes you edit in the piano roll
-  are placed on the lowest playable fret.
+  are placed on the lowest playable fret. **A− / A+** change the size and **Paper** shows it
+  as dark ink on a white page; both are remembered.
 - **Piano roll** (P, or double-click a MIDI region): double-click to add a note, drag to
   move (time and pitch), drag the right edge to resize, Shift-click to multi-select,
   drag a rectangle on empty space to select several, ⌘-drag to copy notes, ⌫ deletes notes,
@@ -187,11 +211,12 @@ claude mcp add opentake -- /absolute/path/to/target/release/opentake serve
 ### Tools
 
 `get_status`, `list_audio_devices`, `start_audio`, `stop_audio`, `undo`, `redo`, `get_history`,
-`get_project`, `new_project`, `load_project`, `save_project`, `set_tempo`, `set_master_volume`, `set_metronome`, `set_loop`,
+`get_project`, `new_project`, `load_project`, `save_project`, `set_tempo`, `set_tempo_map`, `get_tempo_map`, `convert_time`,
+`set_master_volume`, `set_metronome`, `set_count_in`, `set_loop`,
 `add_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `remove_clip`,
 `play`, `stop`, `seek`, `record`,
-`scan_plugins`, `insert_plugin`, `remove_plugin`, `set_plugin_bypass`,
-`list_plugin_params`, `set_plugin_param`,
+`scan_plugins`, `insert_plugin`, `remove_plugin`, `insert_master_plugin`, `remove_master_plugin`, `set_plugin_bypass`,
+`list_plugin_params`, `set_plugin_param` (`"eq"` inserts the built-in EQ; `master: true` addresses the master bus),
 `list_instruments`, `add_instrument_track`, `set_instrument`, `list_instrument_params`, `set_instrument_param`,
 `add_midi_clip`, `set_midi_notes`, `add_midi_notes`, `update_midi_clip`, `copy_midi_clip`, `remove_midi_clip`,
 `inspect_guitar_pro`, `import_guitar_pro`.
@@ -203,7 +228,7 @@ Recording: arm a track (`update_track` with `armed: true` and `input_channel`), 
 ## Reaper projects
 
 `load_project`/`save_project` pick the format from the extension (`.rpp` vs `.json`).
-Supported: tempo/time signature, sample rate, master volume, loop range (`LOOP`/`SELECTION`), track name/volume/pan/mute/solo/
+Supported: tempo/time signature and the tempo map (tempo envelope), sample rate, master volume, loop range (`LOOP`/`SELECTION`), track name/volume/pan/mute/solo/
 record-arm/input/monitoring, audio items (position, length, source offset, gain, mute,
 media file) and FX chain references. VST3 plugins in a Reaper project are matched by
 bundle file name and class id/name and loaded if installed.
@@ -220,14 +245,14 @@ back on export, but they aren't applied to the loaded plugin.
 - VST3: no MIDI/instruments yet, no plugin editor windows, and no `IMessage` host
   objects (some plugins need them for processor ↔ controller messaging). Plugin
   parameters are saved by value in our JSON format, but full state chunks aren't saved yet.
-- Plugin parameter values, MIDI regions and the built-in synth are saved in `.json`
-  projects only (`.rpp` export skips them; VST3 instruments are exported).
+- Plugin parameter values, MIDI regions, the built-in synth/drums/EQ and master-bus effects
+  are saved in `.json` projects only (`.rpp` export skips them; VST3 instruments are exported).
 - Guitar Pro: only GP7/8 (`.gp`, `.gpif`); `.gp3`–`.gp5` and `.gpx` are recognised but not
-  imported yet. Bends, slides and vibrato aren't played back (no pitch bend yet); tempo
-  changes inside a song are baked into note timing while the project keeps one tempo.
+  imported yet. Bends, slides and vibrato aren't played back (no pitch bend yet).
   `cargo run -p opentake-project --example gpinfo -- song.gp` prints what the reader sees.
 - MIDI: no MIDI input / recording yet, no CC/pitch-bend; notes are in seconds, so changing
-  the tempo doesn't stretch existing MIDI regions. VST3 instrument hosting is implemented
+  the tempo map doesn't stretch existing regions (they keep their real-time positions).
+- Tempo map: steps only (no gradual tempo ramps); Reaper ramps are imported as steps. VST3 instrument hosting is implemented
   (note events on the event bus) but has only been tested with the built-in synth.
 - GUI: no plugin editor windows (generic parameter sliders instead), no region fades,
   multi-selection or undo yet.

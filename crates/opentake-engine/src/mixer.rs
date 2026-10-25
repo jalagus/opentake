@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use rtrb::{Consumer, Producer};
 
+use opentake_project::TempoMap;
+
 use crate::media::AudioData;
 
 /// Internal processing block size; device buffers are split into chunks of this size.
@@ -18,6 +20,8 @@ pub const PLUGIN_CAPACITY: usize = 32;
 const MIDI_CLIP_CAPACITY: usize = 512;
 const EVENT_CAPACITY: usize = 1024;
 const LIVE_CAPACITY: usize = 128;
+/// Track id addressing the master bus in plug-in commands.
+pub const MASTER: u64 = u64::MAX;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Transport {
@@ -130,7 +134,13 @@ pub enum Command {
     Stop,
     Seek(u64),
     Record(bool),
-    SetTempo(f64, (i32, i32)),
+    /// Replace the tempo map (built off-thread).
+    SetTempoMap(Box<TempoMap>),
+    /// Metronome count-in bars before recording (0 = off), and whether plain playback
+    /// counts in too.
+    SetCountIn { bars: u32, on_play: bool },
+    /// End of the last region (samples); playback stops when it passes it (0 = never).
+    SetSongEnd(u64),
     SetMasterGain(f32),
     SetMetronome { enabled: bool, gain: f32 },
     /// Cycle playback between two sample positions (ignored while recording).
@@ -165,6 +175,7 @@ pub enum Garbage {
     PluginChain(Box<Vec<Box<PluginRt>>>),
     Order(Box<Vec<(u64, bool)>>),
     Ids(Box<Vec<u64>>),
+    TempoMap(Box<TempoMap>),
 }
 
 /// State the audio thread publishes for the control side.
@@ -179,6 +190,8 @@ pub struct SharedState {
     /// Peak level since last read, per track in mixer order (f32 bits).
     pub track_peaks: Vec<AtomicU32>,
     pub master_peak: [AtomicU32; 2],
+    /// Counting in before playback/recording starts.
+    pub counting_in: AtomicBool,
 }
 
 impl SharedState {
@@ -191,6 +204,7 @@ impl SharedState {
             record_overruns: AtomicU64::new(0),
             track_peaks: (0..MAX_TRACKS).map(|_| AtomicU32::new(0)).collect(),
             master_peak: [AtomicU32::new(0), AtomicU32::new(0)],
+            counting_in: AtomicBool::new(false),
         }
     }
 
@@ -221,6 +235,12 @@ pub struct Mixer {
     transport: Transport,
     master_gain: f32,
     metronome: Metronome,
+    tempo: Box<TempoMap>,
+    count_in: CountInSettings,
+    counting: Option<CountIn>,
+    song_end: u64,
+    master_plugins: Vec<Box<PluginRt>>,
+    sample_rate: f64,
     loop_range: Option<(u64, u64)>,
     input: Vec<Vec<f32>>,
     master: [Vec<f32>; 2],
@@ -249,6 +269,12 @@ impl Mixer {
             shared,
             master_gain: 1.0,
             metronome: Metronome::new(sample_rate),
+            tempo: Box::new(TempoMap::new(120.0, (4, 4), &[])),
+            count_in: CountInSettings::default(),
+            counting: None,
+            song_end: 0,
+            master_plugins: Vec::with_capacity(PLUGIN_CAPACITY),
+            sample_rate: sample_rate.max(1) as f64,
             loop_range: None,
             input: (0..MAX_INPUT_CHANNELS).map(|_| vec![0.0; MAX_BLOCK]).collect(),
             master: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
@@ -285,6 +311,22 @@ impl Mixer {
         }
     }
 
+    fn plugin_mut(&mut self, track: u64, instance: u64) -> Option<&mut Box<PluginRt>> {
+        if track == MASTER {
+            return self.master_plugins.iter_mut().find(|p| p.instance == instance);
+        }
+        self.track_mut(track).and_then(|t| t.plugin_mut(instance))
+    }
+
+    /// Start counting in: the bars at the tempo and signature at the playhead.
+    fn start_count_in(&mut self, then_record: bool) {
+        let secs = self.transport.position_samples.max(0) as f64 / self.sample_rate;
+        let seg = *self.tempo.segment_at(secs);
+        let beat = self.sample_rate * 60.0 / seg.bpm * seg.beat_len_q();
+        let total = (beat * seg.sig.0 as f64 * self.count_in.bars as f64).round() as u64;
+        self.counting = Some(CountIn { total, done: 0, beat, num: seg.sig.0, then_record });
+    }
+
     fn track_mut(&mut self, id: u64) -> Option<&mut TrackRt> {
         self.tracks.iter_mut().find(|t| t.id == id).map(|t| &mut **t)
     }
@@ -292,15 +334,31 @@ impl Mixer {
     fn handle_commands(&mut self) {
         while let Ok(cmd) = self.commands.pop() {
             match cmd {
-                Command::Play => self.transport.playing = true,
+                Command::Play => {
+                    if !self.transport.playing && self.counting.is_none() && self.count_in.on_play && self.count_in.bars > 0 {
+                        self.start_count_in(false);
+                    } else if self.counting.is_none() {
+                        self.transport.playing = true;
+                    }
+                }
                 Command::Stop => {
                     self.transport.playing = false;
                     self.transport.recording = false;
+                    self.counting = None;
                     self.flush_all_notes();
                 }
                 Command::Seek(pos) => {
                     self.transport.position_samples = pos as i64;
                     self.flush_all_notes();
+                }
+                // Recording from a stop counts in first (if set); punching in while playing doesn't.
+                Command::Record(true) if !self.transport.playing && self.count_in.bars > 0 => {
+                    if self.counting.is_none() {
+                        self.flush_all_notes();
+                        self.start_count_in(true);
+                    } else if let Some(c) = &mut self.counting {
+                        c.then_record = true;
+                    }
                 }
                 Command::Record(on) => {
                     self.flush_all_notes();
@@ -320,10 +378,12 @@ impl Mixer {
                     self.metronome.enabled = enabled;
                     self.metronome.gain = gain;
                 }
-                Command::SetTempo(bpm, sig) => {
-                    self.transport.tempo_bpm = bpm;
-                    self.transport.time_sig = sig;
+                Command::SetTempoMap(mut map) => {
+                    std::mem::swap(&mut self.tempo, &mut map);
+                    self.discard(Garbage::TempoMap(map));
                 }
+                Command::SetCountIn { bars, on_play } => self.count_in = CountInSettings { bars, on_play },
+                Command::SetSongEnd(end) => self.song_end = end,
                 Command::AddTrack(t) => {
                     if self.tracks.len() < MAX_TRACKS {
                         self.tracks.push(t);
@@ -367,10 +427,11 @@ impl Mixer {
                     self.discard(Garbage::Midi(clips));
                 }
                 Command::SetPluginChain { track, order, mut new, mut target } => {
-                    if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track) {
+                    let chain = if track == MASTER { Some(&mut self.master_plugins) } else { self.tracks.iter_mut().find(|t| t.id == track).map(|t| &mut t.plugins) };
+                    if let Some(plugins) = chain {
                         for &(instance, bypass) in order.iter() {
-                            let found = match t.plugins.iter().position(|p| p.instance == instance) {
-                                Some(i) => Some(t.plugins.remove(i)),
+                            let found = match plugins.iter().position(|p| p.instance == instance) {
+                                Some(i) => Some(plugins.remove(i)),
                                 None => new.iter().position(|p| p.instance == instance).map(|i| new.swap_remove(i)),
                             };
                             if let Some(mut p) = found {
@@ -383,7 +444,7 @@ impl Mixer {
                             }
                         }
                         // `target` now receives whatever was removed from the chain.
-                        std::mem::swap(&mut t.plugins, &mut *target);
+                        std::mem::swap(plugins, &mut *target);
                     }
                     self.discard(Garbage::PluginChain(target));
                     self.discard(Garbage::PluginChain(new));
@@ -402,12 +463,12 @@ impl Mixer {
                     }
                 }
                 Command::SetPluginBypass { track, instance, bypass } => {
-                    if let Some(p) = self.track_mut(track).and_then(|t| t.plugin_mut(instance)) {
+                    if let Some(p) = self.plugin_mut(track, instance) {
                         p.bypass = bypass;
                     }
                 }
                 Command::SetPluginParam { track, instance, id, value } => {
-                    if let Some(p) = self.track_mut(track).and_then(|t| t.plugin_mut(instance)) {
+                    if let Some(p) = self.plugin_mut(track, instance) {
                         p.processor.set_param(id, value);
                     }
                 }
@@ -434,6 +495,10 @@ impl Mixer {
         let mut done = 0;
         while done < frames {
             let mut n = (frames - done).min(MAX_BLOCK);
+            // End the block exactly where a count-in finishes, so playback starts on time.
+            if let Some(c) = &self.counting {
+                n = n.min((c.total - c.done) as usize).max(1);
+            }
             // End the block exactly at the loop end so the wrap is sample-accurate.
             let loop_range = self.active_loop();
             if let Some((_, end)) = loop_range {
@@ -449,8 +514,16 @@ impl Mixer {
                 &[]
             };
             let out_chunk = &mut output[done * out_channels..(done + n) * out_channels];
+            let before = self.transport.position_samples.max(0) as u64;
             self.process_block(in_chunk, in_channels, out_chunk, out_channels, n);
             done += n;
+            // Plain playback stops when it runs past the last region (not while recording
+            // or cycling).
+            let after = self.transport.position_samples.max(0) as u64;
+            if self.song_end > 0 && self.transport.playing && !self.transport.recording && loop_range.is_none() && before < self.song_end && after >= self.song_end {
+                self.transport.playing = false;
+                self.flush_all_notes();
+            }
             if let Some((start, end)) = loop_range {
                 let pos = self.transport.position_samples.max(0) as u64;
                 if pos >= end && pos - n as u64 <= end {
@@ -460,6 +533,7 @@ impl Mixer {
             }
         }
         self.shared.position.store(self.transport.position_samples.max(0) as u64, Ordering::Relaxed);
+        self.shared.counting_in.store(self.counting.is_some(), Ordering::Relaxed);
         self.shared.playing.store(self.transport.playing, Ordering::Relaxed);
         self.shared.recording.store(self.transport.recording, Ordering::Relaxed);
     }
@@ -492,6 +566,10 @@ impl Mixer {
         for m in &mut self.master {
             m[..n].fill(0.0);
         }
+        // Plug-ins see the tempo and signature at the block start.
+        let seg = *self.tempo.segment_at(self.transport.position_samples.max(0) as f64 / self.sample_rate);
+        self.transport.tempo_bpm = seg.bpm;
+        self.transport.time_sig = (seg.sig.0 as i32, seg.sig.1 as i32);
         let any_solo = self.tracks.iter().any(|t| t.params.solo);
         let pos = self.transport.position_samples.max(0) as u64;
 
@@ -568,6 +646,18 @@ impl Mixer {
             update_peak(&self.shared.track_peaks[ti], peak);
         }
 
+        // Master inserts, then the master fader.
+        for plugin in self.master_plugins.iter_mut().filter(|p| !p.bypass) {
+            let [sl, sr] = &mut self.scratch;
+            {
+                let [ml, mr] = &self.master;
+                let inputs: [&[f32]; 2] = [&ml[..n], &mr[..n]];
+                let mut outputs: [&mut [f32]; 2] = [&mut sl[..n], &mut sr[..n]];
+                plugin.processor.process(&inputs, &mut outputs, n, &self.transport, &[]);
+            }
+            self.master[0][..n].copy_from_slice(&sl[..n]);
+            self.master[1][..n].copy_from_slice(&sr[..n]);
+        }
         for (ch, m) in self.master.iter_mut().enumerate() {
             for s in &mut m[..n] {
                 *s *= self.master_gain;
@@ -580,9 +670,18 @@ impl Mixer {
         // not metered, never recorded.
         if self.transport.playing && self.metronome.enabled {
             let pos = self.transport.position_samples.max(0);
-            let (bpm, sig) = (self.transport.tempo_bpm, self.transport.time_sig);
             let [l, r] = &mut self.master;
-            self.metronome.render(pos, bpm, sig, &mut l[..n], &mut r[..n]);
+            self.metronome.render(pos, &self.tempo, &mut l[..n], &mut r[..n]);
+        }
+        // Count-in clicks play whether or not the metronome is on.
+        let mut count_in_done = None;
+        if let Some(c) = &mut self.counting {
+            let [l, r] = &mut self.master;
+            self.metronome.render_count_in(c, &mut l[..n], &mut r[..n]);
+            c.done += n as u64;
+            if c.done >= c.total {
+                count_in_done = Some(c.then_record);
+            }
         }
 
         for (i, frame) in output.chunks_exact_mut(out_channels).enumerate() {
@@ -600,6 +699,15 @@ impl Mixer {
 
         if self.transport.playing {
             self.transport.position_samples += n as i64;
+        }
+        // Start after this block, so playback begins exactly where the count-in ends.
+        if let Some(record) = count_in_done {
+            self.counting = None;
+            self.transport.playing = true;
+            if record {
+                self.shared.record_start.store(self.transport.position_samples.max(0) as u64, Ordering::Relaxed);
+                self.transport.recording = true;
+            }
         }
     }
 }
@@ -676,6 +784,22 @@ fn collect_events(
 
 /// Click generator. The two click sounds are rendered once at construction (off the
 /// audio thread); playback is a table lookup per sample.
+#[derive(Debug, Clone, Copy, Default)]
+struct CountInSettings {
+    bars: u32,
+    on_play: bool,
+}
+
+/// A count-in in progress (samples).
+#[derive(Debug, Clone, Copy)]
+struct CountIn {
+    total: u64,
+    done: u64,
+    beat: f64,
+    num: u32,
+    then_record: bool,
+}
+
 struct Metronome {
     enabled: bool,
     gain: f32,
@@ -700,18 +824,49 @@ impl Metronome {
         Self { enabled: false, gain: 0.5, sample_rate: sr, accent: click(1760.0, 1.0), normal: click(1320.0, 0.7) }
     }
 
-    /// Add clicks for the block starting at timeline sample `pos`.
-    fn render(&self, pos: i64, bpm: f64, (num, den): (i32, i32), l: &mut [f32], r: &mut [f32]) {
-        let beat = self.sample_rate * 60.0 / bpm.max(1.0) * 4.0 / den.max(1) as f64;
+    /// Add clicks for the block starting at timeline sample `pos`, following the tempo map
+    /// (accent on each bar's first beat).
+    fn render(&self, pos: i64, map: &TempoMap, l: &mut [f32], r: &mut [f32]) {
+        let segments = map.segments();
+        let sr = self.sample_rate;
+        let mut si = segments.partition_point(|s| s.start_secs * sr <= pos as f64).saturating_sub(1);
         for (i, (a, b)) in l.iter_mut().zip(r.iter_mut()).enumerate() {
-            let s = (pos + i as i64) as f64;
-            let index = (s / beat).floor();
-            let phase = (s - index * beat) as usize;
-            let table = if (index as i64).rem_euclid(num.max(1) as i64) == 0 { &self.accent } else { &self.normal };
+            let secs = (pos + i as i64) as f64 / sr;
+            while si + 1 < segments.len() && segments[si + 1].start_secs <= secs {
+                si += 1;
+            }
+            let seg = &segments[si];
+            let q = seg.start_q + (secs - seg.start_secs) * seg.bpm / 60.0;
+            let beat_q = seg.beat_len_q();
+            let k = ((q - seg.bar_q) / beat_q + 1e-9).floor();
+            let beat_start = seg.bar_q + k * beat_q;
+            // Only beats that start inside this segment (a tempo change mid-beat skips one).
+            if beat_start + 1e-9 < seg.start_q {
+                continue;
+            }
+            let phase = ((q - beat_start) * 60.0 / seg.bpm * sr) as usize;
+            let table = if (k as i64).rem_euclid(seg.sig.0.max(1) as i64) == 0 { &self.accent } else { &self.normal };
             if let Some(&v) = table.get(phase) {
                 let v = v * self.gain;
                 *a += v;
                 *b += v;
+            }
+        }
+    }
+
+    fn render_count_in(&self, c: &CountIn, l: &mut [f32], r: &mut [f32]) {
+        let gain = self.gain.max(0.35);
+        for (i, (a, b)) in l.iter_mut().zip(r.iter_mut()).enumerate() {
+            let s = (c.done + i as u64) as f64;
+            if s >= c.total as f64 {
+                break;
+            }
+            let k = (s / c.beat).floor();
+            let phase = (s - k * c.beat) as usize;
+            let table = if (k as i64).rem_euclid(c.num.max(1) as i64) == 0 { &self.accent } else { &self.normal };
+            if let Some(&v) = table.get(phase) {
+                *a += v * gain;
+                *b += v * gain;
             }
         }
     }
@@ -775,7 +930,7 @@ mod tests {
     #[test]
     fn metronome_clicks_on_beats_only_when_enabled_and_playing() {
         let (mut m, mut tx, _g, _s) = mixer();
-        tx.push(Command::SetTempo(120.0, (4, 4))).ok(); // beat = 24000 samples
+        tx.push(Command::SetTempoMap(Box::new(TempoMap::new(120.0, (4, 4), &[])))).ok(); // beat = 24000 samples
         tx.push(Command::SetMetronome { enabled: true, gain: 1.0 }).ok();
         let mut out = vec![0.0; 2 * 512];
         m.process(&[], 0, &mut out, 2);
@@ -797,6 +952,123 @@ mod tests {
         tx.push(Command::Seek(0)).ok();
         m.process(&[], 0, &mut out, 2);
         assert!(out.iter().all(|&s| s == 0.0), "no click when disabled");
+    }
+
+    /// Run `blocks` blocks of 480 frames, returning the left channel.
+    fn run(m: &mut Mixer, blocks: usize) -> Vec<f32> {
+        let mut all = Vec::new();
+        let mut out = vec![0.0; 2 * 480];
+        for _ in 0..blocks {
+            m.process(&[], 0, &mut out, 2);
+            all.extend(out.chunks(2).map(|f| f[0]));
+        }
+        all
+    }
+
+    fn click_at(signal: &[f32], sample: usize) -> bool {
+        signal[sample..(sample + 200).min(signal.len())].iter().any(|s| s.abs() > 0.05)
+    }
+
+    #[test]
+    fn metronome_follows_the_tempo_map() {
+        let (mut m, mut tx, _g, _s) = mixer();
+        // 120 bpm (24000-sample beats), then 60 bpm from 1 s (48000-sample beats).
+        let map = TempoMap::new(120.0, (4, 4), &[opentake_project::TempoChange { at_secs: 1.0, bpm: 60.0, time_signature: None }]);
+        tx.push(Command::SetTempoMap(Box::new(map))).ok();
+        tx.push(Command::SetMetronome { enabled: true, gain: 1.0 }).ok();
+        tx.push(Command::Play).ok();
+        let s = run(&mut m, 250); // 2.5 s
+        for beat in [0, 24_000, 48_000, 96_000] {
+            assert!(click_at(&s, beat), "click at {beat}");
+        }
+        assert!(!click_at(&s, 72_000), "no click at the old tempo's beat after the change");
+    }
+
+    #[test]
+    fn count_in_before_recording_then_records_from_the_playhead() {
+        let (mut m, mut tx, _g, shared) = mixer();
+        tx.push(Command::SetTempoMap(Box::new(TempoMap::new(120.0, (4, 4), &[])))).ok();
+        tx.push(Command::SetCountIn { bars: 1, on_play: false }).ok();
+        tx.push(Command::Seek(48_000)).ok();
+        tx.push(Command::Record(true)).ok();
+        // One 4/4 bar at 120 bpm = 2 s = 96000 samples of clicks, metronome off or not.
+        let s = run(&mut m, 100);
+        assert!(shared.counting_in.load(Ordering::Relaxed));
+        assert!(!shared.recording.load(Ordering::Relaxed));
+        assert_eq!(shared.position.load(Ordering::Relaxed), 48_000, "the playhead waits during the count-in");
+        assert!(click_at(&s, 0) && click_at(&s, 24_000), "count-in clicks");
+        run(&mut m, 101);
+        assert!(!shared.counting_in.load(Ordering::Relaxed));
+        assert!(shared.recording.load(Ordering::Relaxed) && shared.playing.load(Ordering::Relaxed));
+        assert_eq!(shared.record_start.load(Ordering::Relaxed), 48_000);
+        assert_eq!(shared.position.load(Ordering::Relaxed), 48_000 + (201 * 480 - 96_000) as u64, "starts exactly when the count-in ends");
+
+        // Punching in while playing doesn't count in; plain play only counts in if asked to.
+        tx.push(Command::Stop).ok();
+        tx.push(Command::Play).ok();
+        run(&mut m, 1);
+        assert!(shared.playing.load(Ordering::Relaxed) && !shared.counting_in.load(Ordering::Relaxed));
+        tx.push(Command::Record(true)).ok();
+        run(&mut m, 1);
+        assert!(shared.recording.load(Ordering::Relaxed));
+        tx.push(Command::Stop).ok();
+        tx.push(Command::SetCountIn { bars: 1, on_play: true }).ok();
+        tx.push(Command::Play).ok();
+        run(&mut m, 1);
+        assert!(shared.counting_in.load(Ordering::Relaxed) && !shared.playing.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn playback_stops_at_the_song_end_but_not_while_recording_or_cycling() {
+        let (mut m, mut tx, _g, shared) = mixer();
+        tx.push(Command::SetSongEnd(10_000)).ok();
+        tx.push(Command::Play).ok();
+        run(&mut m, 30); // 14400 samples
+        assert!(!shared.playing.load(Ordering::Relaxed), "stopped after the end");
+        assert!((10_000..10_000 + 480).contains(&shared.position.load(Ordering::Relaxed)));
+        // Starting beyond the end (e.g. to hear the metronome) keeps playing.
+        tx.push(Command::Play).ok();
+        run(&mut m, 5);
+        assert!(shared.playing.load(Ordering::Relaxed));
+        // Recording runs past the end.
+        tx.push(Command::Stop).ok();
+        tx.push(Command::Seek(0)).ok();
+        tx.push(Command::Record(true)).ok();
+        run(&mut m, 30);
+        assert!(shared.recording.load(Ordering::Relaxed));
+    }
+
+    struct Gain(f32);
+
+    impl Processor for Gain {
+        fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, _: &Transport, _: &[MidiEvent]) {
+            for ch in 0..2 {
+                for i in 0..frames {
+                    outputs[ch][i] = inputs[ch][i] * self.0;
+                }
+            }
+        }
+        fn set_param(&mut self, _: u32, v: f64) {
+            self.0 = v as f32;
+        }
+    }
+
+    #[test]
+    fn master_inserts_process_the_master_bus() {
+        let (mut m, mut tx, _g, _s) = mixer();
+        tx.push(Command::AddTrack(Box::new(TrackRt::new(1, TrackParams { monitor: true, ..params() })))).ok();
+        let plugin = Box::new(PluginRt { instance: 7, processor: Box::new(Gain(0.5)), bypass: false });
+        tx.push(Command::SetPluginChain { track: MASTER, order: Box::new(vec![(7, false)]), new: Box::new(vec![plugin]), target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)) }).ok();
+        let input = vec![0.8f32; 64];
+        let mut out = vec![0.0; 64];
+        m.process(&input, 1, &mut out, 2);
+        assert!((out[0] - 0.4).abs() < 1e-6, "{}", out[0]);
+        tx.push(Command::SetPluginParam { track: MASTER, instance: 7, id: 0, value: 0.25 }).ok();
+        m.process(&input, 1, &mut out, 2);
+        assert!((out[0] - 0.2).abs() < 1e-6);
+        tx.push(Command::SetPluginBypass { track: MASTER, instance: 7, bypass: true }).ok();
+        m.process(&input, 1, &mut out, 2);
+        assert!((out[0] - 0.8).abs() < 1e-6);
     }
 
     /// Records the events an instrument receives.

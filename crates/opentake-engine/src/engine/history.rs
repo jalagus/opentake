@@ -54,7 +54,7 @@ fn slots(t: &Track) -> impl Iterator<Item = &PluginSlot> {
 }
 
 fn instances(p: &Project) -> impl Iterator<Item = u64> + '_ {
-    p.tracks.iter().flat_map(slots).map(|s| s.instance).filter(|&i| i != 0)
+    p.tracks.iter().flat_map(slots).chain(&p.master_plugins).map(|s| s.instance).filter(|&i| i != 0)
 }
 
 fn chain_signature(t: &Track) -> Vec<(u64, bool)> {
@@ -88,6 +88,7 @@ impl Engine {
                         }
                     }
                     self.history.redo.clear();
+                    self.sync_song_end()?;
                 }
                 Ok(v)
             }
@@ -146,6 +147,8 @@ impl Engine {
         target.loop_enabled = self.project.loop_enabled;
         target.loop_start_secs = self.project.loop_start_secs;
         target.loop_end_secs = self.project.loop_end_secs;
+        target.count_in_bars = self.project.count_in_bars;
+        target.count_in_on_play = self.project.count_in_on_play;
         target.sample_rate = self.project.sample_rate;
         let old = std::mem::replace(&mut self.project, target);
 
@@ -212,13 +215,33 @@ impl Engine {
         if added || old_ids != new_ids {
             self.send(Command::ReorderTracks(Box::new(new_ids)))?;
         }
-        if (old.tempo_bpm, old.time_signature) != (self.project.tempo_bpm, self.project.time_signature) {
+        // Master inserts: parameter values and the chain.
+        for slot in self.project.master_plugins.clone() {
+            let old_slot = old.master_plugins.iter().find(|s| s.instance == slot.instance);
+            for &(id, value) in &slot.params {
+                if old_slot.and_then(|s| s.params.iter().find(|p| p.0 == id)).map(|p| p.1) == Some(value) {
+                    continue;
+                }
+                if let Some(Loaded::Vst3(plugin)) = self.pool.get(&slot.instance) {
+                    plugin.set_param_on_controller(id, value);
+                }
+                if old_slot.is_some() {
+                    self.send(Command::SetPluginParam { track: crate::mixer::MASTER, instance: slot.instance, id, value })?;
+                }
+            }
+        }
+        let master_sig = |p: &Project| p.master_plugins.iter().map(|s| (s.instance, s.bypass)).collect::<Vec<_>>();
+        if master_sig(&old) != master_sig(&self.project) {
+            self.sync_master_chain()?;
+        }
+        if (old.tempo_bpm, old.time_signature, &old.tempo_changes) != (self.project.tempo_bpm, self.project.time_signature, &self.project.tempo_changes) {
             let cmd = self.tempo_command();
             self.send(cmd)?;
         }
         if old.master_volume != self.project.master_volume {
             self.send(Command::SetMasterGain(self.project.master_volume))?;
         }
+        self.sync_song_end()?;
         Ok(())
     }
 }
@@ -227,6 +250,37 @@ impl Engine {
 mod tests {
     use super::super::tests::tone_file;
     use super::super::{Engine, TrackUpdate};
+
+    #[test]
+    fn tempo_changes_and_master_eq_are_undoable_but_count_in_is_not() {
+        use crate::eq::{self, Field};
+        use opentake_project::TempoChange;
+        let mut e = Engine::new();
+        let change = TempoChange { at_secs: 4.0, bpm: 90.0, time_signature: Some((3, 4)) };
+        e.set_tempo_changes(vec![change], None).unwrap();
+        assert_eq!(e.project().tempo_map().tempo_at(5.0), 90.0);
+        assert!(e.set_tempo_changes(vec![TempoChange { at_secs: 0.0, ..change }], None).is_err(), "changes come after the start");
+        assert!(e.set_tempo_changes(vec![TempoChange { time_signature: Some((5, 3)), ..change }], None).is_err());
+
+        e.insert_master_plugin("eq", None).unwrap();
+        assert_eq!(e.project().master_plugins[0].name, eq::NAME);
+        let gain = eq::param_id(2, Field::Gain);
+        e.set_slot_param(0, super::super::SlotRef::Master(0), gain, eq::norm_gain(6.0)).unwrap();
+        let params = e.slot_params(0, super::super::SlotRef::Master(0)).unwrap();
+        assert_eq!(params.iter().find(|p| p.id == gain).and_then(|p| p.display.clone()).as_deref(), Some("+6.0"));
+        e.set_count_in(Some(2), Some(true)).unwrap();
+
+        e.undo().unwrap(); // EQ gain
+        e.undo().unwrap(); // EQ insert
+        assert!(e.project().master_plugins.is_empty());
+        e.undo().unwrap(); // tempo change
+        assert!(e.project().tempo_changes.is_empty());
+        assert_eq!((e.project().count_in_bars, e.project().count_in_on_play), (2, true), "count-in is a setting, not an edit");
+        e.redo().unwrap();
+        e.redo().unwrap();
+        assert_eq!(e.project().tempo_changes, vec![change]);
+        assert_eq!(e.project().master_plugins.len(), 1);
+    }
 
     #[test]
     fn undo_redo_track_and_clip_edits() {

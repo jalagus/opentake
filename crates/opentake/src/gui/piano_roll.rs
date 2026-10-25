@@ -4,7 +4,7 @@ use opentake_engine::project::{MidiClip, Note, Project};
 use eframe::egui;
 use egui::{Align, Align2, Color32, CursorIcon, FontId, Layout, Pos2, Rangef, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
 
-use super::timeline::{self, bar_secs, beat_secs, grid_secs, snap_to};
+use super::timeline::{self, grid_at, grid_step_secs, snap_to};
 use super::widgets;
 use super::{Action, DawApp, Snapshot, theme};
 
@@ -198,7 +198,7 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
         p.text(gutter.min + vec2(18.0, 26.0), Align2::LEFT_TOP, &clip.name, FontId::proportional(10.5), theme::TEXT_FAINT);
     }
     draw_background(ui, &geo, clip, project, app);
-    draw_ruler(ui, &geo, ruler, clip, project);
+    draw_ruler(ui, &app.view, ruler, project);
     let grid_resp = ui.interact(grid, ui.make_persistent_id(("piano_grid", track, ci)), Sense::click_and_drag());
     widgets::label(&grid_resp, egui::Role::Group, "Piano Roll Grid");
     notes_interaction(app, ui, &geo, &grid_resp, track, ci, clip, project, color);
@@ -241,14 +241,15 @@ fn toolbar_ui(app: &mut DawApp, ui: &mut egui::Ui, rect: Rect, track: usize, ci:
             app.act(Action::SetNotes { track, clip: ci, notes });
         }
 
-        let grid = grid_secs(app.snap_mode, project, app.view.px_per_sec);
+        let map = project.tempo_map();
+        let grid = grid_at(app.snap_mode, &map, clip.position_secs, app.view.px_per_sec);
         let quantize = ui.add_enabled(grid.is_some(), egui::Button::new("Quantize")).on_hover_text("Snap note starts to the grid (selected notes, or all)");
         if quantize.clicked() {
             if let Some(g) = grid {
                 let all = app.piano.selected.is_empty();
                 let q = |n: &Note| {
                     let abs = clip.position_secs + n.start_secs;
-                    Note { start_secs: (((abs / g).round() * g) - clip.position_secs).max(0.0), ..*n }
+                    Note { start_secs: (map.snap(abs, g) - clip.position_secs).max(0.0), ..*n }
                 };
                 let notes: Vec<Note> = clip.notes.iter().map(|n| if all || app.piano.selected.contains(n) { q(n) } else { *n }).collect();
                 app.piano.selected.clear();
@@ -274,25 +275,22 @@ fn handle_scroll_zoom(app: &mut DawApp, ui: &egui::Ui, body: Rect) {
     app.view.handle_zoom_scroll(ui, body);
 }
 
-/// Bar numbers (project bars, so they match the arrangement) above the grid.
-fn draw_ruler(ui: &egui::Ui, geo: &Geo, rect: Rect, clip: &MidiClip, project: &Project) {
+/// Bar numbers and beat ticks (project bars, so they match the arrangement) above the grid.
+/// The grid shares the arrangement's time axis, so the timeline's tempo-map helpers apply.
+fn draw_ruler(ui: &egui::Ui, view: &timeline::View, rect: Rect, project: &Project) {
     let p = ui.painter().with_clip_rect(rect);
     p.rect_filled(rect, 0.0, theme::BG_HEADER);
-    let (bar, beat) = (bar_secs(project), beat_secs(project));
-    let t0 = clip.position_secs + geo.start;
-    let t1 = clip.position_secs + geo.t_of(rect.right());
-    let mut k = (t0 / beat).floor() as i64;
-    while (k as f64) * beat <= t1 {
-        let t = k as f64 * beat;
-        let x = geo.x_of(t - clip.position_secs);
-        let beats_per_bar = (bar / beat).round().max(1.0) as i64;
-        if k.rem_euclid(beats_per_bar) == 0 {
-            p.vline(x, Rangef::new(rect.top() + 4.0, rect.bottom()), Stroke::new(1.0, theme::TEXT_FAINT));
-            p.text(pos2(x + 3.0, rect.top() + 2.0), Align2::LEFT_TOP, (k / beats_per_bar + 1).to_string(), FontId::proportional(10.0), theme::TEXT_DIM);
-        } else if beat * geo.px_per_sec as f64 >= 12.0 {
+    let map = project.tempo_map();
+    let (bars, step) = timeline::visible_bars(view, &map);
+    if step == 1 {
+        timeline::lines_in_bars(&bars, &map, view, 12.0, |b| opentake_engine::project::tempo::beat_len_q(b.sig), |x| {
             p.vline(x, Rangef::new(rect.bottom() - 4.0, rect.bottom()), Stroke::new(1.0, theme::HAIRLINE));
-        }
-        k += 1;
+        });
+    }
+    for b in bars.iter().filter(|b| b.index % step == 0 || b.sig_change) {
+        let x = view.x(b.secs);
+        p.vline(x, Rangef::new(rect.top() + 4.0, rect.bottom()), Stroke::new(1.0, theme::TEXT_FAINT));
+        p.text(pos2(x + 3.0, rect.top() + 2.0), Align2::LEFT_TOP, (b.index + 1).to_string(), FontId::proportional(10.0), theme::TEXT_DIM);
     }
     p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
 }
@@ -314,25 +312,11 @@ fn draw_background(ui: &egui::Ui, geo: &Geo, clip: &MidiClip, project: &Project,
             p.hline(g.x_range(), y + geo.key_h, Stroke::new(1.0, theme::GRID_BAR));
         }
     }
-    // Vertical grid aligned to the project's bars (absolute time).
-    let (bar, beat) = (bar_secs(project), beat_secs(project));
-    let sub = grid_secs(app.snap_mode, project, geo.px_per_sec).filter(|&s| s < beat - 1e-9);
-    let t0 = clip.position_secs + geo.start;
-    let t1 = clip.position_secs + geo.t_of(g.right());
-    let lines = |step: f64, color: Color32, min_px: f32| {
-        if step * geo.px_per_sec as f64 >= min_px as f64 {
-            let mut k = (t0 / step).floor() as i64;
-            while (k as f64) * step <= t1 {
-                p.vline(geo.x_of(k as f64 * step - clip.position_secs), g.y_range(), Stroke::new(1.0, color));
-                k += 1;
-            }
-        }
-    };
-    if let Some(s) = sub {
-        lines(s, theme::GRID_SUB, 8.0);
-    }
-    lines(beat, theme::GRID_BEAT, 10.0);
-    lines(bar, theme::GRID_BAR, 0.0);
+    // Vertical grid: the project's bars and beats (tempo map), as in the arrangement.
+    let map = project.tempo_map();
+    let mid = app.view.start + ((g.center().x - g.left()) / app.view.px_per_sec) as f64;
+    let grid = grid_at(app.snap_mode, &map, mid, geo.px_per_sec);
+    timeline::draw_grid(&p, g, &app.view, &map, grid);
     // Shade outside the region.
     let end_x = geo.x_of(clip.length_secs);
     if end_x < g.right() {
@@ -381,7 +365,9 @@ fn notes_interaction(
         if let Some(p) = pointer.filter(|p| hit(*p).is_none()) {
             let t = snap(app, ui, geo.t_of(p.x)).max(0.0);
             if t < clip.length_secs {
-                let len = grid_secs(app.snap_mode, project, geo.px_per_sec).unwrap_or(beat_secs(project) / 4.0);
+                let map = project.tempo_map();
+                let at = clip.position_secs + t;
+                let len = grid_at(app.snap_mode, &map, at, geo.px_per_sec).map_or(map.beat_secs_at(at) / 4.0, |g| grid_step_secs(g, &map, at));
                 let pitch = geo.pitch_at(p.y).clamp(0, 127) as u8;
                 let note = Note { start_secs: t, length_secs: len.min(clip.length_secs - t).max(0.01), pitch, velocity: app.piano.velocity, tab: None };
                 let mut notes = clip.notes.clone();

@@ -7,7 +7,7 @@ use eframe::egui;
 use egui::{Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, vec2};
 
 use super::widgets::{self, Icon};
-use super::{Action, DawApp, Snapshot, short_plugin_name, theme};
+use super::{Action, DawApp, MASTER_UI, Snapshot, short_plugin_name, theme};
 
 /// Strip geometry.
 #[derive(Clone, Copy)]
@@ -131,7 +131,16 @@ pub fn master_strip(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot, layout
     widgets::section(ui, "Output");
     ui.add_sized([w, 20.0], egui::Label::new(RichText::new("Stereo Out").color(theme::TEXT_DIM)));
     widgets::section(ui, "Audio FX");
-    ui.allocate_exact_size(vec2(w, layout.fx_height), Sense::hover());
+    let (fx_rect, _) = ui.allocate_exact_size(vec2(w, layout.fx_height), Sense::hover());
+    ui.scope_builder(UiBuilder::new().max_rect(fx_rect).layout(Layout::top_down(Align::Min)), |ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
+        egui::ScrollArea::vertical().id_salt("fx_master").auto_shrink([false, false]).show(ui, |ui| {
+            for (s, slot) in snap.project.master_plugins.iter().enumerate() {
+                slot_pill(app, ui, MASTER_UI, SlotRef::Master(s), &slot.name, slot.bypass, w, &[]);
+            }
+            add_fx_button(app, ui, MASTER_UI, w, snap);
+        });
+    });
     ui.allocate_exact_size(vec2(w, 34.0), Sense::hover());
     let mut gain = snap.project.master_volume;
     if fader_section(ui, &mut gain, snap.status.master_peak_db, "Master Volume", w) {
@@ -174,7 +183,7 @@ fn slot_pill(app: &mut DawApp, ui: &mut egui::Ui, t: usize, which: SlotRef, name
     let fill = match (bypass, which) {
         (true, _) => theme::shade(theme::BG_CONTROL, 0.8),
         (false, SlotRef::Instrument) => Color32::from_rgb(84, 70, 104),
-        (false, SlotRef::Effect(_)) => Color32::from_rgb(58, 74, 98),
+        (false, SlotRef::Effect(_) | SlotRef::Master(_)) => Color32::from_rgb(58, 74, 98),
     };
     ui.painter().rect_filled(rect, 4.0, fill);
     if open {
@@ -221,16 +230,26 @@ fn add_fx_button(app: &mut DawApp, ui: &mut egui::Ui, t: usize, w: f32, snap: &S
     let stroke = Stroke::new(1.0, if resp.hovered() { theme::TEXT_DIM } else { theme::HAIRLINE });
     ui.painter().rect_stroke(rect, 4.0, stroke, StrokeKind::Inside);
     widgets::draw_icon(ui.painter(), Icon::Plus, rect.center(), 4.0, theme::TEXT_DIM);
-    let resp = resp.on_hover_text("Add audio effect");
+    let resp = resp.on_hover_text(if t == MASTER_UI { "Add audio effect to the master bus" } else { "Add audio effect" });
+    let insert = |app: &mut DawApp, query: String| {
+        app.act(if t == MASTER_UI { Action::InsertMasterPlugin(query) } else { Action::InsertPlugin(t, query) });
+    };
     egui::Popup::menu(&resp).show(|ui| {
         ui.set_min_width(220.0);
+        widgets::section(ui, "Built-in");
+        if ui.button(opentake_engine::eq::NAME).clicked() {
+            insert(app, opentake_engine::eq::PATH.into());
+            ui.close();
+        }
+        ui.separator();
+        widgets::section(ui, "VST3");
         let effects: Vec<_> = snap.scanned.iter().filter(|p| !p.class.is_instrument()).collect();
         if effects.is_empty() {
             ui.label(RichText::new("No effect plug-ins found").color(theme::TEXT_FAINT));
         }
         for p in effects {
             if ui.button(format!("{}  ·  {}", p.class.name, p.class.vendor)).clicked() {
-                app.act(Action::InsertPlugin(t, p.bundle.to_string_lossy().into_owned()));
+                insert(app, p.bundle.to_string_lossy().into_owned());
                 ui.close();
             }
         }

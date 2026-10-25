@@ -26,7 +26,12 @@ Projects can be saved/loaded as Reaper .rpp or native .json files.
 MIDI: add_instrument_track (\"synth\" = built-in synth, or a VST3 instrument from list_instruments) -> \
 add_midi_clip -> set_midi_notes / add_midi_notes (times in seconds relative to the region start, \
 pitch 60 = middle C, velocity 1..127). Every edit — yours or the user's — can be undone with undo/redo; \
-get_history lists the steps.";
+get_history lists the steps.
+
+Tempo: set_tempo sets the opening tempo/signature; set_tempo_map adds tempo and time-signature changes. \
+Region and note times are always seconds; get_tempo_map and convert_time translate between seconds and \
+bars/beats. Effects: insert_plugin with \"eq\" adds the built-in 6-band EQ to a track; \
+insert_master_plugin puts effects on the master bus (address them with master: true).";
 
 pub type SharedEngine = Arc<Mutex<Engine>>;
 
@@ -98,6 +103,63 @@ pub struct TempoArgs {
     pub bpm: f64,
     pub numerator: Option<u32>,
     pub denominator: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TempoChangeArg {
+    /// Where the change happens, in seconds (> 0).
+    pub at_secs: f64,
+    /// Quarter notes per minute from here on.
+    pub bpm: f64,
+    /// New time signature from here (starts a new bar); omit to keep the current one.
+    pub numerator: Option<u32>,
+    pub denominator: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TempoMapArgs {
+    /// All tempo/time-signature changes after the start (replaces the existing ones; [] clears).
+    pub changes: Vec<TempoChangeArg>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TempoMapQuery {
+    /// Also list bar lines (number, time, signature, tempo) from this time...
+    pub bars_from_secs: Option<f64>,
+    /// ...to this time (seconds).
+    pub bars_to_secs: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ConvertTimeArgs {
+    /// Seconds to convert to bar/beat; or give bar (and beat) to get seconds.
+    pub secs: Option<f64>,
+    /// 1-based bar number.
+    pub bar: Option<i64>,
+    /// 1-based beat (fractions allowed, e.g. 2.5); defaults to 1.
+    pub beat: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CountInArgs {
+    /// Bars of count-in before recording (0 = off, max 4); omit to keep.
+    pub bars: Option<u32>,
+    /// Also count in before plain playback; omit to keep.
+    pub on_play: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InsertMasterPluginArgs {
+    /// "eq" for the built-in EQ, or a VST3 effect name / .vst3 bundle path.
+    pub plugin: String,
+    /// Position in the master chain; omit to append.
+    pub position: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MasterSlotArgs {
+    /// Zero-based position in the master effect chain.
+    pub slot: usize,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -330,16 +392,24 @@ pub struct SlotArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListParamsArgs {
+    #[serde(default)]
     pub track: usize,
     pub slot: usize,
+    /// Address the master bus's effect chain instead of a track (track is ignored).
+    #[serde(default)]
+    pub master: bool,
     /// Only return parameters whose title contains this text (case-insensitive).
     pub filter: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetParamArgs {
+    #[serde(default)]
     pub track: usize,
     pub slot: usize,
+    /// Address the master bus's effect chain instead of a track (track is ignored).
+    #[serde(default)]
+    pub master: bool,
     pub param_id: u32,
     /// Normalized value 0..1.
     pub value: f64,
@@ -347,8 +417,12 @@ pub struct SetParamArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BypassArgs {
+    #[serde(default)]
     pub track: usize,
     pub slot: usize,
+    /// Address the master bus's effect chain instead of a track (track is ignored).
+    #[serde(default)]
+    pub master: bool,
     pub bypass: bool,
 }
 
@@ -406,10 +480,73 @@ impl DawServer {
         self.with_engine(move |e| e.save_project(a.path.as_deref().map(std::path::Path::new))).await
     }
 
-    #[tool(description = "Set project tempo and optionally the time signature.")]
+    #[tool(description = "Set the opening tempo and optionally the time signature (see set_tempo_map for changes later in the song).")]
     async fn set_tempo(&self, Parameters(a): Parameters<TempoArgs>) -> ToolResult {
         let sig = a.numerator.zip(a.denominator);
         self.with_engine(move |e| e.set_tempo(a.bpm, sig).map(|_| "ok")).await
+    }
+
+    #[tool(description = "Replace the tempo map's changes: tempo and/or time-signature changes after the start. Bars, the grid, snapping, the metronome and plug-ins follow it; region times stay in seconds. Undoable.")]
+    async fn set_tempo_map(&self, Parameters(a): Parameters<TempoMapArgs>) -> ToolResult {
+        let changes = a
+            .changes
+            .into_iter()
+            .map(|c| opentake_engine::project::TempoChange { at_secs: c.at_secs, bpm: c.bpm, time_signature: c.numerator.zip(c.denominator) })
+            .collect();
+        self.with_engine(move |e| e.set_tempo_changes(changes, None).map(|_| "ok")).await
+    }
+
+    #[tool(description = "The tempo map: opening tempo/signature, the changes, and optionally the bar lines in a time range (bar number, start time, signature, tempo).")]
+    async fn get_tempo_map(&self, Parameters(a): Parameters<TempoMapQuery>) -> ToolResult {
+        self.with_engine(move |e| {
+            let p = e.project();
+            let map = p.tempo_map();
+            let bars = match (a.bars_from_secs, a.bars_to_secs) {
+                (Some(from), Some(to)) if to >= from => map
+                    .bars(from, to.min(from + 3600.0))
+                    .iter()
+                    .take(2000)
+                    .map(|b| json!({ "bar": b.index + 1, "secs": b.secs, "time_signature": [b.sig.0, b.sig.1], "bpm": map.tempo_at(b.secs) }))
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            Ok(json!({
+                "tempo_bpm": p.tempo_bpm,
+                "time_signature": p.time_signature,
+                "changes": p.tempo_changes,
+                "bars": bars,
+            }))
+        })
+        .await
+    }
+
+    #[tool(description = "Convert between seconds and bar/beat using the tempo map: give secs to get bar, beat and the tempo there, or bar (and beat) to get secs.")]
+    async fn convert_time(&self, Parameters(a): Parameters<ConvertTimeArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let map = e.project().tempo_map();
+            match (a.secs, a.bar) {
+                (Some(secs), _) => {
+                    let pos = map.position(secs.max(0.0));
+                    let sig = map.signature_at(secs.max(0.0));
+                    Ok(json!({ "secs": secs, "bar": pos.bar, "beat": pos.beat as f64 + pos.fraction, "bpm": map.tempo_at(secs.max(0.0)), "time_signature": [sig.0, sig.1] }))
+                }
+                (None, Some(bar)) => {
+                    let beat = a.beat.unwrap_or(1.0);
+                    Ok(json!({ "bar": bar, "beat": beat, "secs": map.secs_of(bar.max(1), beat) }))
+                }
+                _ => anyhow::bail!("give either secs or bar"),
+            }
+        })
+        .await
+    }
+
+    #[tool(description = "Metronome count-in: bars of clicks before recording starts (0 = off), and whether plain playback counts in too.")]
+    async fn set_count_in(&self, Parameters(a): Parameters<CountInArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            e.set_count_in(a.bars, a.on_play)?;
+            Ok(json!({ "bars": e.project().count_in_bars, "on_play": e.project().count_in_on_play }))
+        })
+        .await
     }
 
     #[tool(description = "Set the master output level in dB.")]
@@ -637,9 +774,19 @@ impl DawServer {
         .await
     }
 
-    #[tool(description = "Insert a VST3 plugin into a track's effect chain. Returns the slot index.")]
+    #[tool(description = "Insert an effect into a track's chain: \"eq\" for the built-in OpenTake EQ (low cut, low shelf, two bells, high shelf, high cut, output — see list_plugin_params), or a VST3 effect. Returns the slot index.")]
     async fn insert_plugin(&self, Parameters(a): Parameters<InsertPluginArgs>) -> ToolResult {
         self.with_engine(move |e| e.insert_plugin(a.track, &a.plugin, a.position).map(|s| json!({ "slot": s }))).await
+    }
+
+    #[tool(description = "Insert an effect on the master bus (\"eq\" or a VST3 effect). Returns the slot index; use master: true with list_plugin_params / set_plugin_param / set_plugin_bypass.")]
+    async fn insert_master_plugin(&self, Parameters(a): Parameters<InsertMasterPluginArgs>) -> ToolResult {
+        self.with_engine(move |e| e.insert_master_plugin(&a.plugin, a.position).map(|s| json!({ "slot": s }))).await
+    }
+
+    #[tool(description = "Remove an effect from the master bus.")]
+    async fn remove_master_plugin(&self, Parameters(a): Parameters<MasterSlotArgs>) -> ToolResult {
+        self.with_engine(move |e| e.remove_master_plugin(a.slot)).await
     }
 
     #[tool(description = "Remove a plugin from a track's effect chain.")]
@@ -649,13 +796,15 @@ impl DawServer {
 
     #[tool(description = "Bypass or enable a plugin.")]
     async fn set_plugin_bypass(&self, Parameters(a): Parameters<BypassArgs>) -> ToolResult {
-        self.with_engine(move |e| e.set_plugin_bypass(a.track, a.slot, a.bypass).map(|_| "ok")).await
+        let which = if a.master { SlotRef::Master(a.slot) } else { SlotRef::Effect(a.slot) };
+        self.with_engine(move |e| e.set_slot_bypass(a.track, which, a.bypass).map(|_| "ok")).await
     }
 
     #[tool(description = "List a plugin's parameters with ids, normalized values and display strings.")]
     async fn list_plugin_params(&self, Parameters(a): Parameters<ListParamsArgs>) -> ToolResult {
         self.with_engine(move |e| {
-            let mut params = e.plugin_params(a.track, a.slot)?;
+            let which = if a.master { SlotRef::Master(a.slot) } else { SlotRef::Effect(a.slot) };
+            let mut params = e.slot_params(a.track, which)?;
             if let Some(f) = a.filter.map(|f| f.to_lowercase()) {
                 params.retain(|p| p.title.to_lowercase().contains(&f));
             }
@@ -667,7 +816,8 @@ impl DawServer {
     #[tool(description = "Set a plugin parameter (normalized 0..1). Returns the plugin's display string for the new value.")]
     async fn set_plugin_param(&self, Parameters(a): Parameters<SetParamArgs>) -> ToolResult {
         self.with_engine(move |e| {
-            e.set_plugin_param(a.track, a.slot, a.param_id, a.value).map(|d| json!({ "value": a.value, "display": d }))
+            let which = if a.master { SlotRef::Master(a.slot) } else { SlotRef::Effect(a.slot) };
+            e.set_slot_param(a.track, which, a.param_id, a.value).map(|d| json!({ "value": a.value, "display": d }))
         })
         .await
     }

@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::tempo::{TempoChange, TempoMap};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Project {
     pub name: String,
@@ -25,6 +27,19 @@ pub struct Project {
     pub loop_start_secs: f64,
     #[serde(default)]
     pub loop_end_secs: f64,
+    /// Tempo and time-signature changes after the start (`tempo_bpm`/`time_signature` are
+    /// the opening values).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tempo_changes: Vec<TempoChange>,
+    /// Bars of metronome count-in before recording (0 = off).
+    #[serde(default)]
+    pub count_in_bars: u32,
+    /// Also count in before plain playback.
+    #[serde(default)]
+    pub count_in_on_play: bool,
+    /// Insert effects on the master bus.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub master_plugins: Vec<PluginSlot>,
     pub tracks: Vec<Track>,
 }
 
@@ -49,12 +64,21 @@ impl Default for Project {
             loop_enabled: false,
             loop_start_secs: 0.0,
             loop_end_secs: 0.0,
+            tempo_changes: Vec::new(),
+            count_in_bars: 0,
+            count_in_on_play: false,
+            master_plugins: Vec::new(),
             tracks: Vec::new(),
         }
     }
 }
 
 impl Project {
+    /// The project's tempo map (opening tempo/signature plus changes).
+    pub fn tempo_map(&self) -> TempoMap {
+        TempoMap::new(self.tempo_bpm, self.time_signature, &self.tempo_changes)
+    }
+
     /// The song tempo playing at time `t`, from an unmuted region with tempo marks
     /// (e.g. an imported Guitar Pro song). `None` when only the project tempo applies.
     pub fn song_tempo_at(&self, t: f64) -> Option<f64> {

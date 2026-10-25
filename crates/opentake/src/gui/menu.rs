@@ -30,6 +30,8 @@ pub enum MenuCommand {
     PlayStop,
     Record,
     ToggleMetronome,
+    ToggleCountIn,
+    ToggleCountInOnPlay,
     ToggleCycle,
     GoToStart,
     ToggleInspector,
@@ -84,6 +86,8 @@ impl MenuCommand {
             Self::PlayStop => "play_stop",
             Self::Record => "record",
             Self::ToggleMetronome => "toggle_metronome",
+            Self::ToggleCountIn => "toggle_count_in",
+            Self::ToggleCountInOnPlay => "toggle_count_in_on_play",
             Self::ToggleCycle => "toggle_cycle",
             Self::GoToStart => "go_to_start",
             Self::ToggleInspector => "toggle_inspector",
@@ -127,6 +131,8 @@ impl MenuCommand {
             Self::PlayStop => "Play / Stop",
             Self::Record => "Record",
             Self::ToggleMetronome => "Metronome",
+            Self::ToggleCountIn => "Count-in When Recording",
+            Self::ToggleCountInOnPlay => "Count-in When Playing",
             Self::ToggleCycle => "Cycle",
             Self::GoToStart => "Go to Beginning",
             Self::ToggleInspector => "Show Inspector",
@@ -228,7 +234,7 @@ pub const MENUS: &[(&str, &[Option<MenuCommand>])] = {
             ],
         ),
         ("Track", &[Some(NewTrack), Some(NewInstrumentTrack), None, Some(DeleteTrack)]),
-        ("Transport", &[Some(PlayStop), Some(Record), Some(GoToStart), None, Some(ToggleCycle), Some(ToggleMetronome)]),
+        ("Transport", &[Some(PlayStop), Some(Record), Some(GoToStart), None, Some(ToggleCycle), Some(ToggleMetronome), Some(ToggleCountIn), Some(ToggleCountInOnPlay)]),
         ("View", &[Some(ToggleInspector), Some(ToggleMixer), Some(TogglePianoRoll), Some(ToggleTab), None, Some(ZoomIn), Some(ZoomOut), Some(ZoomToFit)]),
         ("Audio", &[Some(AudioSettings), None, Some(ToggleAudioEngine)]),
         ("Plug-ins", &[Some(PluginManager), None, Some(RescanPlugins)]),
@@ -253,6 +259,8 @@ pub struct MenuState {
     pub recent: Vec<String>,
     pub snap_on: bool,
     pub metronome_on: bool,
+    pub count_in_on: bool,
+    pub count_in_on_play: bool,
     pub audio_running: bool,
     pub playing: bool,
 }
@@ -275,6 +283,8 @@ impl MenuState {
             MenuCommand::ToggleInspector => Some(self.inspector_visible),
             MenuCommand::ToggleSnap => Some(self.snap_on),
             MenuCommand::ToggleMetronome => Some(self.metronome_on),
+            MenuCommand::ToggleCountIn => Some(self.count_in_on),
+            MenuCommand::ToggleCountInOnPlay => Some(self.count_in_on_play),
             MenuCommand::ToggleCycle => Some(self.cycle_on),
             MenuCommand::ToggleMixer => Some(self.mixer_visible),
             MenuCommand::TogglePianoRoll => Some(self.piano_roll_visible),
@@ -417,6 +427,8 @@ mod native {
                                 MenuCommand::ToggleInspector
                                     | MenuCommand::ToggleSnap
                                     | MenuCommand::ToggleMetronome
+                                    | MenuCommand::ToggleCountIn
+                                    | MenuCommand::ToggleCountInOnPlay
                                     | MenuCommand::ToggleCycle
                                     | MenuCommand::ToggleMixer
                                     | MenuCommand::TogglePianoRoll

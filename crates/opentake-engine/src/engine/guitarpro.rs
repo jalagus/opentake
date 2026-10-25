@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use opentake_project::guitarpro::{self, Score, TrackKind, timeline};
-use opentake_project::{MidiClip, Note, TabBar, TabLayout, TabPos, TempoMark};
+use opentake_project::{MidiClip, Note, TabBar, TabLayout, TabPos, TempoChange, TempoMark};
 use serde::Serialize;
 
 use super::Engine;
@@ -57,6 +57,43 @@ fn kind_name(kind: TrackKind) -> &'static str {
         TrackKind::Drums => "drums",
         TrackKind::Other => "other",
     }
+}
+
+/// The song's tempo map placed at `start` seconds: opening tempo and signature, plus the
+/// changes (tempo changes and time-signature changes in playing order).
+fn song_tempo_map(score: &Score, perf: &timeline::Performance, start: f64) -> (f64, (u32, u32), Vec<TempoChange>) {
+    let mut points: Vec<(f64, Option<f64>, Option<(u32, u32)>)> = perf.tempos.iter().map(|&(t, bpm)| (t, Some(bpm), None)).collect();
+    let mut prev_sig = None;
+    for occ in &perf.bars {
+        let mb = &score.master_bars[occ.bar];
+        let sig = (mb.numerator, mb.denominator);
+        if prev_sig != Some(sig) {
+            points.push((occ.time, None, Some(sig)));
+        }
+        prev_sig = Some(sig);
+    }
+    points.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let first_bpm = perf.tempos.first().map_or(120.0, |t| t.1);
+    let first_sig = score.master_bars.first().map_or((4, 4), |m| (m.numerator, m.denominator));
+    let (mut bpm, mut changes): (f64, Vec<TempoChange>) = (first_bpm, Vec::new());
+    if start > 1e-9 {
+        // The song's first bar starts at the import position.
+        changes.push(TempoChange { at_secs: start, bpm: first_bpm, time_signature: Some(first_sig) });
+    }
+    let mut i = 0;
+    while i < points.len() {
+        let t = points[i].0;
+        let mut sig = None;
+        while i < points.len() && (points[i].0 - t).abs() < 1e-6 {
+            bpm = points[i].1.unwrap_or(bpm);
+            sig = points[i].2.or(sig);
+            i += 1;
+        }
+        if t > 1e-9 {
+            changes.push(TempoChange { at_secs: start + t, bpm: bpm.clamp(20.0, 999.0), time_signature: sig });
+        }
+    }
+    (first_bpm.clamp(20.0, 999.0), first_sig, changes)
 }
 
 pub fn summarize(score: &Score) -> GuitarProSummary {
@@ -126,7 +163,6 @@ impl Engine {
         };
         let start = options.position_secs.max(0.0);
         let length = perf.events.iter().map(|e| e.time + e.duration).fold(perf.duration, f64::max).max(0.1);
-        let summary = summarize(&score);
         // Bar layout for the tablature view (repeats expanded, real-time positions).
         let tab_bars: Vec<TabBar> = perf
             .bars
@@ -139,8 +175,11 @@ impl Engine {
 
         self.record("Import Guitar Pro", None, |e| {
             if options.set_tempo {
-                e.project.tempo_bpm = summary.tempo_bpm.clamp(20.0, 999.0);
-                e.project.time_signature = summary.time_signature;
+                // Adopt the song's whole tempo map (tempo and time-signature changes).
+                let (bpm, sig, changes) = song_tempo_map(&score, &perf, start);
+                e.project.tempo_bpm = bpm;
+                e.project.time_signature = sig;
+                e.project.tempo_changes = changes;
                 let cmd = e.tempo_command();
                 e.send(cmd)?;
             }
@@ -206,6 +245,11 @@ mod tests {
         assert_eq!(created, vec![1, 2]);
         let p = e.project();
         assert_eq!(p.tempo_bpm, 120.0);
+        // The song's tempo map is adopted: 120 bpm, slowing to 60 where bar 4 starts (8 s).
+        assert_eq!(p.tempo_changes, vec![TempoChange { at_secs: 8.0, bpm: 60.0, time_signature: None }]);
+        let map = p.tempo_map();
+        assert_eq!(map.position(8.0).bar, 5, "bar 4 is the fifth bar played (after the repeat)");
+        assert_eq!(map.tempo_at(9.0), 60.0);
         let guitar = &p.tracks[1];
         assert_eq!(guitar.name, "Guitar");
         assert!(guitar.is_instrument());

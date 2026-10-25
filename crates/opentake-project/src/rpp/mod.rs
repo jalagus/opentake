@@ -63,6 +63,22 @@ pub fn from_str(text: &str, base_dir: &Path) -> Result<Project, RppError> {
             project.time_signature = (n, d);
         }
     }
+    // Tempo envelope: PT <secs> <bpm> <shape> [<num + den * 65536>]. Ramps become steps.
+    if let Some(env) = root.chunk("TEMPOENVEX") {
+        for line in env.lines().filter(|l| l.key() == "PT") {
+            let t = line.tokens();
+            let (Some(at), Some(bpm)) = (t.get(1).and_then(|v| v.parse::<f64>().ok()), t.get(2).and_then(|v| v.parse::<f64>().ok())) else { continue };
+            let sig = t.get(4).and_then(|v| v.parse::<i64>().ok()).filter(|&c| c > 0).map(|c| ((c & 0xffff) as u32, (c >> 16) as u32)).filter(|s| s.0 > 0 && s.1 > 0);
+            if at <= 1e-9 {
+                project.tempo_bpm = bpm;
+                if let Some(s) = sig {
+                    project.time_signature = s;
+                }
+            } else {
+                project.tempo_changes.push(crate::TempoChange { at_secs: at, bpm, time_signature: sig });
+            }
+        }
+    }
     if let Some(sr) = root.value::<u32>("SAMPLERATE", 0).filter(|&sr| sr > 0) {
         project.sample_rate = sr;
     }
@@ -169,6 +185,22 @@ pub fn to_string(project: &Project, base_dir: &Path) -> String {
     root.push_line(&["MASTER_VOLUME".to_string(), fmt_f32(project.master_volume), "0".into(), "-1".into(), "-1".into(), "1".into()]);
     root.push_line(&["LOOP", bool01(project.loop_enabled)]);
     root.push_line(&["SELECTION".to_string(), fmt_f64(project.loop_start_secs), fmt_f64(project.loop_end_secs)]);
+    if !project.tempo_changes.is_empty() {
+        let mut env = Node::new("TEMPOENVEX");
+        env.push_line(&["ACT", "1", "-1"]).push_line(&["VIS", "1", "0", "1"]).push_line(&["DEFSHAPE", "1", "-1", "-1"]);
+        let code = |(n, d): (u32, u32)| (n as i64 + ((d as i64) << 16)).to_string();
+        env.push_line(&["PT".to_string(), "0".into(), fmt_f64(project.tempo_bpm), "1".into(), code(project.time_signature)]);
+        let mut changes = project.tempo_changes.clone();
+        changes.sort_by(|a, b| a.at_secs.total_cmp(&b.at_secs));
+        for c in changes {
+            let mut line = vec!["PT".to_string(), fmt_f64(c.at_secs), fmt_f64(c.bpm), "1".into()];
+            if let Some(sig) = c.time_signature {
+                line.push(code(sig));
+            }
+            env.push_line(&line);
+        }
+        root.push_chunk(env);
+    }
     for track in &project.tracks {
         root.push_chunk(export_track(track, base_dir));
     }
@@ -298,6 +330,20 @@ mod tests {
   >
 >
 "#;
+
+    #[test]
+    fn tempo_map_round_trips_through_the_tempo_envelope() {
+        let mut p = Project { tempo_bpm: 120.0, ..Project::default() };
+        p.tempo_changes = vec![
+            crate::TempoChange { at_secs: 4.0, bpm: 96.0, time_signature: Some((3, 4)) },
+            crate::TempoChange { at_secs: 9.5, bpm: 140.0, time_signature: None },
+        ];
+        let text = to_string(&p, Path::new("/proj"));
+        assert!(text.contains("<TEMPOENVEX") && text.contains("PT 4 96 1 262147"), "{text}");
+        let back = from_str(&text, Path::new("/proj")).unwrap();
+        assert_eq!(back.tempo_bpm, 120.0);
+        assert_eq!(back.tempo_changes, p.tempo_changes);
+    }
 
     #[test]
     fn imports_sample() {

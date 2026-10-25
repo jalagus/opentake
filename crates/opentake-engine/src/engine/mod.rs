@@ -18,7 +18,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use opentake_project::{Clip, Project, Track};
+use opentake_project::{Clip, Project, TempoChange, Track};
 use opentake_vst3::{Module, ScannedPlugin};
 use rtrb::{Consumer, Producer};
 use serde::Serialize;
@@ -88,6 +88,8 @@ pub struct EngineStatus {
     pub output_channels: usize,
     pub playing: bool,
     pub recording: bool,
+    /// Counting in before playback or recording starts.
+    pub counting_in: bool,
     pub position_secs: f64,
     pub record_overrun_samples: u64,
     /// Peak level in dBFS with a 30 dB/s fall (floored at -120).
@@ -321,6 +323,8 @@ impl Engine {
         let _ = cmd_tx.push(self.tempo_command());
         let _ = cmd_tx.push(Command::SetMasterGain(self.project.master_volume));
         let _ = cmd_tx.push(self.metronome_command());
+        let _ = cmd_tx.push(self.count_in_command());
+        let _ = cmd_tx.push(Command::SetSongEnd((self.project.length_secs() * sample_rate as f64).round() as u64));
         let _ = cmd_tx.push(self.loop_command_at(sample_rate));
 
         let mixer = Mixer::new(cmd_rx, g_tx, rec_tx, self.shared.clone(), sample_rate);
@@ -377,8 +381,20 @@ impl Engine {
     }
 
     fn tempo_command(&self) -> Command {
-        let (n, d) = self.project.time_signature;
-        Command::SetTempo(self.project.tempo_bpm, (n as i32, d as i32))
+        Command::SetTempoMap(Box::new(self.project.tempo_map()))
+    }
+
+    /// Tell the audio thread where the last region ends, so playback stops there.
+    pub(super) fn sync_song_end(&mut self) -> Result<()> {
+        if self.audio.is_none() {
+            return Ok(());
+        }
+        let end = (self.project.length_secs() * self.sample_rate() as f64).round() as u64;
+        self.send(Command::SetSongEnd(end))
+    }
+
+    fn count_in_command(&self) -> Command {
+        Command::SetCountIn { bars: self.project.count_in_bars, on_play: self.project.count_in_on_play }
     }
 
     // ---------------------------------------------------------------- runtime builders
@@ -577,6 +593,7 @@ impl Engine {
             output_channels: streams.map_or(0, |s| s.output_channels),
             playing: self.shared.playing.load(Ordering::Relaxed),
             recording: self.shared.recording.load(Ordering::Relaxed),
+            counting_in: self.shared.counting_in.load(Ordering::Relaxed),
             position_secs: self.shared.position.load(Ordering::Relaxed) as f64 / sr as f64,
             record_overrun_samples: self.shared.record_overruns.load(Ordering::Relaxed),
             master_peak_db: self.meters.master.map(db),
@@ -609,6 +626,43 @@ impl Engine {
 
     fn metronome_command(&self) -> Command {
         Command::SetMetronome { enabled: self.project.metronome_enabled, gain: self.project.metronome_volume }
+    }
+
+    /// Metronome count-in: bars before recording (0 = off, max 4), and whether plain
+    /// playback counts in too. Not an undoable edit.
+    pub fn set_count_in(&mut self, bars: Option<u32>, on_play: Option<bool>) -> Result<()> {
+        if let Some(b) = bars {
+            self.project.count_in_bars = b.min(4);
+        }
+        if let Some(p) = on_play {
+            self.project.count_in_on_play = p;
+        }
+        let cmd = self.count_in_command();
+        self.send(cmd)
+    }
+
+    /// Replace the tempo changes after the start (the opening tempo and signature are set
+    /// with `set_tempo`). `merge` groups repeated edits (e.g. a drag) into one undo step.
+    pub fn set_tempo_changes(&mut self, mut changes: Vec<TempoChange>, merge: Option<String>) -> Result<()> {
+        for c in &changes {
+            if !(c.at_secs.is_finite() && c.at_secs > 0.0) {
+                bail!("tempo changes must be after the start (got {} s)", c.at_secs);
+            }
+            if !(20.0..=999.0).contains(&c.bpm) {
+                bail!("tempo must be between 20 and 999 BPM (got {})", c.bpm);
+            }
+            if let Some((n, d)) = c.time_signature {
+                if n == 0 || n > 32 || !matches!(d, 1 | 2 | 4 | 8 | 16 | 32) {
+                    bail!("invalid time signature {n}/{d}");
+                }
+            }
+        }
+        changes.sort_by(|a, b| a.at_secs.total_cmp(&b.at_secs));
+        self.record("Tempo Change", merge, |e| {
+            e.project.tempo_changes = changes;
+            let cmd = e.tempo_command();
+            e.send(cmd)
+        })
     }
 
     /// Turn the click on/off and/or set its level (linear, max 2.0). Not an undoable edit.
@@ -934,6 +988,16 @@ impl Engine {
             }
         }
 
+        for slot in &mut project.master_plugins {
+            slot.instance = match self.load_slot(slot) {
+                Ok(instance) => instance,
+                Err(e) => {
+                    warnings.push(format!("master: plugin '{}' not loaded: {e:#}", slot.name));
+                    0
+                }
+            };
+        }
+
         self.project = project;
         self.project_path = path;
         self.media.clear();
@@ -954,8 +1018,12 @@ impl Engine {
             self.send(Command::SetMasterGain(self.project.master_volume))?;
             let metronome = self.metronome_command();
             self.send(metronome)?;
+            let count_in = self.count_in_command();
+            self.send(count_in)?;
+            self.sync_song_end()?;
             let looping = self.loop_command_at(sr);
             self.send(looping)?;
+            self.sync_master_chain()?;
         }
         Ok(warnings)
     }

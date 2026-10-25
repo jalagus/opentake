@@ -6,6 +6,7 @@
 
 mod menu;
 mod mixer;
+mod eq_view;
 mod piano_roll;
 mod tab_view;
 mod theme;
@@ -50,7 +51,10 @@ pub fn run(engine: SharedEngine, mcp_url: Option<String>, settings_path: Option<
             theme::apply(&cc.egui_ctx);
             let has_tracks = !engine.lock().map(|e| e.project().tracks.is_empty()).unwrap_or(true);
             let mut app = DawApp::new(engine, mcp_url);
-            app.recent = settings_path.as_deref().map(crate::settings::Settings::load).map(|s| s.existing_recent()).unwrap_or_default();
+            let settings = settings_path.as_deref().map(crate::settings::Settings::load).unwrap_or_default();
+            app.recent = settings.existing_recent();
+            app.tab_scale = settings.tab_scale.unwrap_or(1.0).clamp(0.75, 2.5);
+            app.tab_paper = settings.tab_paper.unwrap_or(false);
             app.settings_path = settings_path;
             if has_tracks {
                 app.selected_track = Some(0);
@@ -97,12 +101,21 @@ pub(crate) enum BottomTab {
     Tab,
 }
 
+/// Track index used with `SlotRef::Master` (the master bus isn't a track).
+pub(crate) const MASTER_UI: usize = usize::MAX;
+
 pub(crate) enum Action {
     Play,
     Stop,
     Record,
     Seek(f64),
     SetTempo(f64),
+    SetTimeSignature((u32, u32)),
+    SetTempoChanges { changes: Vec<opentake_engine::project::TempoChange>, merge: Option<String> },
+    SetCountIn { bars: Option<u32>, on_play: Option<bool> },
+    InsertMasterPlugin(String),
+    /// Several parameters as one undo step: (track, slot, values, label).
+    SetParams(usize, SlotRef, Vec<(u32, f64)>, String),
     SetMasterVolume(f32),
     SetMetronome { enabled: Option<bool>, volume: Option<f32> },
     StartAudio(AudioConfig),
@@ -158,6 +171,9 @@ pub(crate) struct DawApp {
     pub bottom: Option<BottomTab>,
     /// What the tablature view shows (notation, tab or both).
     pub tab_mode: tab_view::TabMode,
+    /// Tablature view size (1.0 = normal) and paper (white) mode; saved in the settings.
+    pub tab_scale: f32,
+    pub tab_paper: bool,
     pub piano: piano_roll::PianoRoll,
     pub open_plugins: Vec<(usize, SlotRef)>,
     devices: Option<DeviceList>,
@@ -213,6 +229,8 @@ impl DawApp {
             show_inspector: true,
             bottom: None,
             tab_mode: tab_view::TabMode::default(),
+            tab_scale: 1.0,
+            tab_paper: false,
             piano: piano_roll::PianoRoll::default(),
             open_plugins: Vec::new(),
             devices: None,
@@ -326,6 +344,14 @@ impl DawApp {
             }
             Action::Seek(t) => e.seek(t)?,
             Action::SetTempo(bpm) => e.set_tempo(bpm, None)?,
+            Action::SetTimeSignature(sig) => e.set_tempo(e.project().tempo_bpm, Some(sig))?,
+            Action::SetTempoChanges { changes, merge } => e.set_tempo_changes(changes, merge)?,
+            Action::SetCountIn { bars, on_play } => e.set_count_in(bars, on_play)?,
+            Action::InsertMasterPlugin(query) => {
+                let slot = e.insert_master_plugin(&query, None)?;
+                self.open_plugins.push((MASTER_UI, SlotRef::Master(slot)));
+            }
+            Action::SetParams(t, s, values, label) => e.set_slot_params(t, s, &values, &label)?,
             Action::SetMasterVolume(g) => e.set_master_volume(g)?,
             Action::SetMetronome { enabled, volume } => e.set_metronome(enabled, volume)?,
             Action::StartAudio(cfg) => {
@@ -522,9 +548,11 @@ impl DawApp {
                 match which {
                     SlotRef::Instrument => drop(e.set_instrument(t, None)?),
                     SlotRef::Effect(s) => drop(e.remove_plugin(t, s)?),
+                    SlotRef::Master(s) => drop(e.remove_master_plugin(s)?),
                 }
-                // Slot indices shift; simplest is to close this track's windows.
-                self.open_plugins.retain(|&(pt, _)| pt != t);
+                // Slot indices shift; simplest is to close this track's (or the master's) windows.
+                let master = matches!(which, SlotRef::Master(_));
+                self.open_plugins.retain(|&(pt, s)| if master { !matches!(s, SlotRef::Master(_)) } else { pt != t || matches!(s, SlotRef::Master(_)) });
             }
             Action::SetBypass(t, s, b) => e.set_slot_bypass(t, s, b)?,
             Action::SetParam(t, s, id, v) => {
@@ -548,11 +576,10 @@ impl DawApp {
             self.selected_track = None;
         }
         self.selection.retain(|r| timeline::region_view(p, *r).is_some());
-        self.open_plugins.retain(|&(t, s)| {
-            p.tracks.get(t).is_some_and(|tr| match s {
-                SlotRef::Instrument => tr.instrument.is_some(),
-                SlotRef::Effect(i) => i < tr.plugins.len(),
-            })
+        self.open_plugins.retain(|&(t, s)| match s {
+            SlotRef::Master(i) => i < p.master_plugins.len(),
+            SlotRef::Instrument => p.tracks.get(t).is_some_and(|tr| tr.instrument.is_some()),
+            SlotRef::Effect(i) => p.tracks.get(t).is_some_and(|tr| i < tr.plugins.len()),
         });
     }
 
@@ -708,7 +735,21 @@ impl DawApp {
         if from.is_finite() {
             self.view.zoom_to_fit(from, to);
         } else {
-            self.view.zoom_to_fit(0.0, 8.0 * timeline::bar_secs(&snap.project));
+            self.view.zoom_to_fit(0.0, snap.project.tempo_map().secs_of(9, 1.0));
+        }
+    }
+
+    /// Change the tablature view's size / paper mode and remember them.
+    pub(crate) fn set_tab_view_prefs(&mut self, scale: f32, paper: bool) {
+        self.tab_scale = scale.clamp(0.75, 2.5);
+        self.tab_paper = paper;
+        if let Some(path) = &self.settings_path {
+            let mut settings = crate::settings::Settings::load(path);
+            settings.tab_scale = Some(self.tab_scale);
+            settings.tab_paper = Some(paper);
+            if let Err(e) = settings.save(path) {
+                self.error(format!("Could not save settings: {e:#}"));
+            }
         }
     }
 
@@ -775,7 +816,7 @@ impl DawApp {
                         ui.end_row();
                     }
                 });
-                ui.checkbox(&mut dialog.set_tempo, "Use the song's tempo and time signature");
+                ui.checkbox(&mut dialog.set_tempo, "Use the song's tempo map (tempo and time-signature changes)");
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     let any = dialog.selected.iter().any(|&on| on);
@@ -878,6 +919,8 @@ impl DawApp {
             piano_roll_visible: self.bottom == Some(BottomTab::PianoRoll),
             snap_on: self.snap_mode != timeline::SnapMode::Off,
             metronome_on: snap.project.metronome_enabled,
+            count_in_on: snap.project.count_in_bars > 0,
+            count_in_on_play: snap.project.count_in_on_play,
             audio_running: snap.status.audio_running,
             playing: snap.status.playing,
             undo: snap.history.undo.clone(),
@@ -980,9 +1023,10 @@ impl DawApp {
     fn toggle_cycle(&mut self, snap: &Snapshot) {
         let p = &snap.project;
         if !p.loop_enabled && p.loop_end_secs <= p.loop_start_secs {
-            let bar = timeline::bar_secs(p);
-            let start = (snap.status.position_secs / bar).floor() * bar;
-            self.act(Action::SetLoop { enabled: Some(true), start: Some(start), end: Some(start + 4.0 * bar) });
+            let map = p.tempo_map();
+            let bar = map.bar_at(snap.status.position_secs);
+            let end = map.secs_of(bar.index + 5, 1.0);
+            self.act(Action::SetLoop { enabled: Some(true), start: Some(bar.secs), end: Some(end) });
         } else {
             self.act(Action::SetLoop { enabled: Some(!p.loop_enabled), start: None, end: None });
         }
@@ -1072,6 +1116,16 @@ impl DawApp {
             MenuCommand::GoToStart => self.act(Action::Seek(0.0)),
             MenuCommand::ToggleMetronome => {
                 self.act(Action::SetMetronome { enabled: Some(!snap.project.metronome_enabled), volume: None })
+            }
+            MenuCommand::ToggleCountIn => {
+                let bars = if snap.project.count_in_bars > 0 { 0 } else { 1 };
+                self.act(Action::SetCountIn { bars: Some(bars), on_play: None })
+            }
+            MenuCommand::ToggleCountInOnPlay => {
+                // Turning it on also enables a 1-bar count-in if none is set.
+                let on = !snap.project.count_in_on_play;
+                let bars = (on && snap.project.count_in_bars == 0).then_some(1);
+                self.act(Action::SetCountIn { bars, on_play: Some(on) })
             }
             MenuCommand::ToggleInspector => self.show_inspector = !self.show_inspector,
             MenuCommand::ToggleMixer => self.toggle_bottom(BottomTab::Mixer),
@@ -1254,23 +1308,22 @@ impl DawApp {
             plain(Icon::Rewind, "Rewind One Bar"),
             plain(Icon::Forward, "Forward One Bar"),
             plain(Icon::Stop, "Stop (Space)"),
-            B { icon: Icon::Play, active: s.playing && !s.recording, color: theme::PLAY, idle_color: theme::TEXT, a11y: "Play (Space)" },
+            B { icon: Icon::Play, active: (s.playing || s.counting_in) && !s.recording, color: theme::PLAY, idle_color: theme::TEXT, a11y: "Play (Space)" },
             B { icon: Icon::Record, active: s.recording, color: theme::RECORD, idle_color: theme::shade(theme::RECORD, 0.85), a11y: "Record (R)" },
             B { icon: Icon::Cycle, active: snap.project.loop_enabled, color: theme::SOLO, idle_color: theme::TEXT, a11y: "Cycle (C)" },
         ];
         let r = widgets::transport(ui, "transport", &buttons, vec2(TRANSPORT_SEG_W, 30.0));
-        let bar = timeline::bar_secs(&snap.project);
+        let map = snap.project.tempo_map();
         let pos = s.position_secs;
         if r[0].clicked() {
             self.act(Action::Seek(0.0));
         }
         if r[1].clicked() {
             // Back to the previous bar line (or one more bar if already on one).
-            let prev = ((pos - 1e-6) / bar).floor() * bar;
-            self.act(Action::Seek(prev.max(0.0)));
+            self.act(Action::Seek(map.bar_at((pos - 1e-6).max(0.0)).secs.max(0.0)));
         }
         if r[2].clicked() {
-            self.act(Action::Seek(((pos + 1e-6) / bar).floor() * bar + bar));
+            self.act(Action::Seek(map.secs_of(map.bar_at(pos + 1e-6).index + 2, 1.0)));
         }
         if r[3].clicked() {
             self.act(Action::Stop);
@@ -1297,7 +1350,7 @@ impl DawApp {
             active: on,
             color: theme::ACCENT,
             idle_color: theme::TEXT,
-            a11y: "Metronome (K) — right-click for volume",
+            a11y: "Metronome (K) — right-click for volume and count-in",
         };
         let resp = widgets::transport(ui, "metronome", &[button], vec2(TRANSPORT_SEG_W, 30.0)).remove(0);
         if resp.clicked() {
@@ -1315,6 +1368,19 @@ impl DawApp {
             if ui.add(slider).changed() {
                 self.act(Action::SetMetronome { enabled: None, volume: Some(widgets::db_to_gain(db)) });
             }
+            ui.separator();
+            widgets::section(ui, "Count-in");
+            ui.horizontal(|ui| {
+                for (bars, label) in [(0, "Off"), (1, "1 bar"), (2, "2 bars"), (4, "4 bars")] {
+                    if ui.add(egui::Button::new(label).selected(snap.project.count_in_bars == bars)).clicked() {
+                        self.act(Action::SetCountIn { bars: Some(bars), on_play: None });
+                    }
+                }
+            });
+            let mut on_play = snap.project.count_in_on_play;
+            if ui.add_enabled(snap.project.count_in_bars > 0, egui::Checkbox::new(&mut on_play, "Count in when playing too")).changed() {
+                self.act(Action::SetCountIn { bars: None, on_play: Some(on_play) });
+            }
         });
     }
 
@@ -1331,17 +1397,17 @@ impl DawApp {
         let mut x = rect.left() + 14.0;
 
         // State LED; pulses on each beat while the transport runs (brighter on the downbeat).
-        let base = if s.recording {
+        let base = if s.recording || s.counting_in {
             theme::RECORD
         } else if s.playing {
             theme::PLAY
         } else {
             Color32::from_gray(60)
         };
-        let beat = 60.0 / snap.project.tempo_bpm * 4.0 / snap.project.time_signature.1.max(1) as f64;
-        let beats = s.position_secs / beat;
-        let on_beat = s.playing && beats.fract() < 0.15;
-        let downbeat = (beats.floor() as u64) % snap.project.time_signature.0.max(1) as u64 == 0;
+        let map = snap.project.tempo_map();
+        let here = map.position(s.position_secs.max(0.0));
+        let on_beat = s.playing && here.fraction < 0.15;
+        let downbeat = here.beat == 1;
         let led = match (on_beat, downbeat) {
             (true, true) => Color32::WHITE,
             (true, false) => theme::shade(base, 1.35),
@@ -1356,6 +1422,7 @@ impl DawApp {
 
         // Position: bar . beat . division
         let (bar, beat, div) = bar_beat(s.position_secs, &snap.project);
+        let counting_in = s.counting_in;
         let pos_rect = Rect::from_min_size(pos2(x, rect.top()), vec2(118.0, rect.height()));
         // One column per field, so each number sits centred over its label.
         let columns = [(bar.to_string(), "BAR", 0.42), (beat.to_string(), "BEAT", 0.29), (div.to_string(), "DIV", 0.29)];
@@ -1374,26 +1441,41 @@ impl DawApp {
         // Clock time.
         let time_rect = Rect::from_min_size(pos2(x, rect.top()), vec2(104.0, rect.height()));
         p.text(pos2(time_rect.center().x, value_y), Align2::CENTER_CENTER, format_time(s.position_secs), FontId::monospace(14.0), theme::LCD_TEXT);
-        p.text(pos2(time_rect.center().x, label_y), Align2::CENTER_CENTER, "TIME", small.clone(), theme::LCD_DIM);
+        if counting_in {
+            p.text(pos2(time_rect.center().x, label_y), Align2::CENTER_CENTER, "COUNT-IN", small.clone(), theme::RECORD);
+        } else {
+            p.text(pos2(time_rect.center().x, label_y), Align2::CENTER_CENTER, "TIME", small.clone(), theme::LCD_DIM);
+        }
         x = time_rect.right();
         sep(p, x);
 
         // Tempo (drag to change, Shift for fine).
         let tempo_rect = Rect::from_min_size(pos2(x, rect.top()), vec2(70.0, rect.height()));
         let resp = ui.interact(tempo_rect, ui.make_persistent_id("lcd_tempo"), Sense::drag());
-        let bpm = snap.project.tempo_bpm;
+        // The tempo map's tempo at the playhead; dragging edits that section's tempo.
+        let bpm = map.tempo_at(s.position_secs.max(0.0));
+        let mut changes = snap.project.tempo_changes.clone();
+        changes.sort_by(|a, b| a.at_secs.total_cmp(&b.at_secs));
+        let section = changes.iter().rposition(|c| c.at_secs <= s.position_secs + 1e-9);
         if resp.dragged() {
             let fine = ui.input(|i| i.modifiers.shift);
-            let new = (bpm - resp.drag_delta().y as f64 * if fine { 0.05 } else { 0.5 }).clamp(20.0, 999.0);
+            let new = ((bpm - resp.drag_delta().y as f64 * if fine { 0.05 } else { 0.5 }).clamp(20.0, 999.0) * 10.0).round() / 10.0;
             if (new - bpm).abs() > f64::EPSILON {
-                self.act(Action::SetTempo((new * 10.0).round() / 10.0));
+                match section {
+                    None => self.act(Action::SetTempo(new)),
+                    Some(i) => {
+                        changes[i].bpm = new;
+                        self.act(Action::SetTempoChanges { changes: changes.clone(), merge: Some(format!("tempo-bpm:{i}")) });
+                    }
+                }
             }
         }
-        // While an imported song with a tempo map plays, show the tempo it's playing at;
+        // An imported song that didn't adopt its tempo map: show the tempo it plays at;
         // hovering/dragging shows (and edits) the project tempo again.
-        let song = snap.project.song_tempo_at(s.position_secs);
+        let song = snap.project.song_tempo_at(s.position_secs).filter(|t| (t - bpm).abs() > 0.05);
         let hint = match song {
             Some(t) => format!("Song tempo {t:.1} at the playhead (from the imported score).\nProject tempo {bpm:.1} — drag to change it (Shift = fine)"),
+            None if section.is_some() => "Tempo at the playhead (from the tempo track) — drag to change it (Shift = fine)".to_string(),
             None => "Drag to change tempo (Shift = fine)".to_string(),
         };
         let resp = resp.on_hover_text(hint);
@@ -1408,7 +1490,7 @@ impl DawApp {
         x = tempo_rect.right();
         sep(p, x);
 
-        let (n, d) = snap.project.time_signature;
+        let (n, d) = map.signature_at(s.position_secs.max(0.0));
         let sig_rect = Rect::from_min_max(pos2(x, rect.top()), rect.max);
         p.text(pos2(sig_rect.center().x, value_y), Align2::CENTER_CENTER, format!("{n}/{d}"), FontId::monospace(16.0), theme::LCD_TEXT);
         p.text(pos2(sig_rect.center().x, label_y), Align2::CENTER_CENTER, "SIGNATURE", small, theme::LCD_DIM);
@@ -1492,22 +1574,23 @@ impl DawApp {
     }
 
     fn plugin_windows(&mut self, ui: &egui::Ui, snap: &Snapshot) {
-        let tracks = &snap.project.tracks;
-        let slot_of = |t: usize, s: SlotRef| {
-            tracks.get(t).and_then(|tr| match s {
-                SlotRef::Instrument => tr.instrument.as_ref(),
-                SlotRef::Effect(i) => tr.plugins.get(i),
-            })
+        let project = &snap.project;
+        let slot_of = |t: usize, s: SlotRef| match s {
+            SlotRef::Master(i) => project.master_plugins.get(i),
+            SlotRef::Instrument => project.tracks.get(t).and_then(|tr| tr.instrument.as_ref()),
+            SlotRef::Effect(i) => project.tracks.get(t).and_then(|tr| tr.plugins.get(i)),
         };
         self.open_plugins.retain(|&(t, s)| slot_of(t, s).is_some());
         for (n, (t, s)) in self.open_plugins.clone().into_iter().enumerate() {
             let Some(slot) = slot_of(t, s) else { continue };
             let name = short_plugin_name(&slot.name).to_string();
+            let owner = if matches!(s, SlotRef::Master(_)) { "Stereo Out".to_string() } else { project.tracks[t].name.clone() };
+            let is_eq = slot.format == opentake_engine::project::PluginFormat::Builtin && slot.path == opentake_engine::eq::PATH;
             let mut open = true;
-            egui::Window::new(format!("{} — {}", tracks[t].name, name))
+            egui::Window::new(format!("{owner} — {name}"))
                 .id(ui.make_persistent_id(("plugin_window", t, s)))
                 .open(&mut open)
-                .default_size([400.0, 360.0])
+                .default_size(if is_eq { [660.0, 440.0] } else { [400.0, 360.0] })
                 .default_pos(pos2(640.0 + 28.0 * n as f32, 260.0))
                 .show(ui.ctx(), |ui| {
                     ui.horizontal(|ui| {
@@ -1521,6 +1604,10 @@ impl DawApp {
                     });
                     ui.add_space(6.0);
                     let params = snap.params.get(&(t, s)).map(Vec::as_slice).unwrap_or_default();
+                    if is_eq && !params.is_empty() {
+                        eq_view::show(self, ui, t, s, params, snap.status.sample_rate as f64);
+                        return;
+                    }
                     if params.is_empty() {
                         ui.label(RichText::new("This plug-in exposes no parameters.").color(theme::TEXT_FAINT));
                         return;
@@ -1769,11 +1856,8 @@ pub(crate) fn format_time(secs: f64) -> String {
 
 /// 1-based bar, beat and sixteenth division at `secs`.
 pub(crate) fn bar_beat(secs: f64, project: &Project) -> (u64, u64, u64) {
-    let beats = secs.max(0.0) * project.tempo_bpm / 60.0;
-    let whole = beats as u64;
-    let per_bar = project.time_signature.0.max(1) as u64;
-    let div = ((beats - whole as f64) * 4.0) as u64 + 1;
-    (whole / per_bar + 1, whole % per_bar + 1, div)
+    let pos = project.tempo_map().position(secs.max(0.0));
+    (pos.bar.max(1) as u64, pos.beat as u64, (pos.fraction * 4.0) as u64 + 1)
 }
 
 #[cfg(test)]
@@ -2327,7 +2411,7 @@ mod tests {
     #[test]
     fn metronome_button_and_menu_toggle_click() {
         let (mut harness, engine) = harness_with_track();
-        click(&mut harness, "Metronome (K) — right-click for volume");
+        click(&mut harness, "Metronome (K) — right-click for volume and count-in");
         assert!(engine.lock().unwrap().project().metronome_enabled);
         click(&mut harness, "Transport");
         click(&mut harness, &menu_label(MenuCommand::ToggleMetronome));
@@ -2415,6 +2499,115 @@ mod tests {
     }
 
     #[test]
+    fn tempo_track_adds_and_edits_tempo_changes() {
+        let (mut harness, engine) = harness_with_track();
+        harness.state_mut().snap_mode = timeline::SnapMode::Bar;
+        harness.step();
+        let row = harness.get_by_label("Tempo Track").rect();
+        // Double-click near bar 3 (4 s at 120 BPM): a change snapped to the bar line.
+        let x = harness.state().view.x(4.1);
+        double_click_at(&mut harness, egui::pos2(x, row.center().y));
+        let changes = engine.lock().unwrap().project().tempo_changes.clone();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!((changes[0].at_secs, changes[0].bpm), (4.0, 120.0));
+
+        // Drag the section after it up 20 px: +10 BPM, as one undo step.
+        let from = egui::pos2(harness.state().view.x(5.0), row.center().y);
+        press_drag(&mut harness, from, from - egui::vec2(0.0, 20.0), egui::Modifiers::NONE);
+        assert_eq!(engine.lock().unwrap().project().tempo_changes[0].bpm, 130.0);
+        // Before the change, dragging edits the opening tempo.
+        let from = egui::pos2(harness.state().view.x(1.0), row.center().y);
+        press_drag(&mut harness, from, from + egui::vec2(0.0, 20.0), egui::Modifiers::NONE);
+        assert_eq!(engine.lock().unwrap().project().tempo_bpm, 110.0);
+        let map = engine.lock().unwrap().project().tempo_map();
+        assert_eq!(map.tempo_at(6.0), 130.0);
+
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        harness.step();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        harness.step();
+        let e = engine.lock().unwrap();
+        assert_eq!((e.project().tempo_bpm, e.project().tempo_changes[0].bpm), (120.0, 120.0), "each drag is one undo step");
+    }
+
+    #[test]
+    fn count_in_settings_from_metronome_menu_and_transport_menu() {
+        let (mut harness, engine) = harness_with_track();
+        let button = harness.get_by_label("Metronome (K) — right-click for volume and count-in").rect().center();
+        harness.hover_at(button);
+        harness.step();
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton { pos: button, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE });
+        }
+        harness.step();
+        harness.step();
+        click(&mut harness, "2 bars");
+        assert_eq!(engine.lock().unwrap().project().count_in_bars, 2);
+        click(&mut harness, "Transport");
+        click(&mut harness, &menu_label(MenuCommand::ToggleCountInOnPlay));
+        assert!(engine.lock().unwrap().project().count_in_on_play);
+        click(&mut harness, "Transport");
+        click(&mut harness, &menu_label(MenuCommand::ToggleCountIn));
+        assert_eq!(engine.lock().unwrap().project().count_in_bars, 0);
+    }
+
+    #[test]
+    fn master_eq_insert_and_drag_a_band_in_the_editor() {
+        let (mut harness, engine) = harness_with_track();
+        harness.key_press(egui::Key::X);
+        harness.step();
+        harness.step();
+        // The inspector shows Stereo Out too; use the mixer's (lowest) add button.
+        let add = harness.query_all_by_label("Add audio effect to the master bus").map(|n| n.rect()).max_by(|a, b| a.top().total_cmp(&b.top())).unwrap();
+        harness.hover_at(add.center());
+        harness.step();
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton { pos: add.center(), button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+        }
+        harness.step();
+        harness.step();
+        click(&mut harness, opentake_engine::eq::NAME);
+        assert_eq!(engine.lock().unwrap().project().master_plugins.len(), 1);
+        assert!(harness.state().open_plugins.contains(&(MASTER_UI, SlotRef::Master(0))), "the EQ window opens");
+        for _ in 0..3 {
+            harness.step();
+        }
+        // Drag the Low Mid band (400 Hz, 0 dB) up.
+        let graph = harness.get_by_label("EQ Graph").rect();
+        let x = graph.left() + opentake_engine::eq::norm_freq(400.0) as f32 * graph.width();
+        let from = egui::pos2(x, graph.center().y);
+        press_drag(&mut harness, from, from - egui::vec2(0.0, 40.0), egui::Modifiers::NONE);
+        let gain_id = opentake_engine::eq::param_id(2, opentake_engine::eq::Field::Gain);
+        let gain = |e: &SharedEngine| {
+            let e = e.lock().unwrap();
+            let v = e.project().master_plugins[0].params.iter().find(|p| p.0 == gain_id).map(|p| p.1).unwrap_or(0.5);
+            opentake_engine::eq::gain_of(v)
+        };
+        let boosted = gain(&engine);
+        assert!(boosted > 5.0, "boosted {boosted} dB");
+        assert_eq!(engine.lock().unwrap().history_info().undo.as_deref(), Some("Adjust Low Mid"));
+        engine.lock().unwrap().undo().unwrap();
+        assert!(gain(&engine).abs() < 1e-6, "the whole drag is one undo step");
+    }
+
+    #[test]
+    fn tablature_size_and_paper_mode() {
+        let (mut harness, engine) = harness_with_track();
+        let fixture = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../opentake-project/tests/fixtures/simple.gp"));
+        engine.lock().unwrap().import_guitar_pro(&fixture, &opentake_engine::GuitarProImport::default()).unwrap();
+        harness.state_mut().bottom = Some(BottomTab::Tab);
+        harness.step();
+        harness.step();
+        click(&mut harness, "Paper");
+        assert!(harness.state().tab_paper);
+        click(&mut harness, "A+");
+        click(&mut harness, "A+");
+        assert_eq!(harness.state().tab_scale, 1.5);
+        click(&mut harness, "A−");
+        assert_eq!(harness.state().tab_scale, 1.25);
+    }
+
+    #[test]
     fn transport_buttons_drive_engine() {
         let (mut harness, _engine) = harness_with_track();
         click(&mut harness, "Go to Beginning (Home)");
@@ -2478,6 +2671,9 @@ mod tests {
             e.set_midi_notes(keys, clip, notes).unwrap();
             e.add_track("Audio 4").unwrap();
             e.set_loop(Some(true), Some(2.0 * 4.0 * beat), Some(3.0 * 4.0 * beat)).unwrap();
+            // A tempo change into 3/4 at bar 5.
+            let change = opentake_engine::project::TempoChange { at_secs: 16.0 * beat, bpm: 96.0, time_signature: Some((3, 4)) };
+            e.set_tempo_changes(vec![change], None).unwrap();
             e.seek(5.2).unwrap();
         }
 
@@ -2529,6 +2725,34 @@ mod tests {
         }
         let tab = out.replace(".png", "-tab.png");
         harness.render().expect("render").save(&tab).expect("save png");
+
+        // The same on paper, larger.
+        harness.state_mut().tab_paper = true;
+        harness.state_mut().tab_scale = 1.5;
+        for _ in 0..4 {
+            harness.step();
+        }
+        harness.render().expect("render").save(out.replace(".png", "-paper.png")).expect("save png");
+
+        // Master EQ with a few bands set, its editor open over the mixer.
+        {
+            use opentake_engine::eq::{self, Field};
+            let mut e = engine.lock().unwrap();
+            e.insert_master_plugin("eq", None).unwrap();
+            let m = SlotRef::Master(0);
+            e.set_slot_param(0, m, eq::param_id(0, Field::On), 1.0).unwrap();
+            e.set_slot_param(0, m, eq::param_id(1, Field::Gain), eq::norm_gain(3.0)).unwrap();
+            e.set_slot_param(0, m, eq::param_id(2, Field::Gain), eq::norm_gain(-4.5)).unwrap();
+            e.set_slot_param(0, m, eq::param_id(3, Field::Gain), eq::norm_gain(5.0)).unwrap();
+            e.set_slot_param(0, m, eq::param_id(3, Field::Q), eq::norm_q(2.0)).unwrap();
+            e.set_slot_param(0, m, eq::param_id(4, Field::Gain), eq::norm_gain(2.0)).unwrap();
+        }
+        harness.state_mut().bottom = Some(BottomTab::Mixer);
+        harness.state_mut().open_plugins = vec![(MASTER_UI, SlotRef::Master(0))];
+        for _ in 0..6 {
+            harness.step();
+        }
+        harness.render().expect("render").save(out.replace(".png", "-eq.png")).expect("save png");
         std::fs::remove_dir_all(&dir).ok();
         eprintln!("wrote {out}, {piano} and {tab}");
     }

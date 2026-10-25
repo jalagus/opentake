@@ -11,21 +11,30 @@ use opentake_project::{PluginFormat, PluginSlot};
 use opentake_vst3::{ClassInfo, Module, NoteEvent, ScannedPlugin, Vst3Plugin, Vst3Processor};
 
 use super::{Engine, ParamView, display_name};
-use crate::mixer::{Command, MAX_BLOCK, MidiEvent, PLUGIN_CAPACITY, PluginRt, Processor, Transport};
+use crate::mixer::{Command, MASTER, MAX_BLOCK, MidiEvent, PLUGIN_CAPACITY, PluginRt, Processor, Transport};
 use crate::drums::{self, DrumSynth};
+use crate::eq::{self, Eq};
 use crate::synth::{self, Synth};
 
 pub(super) enum Loaded {
     Vst3(Vst3Plugin),
     Synth,
     Drums,
+    Eq,
 }
 
-/// Which plugin on a track: its instrument or an effect slot.
+/// Which plugin: a track's instrument or effect slot, or a slot on the master bus (the
+/// track argument is ignored for those).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SlotRef {
     Instrument,
     Effect(usize),
+    Master(usize),
+}
+
+fn is_builtin_eq(query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    matches!(q.as_str(), "eq" | "equalizer" | "equaliser" | "channel eq" | "parametric eq" | "builtin:eq") || q == eq::NAME.to_lowercase()
 }
 
 struct Vst3Insert {
@@ -194,6 +203,14 @@ impl Engine {
             slot.instance = self.add_to_pool(Loaded::Drums);
             return Ok(slot);
         }
+        if is_builtin_eq(query) {
+            if instrument {
+                bail!("{} is an effect, not an instrument", eq::NAME);
+            }
+            let mut slot = builtin_slot(eq::NAME, eq::PATH);
+            slot.instance = self.add_to_pool(Loaded::Eq);
+            return Ok(slot);
+        }
         let (bundle, cid) = self.resolve_plugin(query, instrument)?;
         let plugin = self.instantiate(&bundle, cid.as_deref(), None)?;
         let kind = if plugin.is_instrument() { "VST3i" } else { "VST3" };
@@ -216,6 +233,7 @@ impl Engine {
         match slot.format {
             PluginFormat::Builtin if slot.path == synth::PATH => return Ok(self.add_to_pool(Loaded::Synth)),
             PluginFormat::Builtin if slot.path == drums::PATH => return Ok(self.add_to_pool(Loaded::Drums)),
+            PluginFormat::Builtin if slot.path == eq::PATH => return Ok(self.add_to_pool(Loaded::Eq)),
             PluginFormat::Vst3 => {}
             _ => bail!("unsupported plugin format"),
         }
@@ -266,6 +284,13 @@ impl Engine {
                 }
                 Box::new(d)
             }
+            Some(Loaded::Eq) => {
+                let mut q = Eq::new(sr as f64);
+                for &(id, value) in &slot.params {
+                    q.set_param(id, value);
+                }
+                Box::new(q)
+            }
             None => return Ok(None),
         };
         Ok(Some(Box::new(PluginRt { instance: slot.instance, processor, bypass: slot.bypass })))
@@ -297,6 +322,38 @@ impl Engine {
         })
     }
 
+    /// Bring the audio thread's master insert chain in line with the project.
+    pub(super) fn sync_master_chain(&mut self) -> Result<()> {
+        if self.audio.is_none() {
+            return Ok(());
+        }
+        let live = self.live_chain.get(&MASTER).cloned().unwrap_or_default();
+        let slots: Vec<PluginSlot> = self.project.master_plugins.iter().filter(|s| self.is_loaded(s)).cloned().collect();
+        let sr = self.sample_rate();
+        let mut new = Vec::new();
+        for slot in slots.iter().filter(|s| !live.contains(&s.instance)) {
+            if let Some(p) = self.make_processor(slot, sr)? {
+                new.push(p);
+            }
+        }
+        let order: Vec<(u64, bool)> = slots.iter().map(|s| (s.instance, s.bypass)).collect();
+        self.live_chain.insert(MASTER, order.iter().map(|o| o.0).collect());
+        self.send(Command::SetPluginChain {
+            track: MASTER,
+            order: Box::new(order),
+            new: Box::new(new),
+            target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)),
+        })
+    }
+
+    /// Mixer id for a slot's commands: the master bus or the track.
+    fn slot_target(&self, track: usize, which: SlotRef) -> u64 {
+        match which {
+            SlotRef::Master(_) => MASTER,
+            _ => self.track_id(track),
+        }
+    }
+
     /// Bring the audio thread's instrument for a track in line with the project.
     pub(super) fn sync_instrument(&mut self, index: usize) -> Result<()> {
         if self.audio.is_none() {
@@ -322,20 +379,57 @@ impl Engine {
     // ---------------------------------------------------------------- slots
 
     fn slot_ref(&self, track: usize, which: SlotRef) -> Result<&PluginSlot> {
+        if let SlotRef::Master(s) = which {
+            return self.project.master_plugins.get(s).ok_or_else(|| anyhow!("the master bus has no plugin at slot {s}"));
+        }
         let t = &self.project.tracks[self.track_index(track)?];
         match which {
             SlotRef::Instrument => t.instrument.as_ref().ok_or_else(|| anyhow!("track {track} has no instrument")),
             SlotRef::Effect(s) => t.plugins.get(s).ok_or_else(|| anyhow!("track {track} has no plugin at slot {s}")),
+            SlotRef::Master(_) => unreachable!(),
         }
     }
 
     fn slot_mut(&mut self, track: usize, which: SlotRef) -> Result<&mut PluginSlot> {
+        if let SlotRef::Master(s) = which {
+            return self.project.master_plugins.get_mut(s).ok_or_else(|| anyhow!("the master bus has no plugin at slot {s}"));
+        }
         let index = self.track_index(track)?;
         let t = &mut self.project.tracks[index];
         match which {
             SlotRef::Instrument => t.instrument.as_mut().ok_or_else(|| anyhow!("track {track} has no instrument")),
             SlotRef::Effect(s) => t.plugins.get_mut(s).ok_or_else(|| anyhow!("track {track} has no plugin at slot {s}")),
+            SlotRef::Master(_) => unreachable!(),
         }
+    }
+
+    /// Insert an effect on the master bus. `position` defaults to the end of the chain.
+    pub fn insert_master_plugin(&mut self, query: &str, position: Option<usize>) -> Result<usize> {
+        let slot = self.new_slot(query, false)?;
+        self.record("Insert Master Plug-in", None, |e| {
+            let pos = position.unwrap_or(usize::MAX).min(e.project.master_plugins.len());
+            e.project.master_plugins.insert(pos, slot);
+            e.sync_master_chain()?;
+            Ok(pos)
+        })
+    }
+
+    pub fn remove_master_plugin(&mut self, slot: usize) -> Result<PluginSlot> {
+        self.slot_ref(0, SlotRef::Master(slot))?;
+        self.record("Remove Master Plug-in", None, |e| {
+            let removed = e.project.master_plugins.remove(slot);
+            e.sync_master_chain()?;
+            Ok(removed)
+        })
+    }
+
+    /// Effects available to insert: the built-in EQ plus scanned VST3 effects.
+    pub fn available_effects(&self) -> Vec<(String, String)> {
+        let mut list = vec![(eq::NAME.to_string(), eq::PATH.to_string())];
+        for p in self.scanned.iter().filter(|p| !p.class.is_instrument()) {
+            list.push((format!("{} — {}", p.class.name, p.class.vendor), p.bundle.to_string_lossy().into_owned()));
+        }
+        list
     }
 
     // ---------------------------------------------------------------- effects
@@ -367,13 +461,13 @@ impl Engine {
     }
 
     pub fn set_slot_bypass(&mut self, track: usize, which: SlotRef, bypass: bool) -> Result<()> {
-        let index = self.track_index(track)?;
         self.slot_ref(track, which)?;
         self.record(if bypass { "Bypass Plug-in" } else { "Enable Plug-in" }, None, |e| {
             let slot = e.slot_mut(track, which)?;
             slot.bypass = bypass;
             let instance = slot.instance;
-            e.send(Command::SetPluginBypass { track: e.track_id(index), instance, bypass })
+            let target = e.slot_target(track, which);
+            e.send(Command::SetPluginBypass { track: target, instance, bypass })
         })
     }
 
@@ -430,6 +524,13 @@ impl Engine {
                     }
                 })
                 .collect()),
+            Some(Loaded::Eq) => Ok(eq::params()
+                .into_iter()
+                .map(|(id, title, units, default, steps)| {
+                    let value = slot.params.iter().find(|(pid, _)| *pid == id).map_or(default, |p| p.1);
+                    ParamView { id, title, units: units.into(), value, display: Some(eq::display(id, value)), step_count: steps, read_only: false }
+                })
+                .collect()),
             None => bail!("plugin '{}' is not loaded", slot.name),
         }
     }
@@ -440,7 +541,7 @@ impl Engine {
     }
 
     pub fn set_slot_param(&mut self, track: usize, which: SlotRef, id: u32, value: f64) -> Result<Option<String>> {
-        let index = self.track_index(track)?;
+        let index = if matches!(which, SlotRef::Master(_)) { track } else { self.track_index(track)? };
         let value = value.clamp(0.0, 1.0);
         let params = self.slot_params(track, which)?;
         let current = params.iter().find(|p| p.id == id).ok_or_else(|| anyhow!("plugin has no parameter with id {id}"))?.value;
@@ -460,6 +561,28 @@ impl Engine {
         Ok(self.slot_params(track, which)?.into_iter().find(|p| p.id == id).and_then(|p| p.display))
     }
 
+    /// Set several parameters as one undo step (e.g. an EQ band's frequency and gain while
+    /// dragging it). Repeated calls with the same `label` and ids merge into one step.
+    pub fn set_slot_params(&mut self, track: usize, which: SlotRef, values: &[(u32, f64)], label: &str) -> Result<()> {
+        let index = if matches!(which, SlotRef::Master(_)) { track } else { self.track_index(track)? };
+        let params = self.slot_params(track, which)?;
+        for &(id, _) in values {
+            let current = params.iter().find(|p| p.id == id).ok_or_else(|| anyhow!("plugin has no parameter with id {id}"))?.value;
+            let slot = self.slot_mut(track, which)?;
+            if !slot.params.iter().any(|(pid, _)| *pid == id) {
+                slot.params.push((id, current));
+            }
+        }
+        let instance = self.slot_ref(track, which)?.instance;
+        let ids: Vec<String> = values.iter().map(|v| v.0.to_string()).collect();
+        self.record(label.to_string(), Some(format!("params:{instance}:{}", ids.join(","))), |e| {
+            for &(id, value) in values {
+                e.apply_param(index, which, id, value.clamp(0.0, 1.0))?;
+            }
+            Ok(())
+        })
+    }
+
     /// Write a parameter into the project, the plugin controller and the processor.
     pub(super) fn apply_param(&mut self, index: usize, which: SlotRef, id: u32, value: f64) -> Result<()> {
         let slot = self.slot_mut(index, which)?;
@@ -471,7 +594,8 @@ impl Engine {
         if let Some(Loaded::Vst3(plugin)) = self.pool.get(&instance) {
             plugin.set_param_on_controller(id, value);
         }
-        self.send(Command::SetPluginParam { track: self.track_id(index), instance, id, value })
+        let target = self.slot_target(index, which);
+        self.send(Command::SetPluginParam { track: target, instance, id, value })
     }
 
     // ---------------------------------------------------------------- instruments

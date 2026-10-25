@@ -12,6 +12,8 @@ use super::{Action, DawApp, Snapshot, theme, timeline, widgets};
 const NOTE_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 /// Row with bar numbers, time signatures and sections.
 const HEADER_H: f32 = 22.0;
+/// Where the system's opening line sits in the left column.
+const SYSTEM_X: f32 = 30.0;
 /// Extra header row for tempo markings.
 const TEMPO_H: f32 = 14.0;
 
@@ -69,6 +71,20 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             timeline::zoom_controls(app, ui, "tab_zoom", playhead);
             ui.add_space(10.0);
+            // Reading comfort: size and paper (white) background.
+            let paper = app.tab_paper;
+            let text = RichText::new("Paper").size(11.0).color(if paper { Color32::WHITE } else { theme::TEXT_DIM });
+            if ui.add(egui::Button::new(text).fill(if paper { theme::BG_HEADER_SELECTED } else { theme::BG_CONTROL })).on_hover_text("Dark ink on a white page").clicked() {
+                app.set_tab_view_prefs(app.tab_scale, !paper);
+            }
+            if ui.add_enabled(app.tab_scale < 2.5, egui::Button::new(RichText::new("A+").size(12.0))).on_hover_text("Larger notation and tab").clicked() {
+                app.set_tab_view_prefs((app.tab_scale + 0.25).min(2.5), app.tab_paper);
+            }
+            ui.label(RichText::new(format!("{:.0}%", app.tab_scale * 100.0)).size(10.5).color(theme::TEXT_FAINT));
+            if ui.add_enabled(app.tab_scale > 0.75, egui::Button::new(RichText::new("A−").size(10.5))).on_hover_text("Smaller notation and tab").clicked() {
+                app.set_tab_view_prefs((app.tab_scale - 0.25).max(0.75), app.tab_paper);
+            }
+            ui.add_space(10.0);
             for mode in TabMode::ALL.into_iter().rev() {
                 let on = app.tab_mode == mode;
                 let text = RichText::new(mode.label()).size(11.0).color(if on { Color32::WHITE } else { theme::TEXT_DIM });
@@ -81,19 +97,44 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
     });
     ui.add_space(4.0);
 
-    let full = ui.available_rect_before_wrap();
-    let resp = ui.allocate_rect(full, Sense::click_and_drag());
+    let pal = if app.tab_paper { Palette::PAPER } else { Palette::DARK };
+    let scale = app.tab_scale;
+    // Height the parts need at this size; scroll when the panel is smaller.
+    let clips_strings = project.tracks[track].midi_clips.iter().filter_map(|c| c.tab.as_ref()).map(|t| t.tuning.len()).max().unwrap_or(6) as f32;
+    let has_tempos = project.tracks[track].midi_clips.iter().any(|c| c.tab.is_some() && !c.tempos.is_empty());
+    let header = HEADER_H + if has_tempos { TEMPO_H } else { 0.0 };
+    let staff_h = 30.0 * 4.0 * scale;
+    let tab_h = clips_strings * 15.0 * scale + 30.0;
+    let needed = header
+        + match app.tab_mode {
+            TabMode::Notes => staff_h,
+            TabMode::Tab => tab_h,
+            TabMode::Both => staff_h + tab_h,
+        };
+    let avail = ui.available_height();
+    if needed > avail {
+        egui::ScrollArea::vertical().id_salt("tab_scroll").auto_shrink([false, false]).show(ui, |ui| draw_body(app, ui, snap, track, playhead, pal, scale, needed));
+    } else {
+        draw_body(app, ui, snap, track, playhead, pal, scale, avail);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_body(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot, track: usize, playhead: f64, pal: Palette, scale: f32, height: f32) {
+    let project = &snap.project;
+    let width = ui.available_width();
+    let (full, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click_and_drag());
     widgets::label(&resp, egui::Role::Group, "Tab staff");
     let lanes = app.view.lanes();
     let content = Rect::from_x_y_ranges(Rangef::new(lanes.min.max(full.left()), full.right()), full.y_range());
     let gutter = Rect::from_min_max(full.min, pos2(content.left(), full.bottom()));
     let painter = ui.painter().clone();
-    painter.rect_filled(full, 6.0, theme::BG_DEEP);
+    painter.rect_filled(full, 6.0, pal.bg);
 
     let clips: Vec<(&MidiClip, &TabLayout)> = project.tracks[track].midi_clips.iter().filter_map(|c| c.tab.as_ref().map(|t| (c, t))).collect();
-    painter.text(gutter.left_top() + vec2(10.0, 6.0), Align2::LEFT_TOP, &project.tracks[track].name, FontId::proportional(12.0), theme::TEXT);
+    painter.text(gutter.left_top() + vec2(10.0, 6.0), Align2::LEFT_TOP, &project.tracks[track].name, FontId::proportional(12.0), pal.ink);
     if let Some((_, layout)) = clips.first().filter(|(_, l)| l.capo > 0) {
-        painter.text(gutter.left_top() + vec2(10.0, 21.0), Align2::LEFT_TOP, format!("Capo {}", layout.capo), FontId::proportional(10.0), theme::TEXT_FAINT);
+        painter.text(gutter.left_top() + vec2(10.0, 21.0), Align2::LEFT_TOP, format!("Capo {}", layout.capo), FontId::proportional(10.0), pal.faint);
     }
 
     // Split the area between staff and tab.
@@ -105,12 +146,12 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
         TabMode::Tab => (None, Some(body)),
         TabMode::Both => {
             let strings = clips.iter().map(|(_, t)| t.tuning.len()).max().unwrap_or(6) as f32;
-            let tab_h = (strings * 16.0 + 24.0).min(body.height() * 0.45);
+            let tab_h = (strings * 16.0 * scale + 24.0).min(body.height() * 0.55);
             let split = body.bottom() - tab_h;
             (Some(Rect::from_min_max(body.min, pos2(body.right(), split))), Some(Rect::from_min_max(pos2(body.left(), split), body.max)))
         }
     };
-    let ctx = Ctx { app, content, playhead, color: theme::track_color(track) };
+    let ctx = Ctx { app, content, playhead, color: theme::track_color(track), pal, scale };
     draw_bar_header(&ctx, &painter, &clips, Rect::from_min_max(pos2(content.left(), full.top()), pos2(content.right(), body.top())));
     if let Some(r) = staff_rect {
         draw_staff(&ctx, &painter, &clips, r, gutter.x_range());
@@ -122,7 +163,7 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
     // Playhead, exactly where the arrangement draws it.
     let x = app.view.x(playhead);
     if content.x_range().contains(x) {
-        painter.with_clip_rect(content).vline(x, Rangef::new(full.top() + 2.0, full.bottom() - 2.0), Stroke::new(1.0, theme::PLAYHEAD));
+        painter.with_clip_rect(content).vline(x, Rangef::new(full.top() + 2.0, full.bottom() - 2.0), Stroke::new(1.0, pal.playhead));
     }
 
     // Click to move the playhead; scroll/zoom moves the shared timeline view.
@@ -139,6 +180,42 @@ struct Ctx<'a> {
     content: Rect,
     playhead: f64,
     color: Color32,
+    pal: Palette,
+    /// Size of the notation and tab (1.0 = normal).
+    scale: f32,
+}
+
+/// Colours for the notation and tab: the app's dark look, or ink on paper.
+#[derive(Clone, Copy)]
+struct Palette {
+    bg: Color32,
+    ink: Color32,
+    dim: Color32,
+    faint: Color32,
+    line: Color32,
+    section: Color32,
+    playhead: Color32,
+}
+
+impl Palette {
+    const DARK: Palette = Palette {
+        bg: theme::BG_DEEP,
+        ink: theme::TEXT,
+        dim: theme::TEXT_DIM,
+        faint: theme::TEXT_FAINT,
+        line: theme::HAIRLINE,
+        section: theme::SOLO,
+        playhead: theme::PLAYHEAD,
+    };
+    const PAPER: Palette = Palette {
+        bg: Color32::from_rgb(251, 250, 247),
+        ink: Color32::from_rgb(22, 24, 28),
+        dim: Color32::from_rgb(70, 75, 84),
+        faint: Color32::from_rgb(128, 134, 144),
+        line: Color32::from_rgb(196, 200, 207),
+        section: Color32::from_rgb(170, 110, 0),
+        playhead: Color32::from_rgb(220, 60, 45),
+    };
 }
 
 impl Ctx<'_> {
@@ -174,14 +251,14 @@ fn draw_bar_header(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout
                 continue;
             }
             let font = FontId::proportional(10.0);
-            let r = p.text(pos2(x + 3.0, rect.top() + 5.0), Align2::LEFT_TOP, bar.number.to_string(), font.clone(), theme::TEXT_FAINT);
+            let r = p.text(pos2(x + 3.0, rect.top() + 5.0), Align2::LEFT_TOP, bar.number.to_string(), font.clone(), ctx.pal.faint);
             let mut label_x = r.right() + 5.0;
             if sig_changed {
-                let r = p.text(pos2(label_x, rect.top() + 5.0), Align2::LEFT_TOP, format!("{}/{}", sig.0, sig.1), font, theme::TEXT_DIM);
+                let r = p.text(pos2(label_x, rect.top() + 5.0), Align2::LEFT_TOP, format!("{}/{}", sig.0, sig.1), font, ctx.pal.dim);
                 label_x = r.right() + 6.0;
             }
             if let Some(section) = &bar.section {
-                p.text(pos2(label_x, rect.top() + 4.5), Align2::LEFT_TOP, section, FontId::proportional(10.5), theme::SOLO);
+                p.text(pos2(label_x, rect.top() + 4.5), Align2::LEFT_TOP, section, FontId::proportional(10.5), ctx.pal.section);
             }
         }
         // Tempo markings on a second line, the one at the playhead highlighted.
@@ -191,31 +268,44 @@ fn draw_bar_header(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout
         let span = Rangef::new(ctx.x(clip.position_secs).max(rect.left()), ctx.x(clip.position_secs + clip.length_secs).min(rect.right()));
         if span.span() > 0.0 {
             let row = p.with_clip_rect(Rect::from_x_y_ranges(span, rect.y_range()));
-            timeline::draw_tempo_labels(&row, span, rect.top() + HEADER_H + 4.0, &marks, current, theme::BG_DEEP);
+            timeline::draw_tempo_labels(&row, span, rect.top() + HEADER_H + 4.0, &marks, current, ctx.pal.bg);
         }
     }
 }
 
 fn draw_tab(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], rect: Rect, gutter: Rangef) {
     let strings = clips.iter().map(|(_, t)| t.tuning.len()).max().unwrap_or(6).max(1);
-    let spacing = ((rect.height() - 24.0) / strings as f32).clamp(9.0, 18.0);
+    let spacing = ((rect.height() - 24.0) / strings as f32).clamp(9.0 * ctx.scale, 18.0 * ctx.scale);
     let top = rect.top() + 12.0 + spacing / 2.0;
     // Highest string on top, as tab is written.
     let y_of = |string: usize| top + (strings - 1 - string.min(strings - 1)) as f32 * spacing;
     let (y_top, y_bottom) = (y_of(strings - 1), y_of(0));
 
+    // The left column starts the system like printed tab: string names, a bracket line,
+    // "TAB" stacked, and the strings running on into the timeline.
+    let system_x = gutter.min + SYSTEM_X;
     if let Some((_, layout)) = clips.first() {
         for (s, &open) in layout.tuning.iter().enumerate() {
-            painter.text(pos2(gutter.max - 10.0, y_of(s)), Align2::RIGHT_CENTER, NOTE_NAMES[(open % 12) as usize], FontId::monospace(11.0), theme::TEXT_DIM);
+            painter.text(pos2(system_x - 6.0, y_of(s)), Align2::RIGHT_CENTER, NOTE_NAMES[(open % 12) as usize], FontId::monospace(11.0 * ctx.scale.sqrt()), ctx.pal.dim);
         }
+    }
+    painter.vline(system_x, Rangef::new(y_top, y_bottom), Stroke::new(1.5, ctx.pal.faint));
+    for s in 0..strings {
+        painter.hline(Rangef::new(system_x, gutter.max), y_of(s), Stroke::new(1.0, ctx.pal.line));
+    }
+    let tab_letters = ["T", "A", "B"];
+    let letter_h = (y_bottom - y_top) / 3.0;
+    for (i, l) in tab_letters.iter().enumerate() {
+        let y = y_top + letter_h * (i as f32 + 0.5);
+        painter.text(pos2(system_x + 16.0, y), Align2::CENTER_CENTER, *l, FontId::proportional((letter_h * 0.9).clamp(9.0, 15.0)), ctx.pal.dim);
     }
     let content = Rect::from_x_y_ranges(ctx.content.x_range(), rect.y_range());
     let p = painter.with_clip_rect(content);
     for s in 0..strings {
-        p.hline(content.x_range(), y_of(s), Stroke::new(1.0, theme::HAIRLINE));
+        p.hline(content.x_range(), y_of(s), Stroke::new(1.0, ctx.pal.line));
     }
 
-    let mono = FontId::monospace(11.5);
+    let mono = FontId::monospace(11.5 * ctx.scale);
     for (clip, layout) in clips {
         let (start, end) = (clip.position_secs, clip.position_secs + clip.length_secs);
         let (x0, x1) = (ctx.x(start), ctx.x(end));
@@ -226,7 +316,7 @@ fn draw_tab(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], rec
             p.vline(x, Rangef::new(y_top - 6.0, y_bottom + 6.0), Stroke::new(1.0, theme::with_alpha(ctx.color, 90)));
         }
         for (t, _) in bar_times(clip, layout) {
-            p.vline(ctx.x(t), Rangef::new(y_top, y_bottom), Stroke::new(1.0, theme::TEXT_FAINT));
+            p.vline(ctx.x(t), Rangef::new(y_top, y_bottom), Stroke::new(1.0, ctx.pal.faint));
         }
 
         // Fret numbers on their strings, with a faint line for how long they ring.
@@ -240,7 +330,7 @@ fn draw_tab(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], rec
             let Some(pos) = layout.position(n) else { continue };
             let y = y_of(pos.string as usize);
             let sounding = ctx.sounding(t, note_end);
-            let (bg, fg) = if sounding { (ctx.color, Color32::from_rgb(16, 16, 18)) } else { (theme::BG_DEEP, theme::TEXT) };
+            let (bg, fg) = if sounding { (ctx.color, Color32::from_rgb(16, 16, 18)) } else { (ctx.pal.bg, ctx.pal.ink) };
             let galley = p.layout_no_wrap(pos.fret.to_string(), mono.clone(), fg);
             let box_rect = Rect::from_center_size(pos2(nx + galley.size().x / 2.0 + 1.0, y), galley.size() + vec2(4.0, 1.0));
             if nx_end > box_rect.right() + 2.0 {
@@ -347,6 +437,7 @@ struct Chord {
 /// Staff geometry shared by the drawing helpers.
 struct Staff<'a> {
     p: &'a Painter,
+    pal: Palette,
     h: f32,
     bottom_step: i32,
     bottom_y: f32,
@@ -377,7 +468,7 @@ impl Staff<'_> {
                 (true, true) => cx + 2.0 * rx,
                 (true, false) => cx - 2.0 * rx,
             };
-            let ledger = |s: i32| self.p.hline(Rangef::new(hx - rx * 1.7, hx + rx * 1.7), self.y(s), Stroke::new(1.0, theme::TEXT_FAINT));
+            let ledger = |s: i32| self.p.hline(Rangef::new(hx - rx * 1.7, hx + rx * 1.7), self.y(s), Stroke::new(1.0, self.pal.faint));
             for s in (step..self.bottom_step).filter(|s| (self.bottom_step - s) % 2 == 0) {
                 ledger(s);
             }
@@ -463,7 +554,7 @@ impl Staff<'_> {
             let shift = -dir * level as f32 * h * 1.55;
             let (ya, yb) = (line(xa) + shift, line(xb) + shift);
             let t = -dir * thick;
-            self.p.add(Shape::convex_polygon(vec![pos2(xa, ya), pos2(xb, yb), pos2(xb, yb + t), pos2(xa, ya + t)], theme::TEXT, Stroke::NONE));
+            self.p.add(Shape::convex_polygon(vec![pos2(xa, ya), pos2(xb, yb), pos2(xb, yb + t), pos2(xa, ya + t)], self.pal.ink, Stroke::NONE));
         };
         beam(x0 - 0.5, x1 + 0.5, 0);
         // Secondary beams join neighbours that both need them; a lone short note gets a stub
@@ -493,7 +584,7 @@ impl Staff<'_> {
         // Triplet number beyond the beam.
         if group.iter().all(|c| c.written.triplet) && (group.len() == 3 || group.len() == 6) {
             let mx = (x0 + x1) / 2.0;
-            self.p.text(pos2(mx, line(mx) + dir * h * 2.2), Align2::CENTER_CENTER, group.len().to_string(), FontId::proportional(h * 2.2), theme::TEXT_DIM);
+            self.p.text(pos2(mx, line(mx) + dir * h * 2.2), Align2::CENTER_CENTER, group.len().to_string(), FontId::proportional(h * 2.2), self.pal.dim);
         }
     }
 }
@@ -535,7 +626,7 @@ fn chords_of(ctx: &Ctx, clip: &MidiClip, layout: &TabLayout, content: Rect) -> V
             written: written(len / quarter),
             beat: (bar, beat),
             quarter,
-            ink: if sounding { ctx.color } else { theme::TEXT },
+            ink: if sounding { ctx.color } else { ctx.pal.ink },
         });
     }
     out
@@ -563,33 +654,36 @@ fn draw_staff(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], r
     // Guitar is written an octave above where it sounds (treble 8vb); bass likewise in bass clef.
     let bass = clips.first().and_then(|(_, l)| l.tuning.first()).is_some_and(|&low| low < 36);
     let bottom_step = if bass { diatonic(43).0 } else { diatonic(64).0 }; // G2 / E4 on the bottom line
-    let h = (rect.height() / 26.0).clamp(3.0, 5.0); // half a staff space
+    let h = (rect.height() / 26.0).clamp(3.0 * ctx.scale, 5.0 * ctx.scale); // half a staff space
     let middle = rect.center().y;
     let bottom_y = middle + 4.0 * h;
     let y_of = |step: i32| bottom_y - (step - bottom_step) as f32 * h;
     let (y_top, y_bottom) = (y_of(bottom_step + 8), bottom_y);
 
-    // Clef in the gutter, on a stub of the staff.
-    let clef_x = gutter.max - 24.0;
+    // The left column starts the system like a printed score: a bracket line, the clef,
+    // and the staff running on into the timeline.
+    let system_x = gutter.min + SYSTEM_X;
+    let clef_x = system_x + 18.0;
+    painter.vline(system_x, Rangef::new(y_top, y_bottom), Stroke::new(1.5, ctx.pal.faint));
     for k in 0..5 {
-        painter.hline(Rangef::new(gutter.max - 46.0, gutter.max), y_of(bottom_step + 2 * k), Stroke::new(1.0, theme::TEXT_FAINT));
+        painter.hline(Rangef::new(system_x, gutter.max), y_of(bottom_step + 2 * k), Stroke::new(1.0, ctx.pal.faint));
     }
     // Clef extents relative to their reference line, in staff spaces (SMuFL metrics):
     // the G clef curls around the second line, the F clef's dots straddle the fourth.
     let space = 2.0 * h;
     let (glyph, line, above, below) = if bass { ("\u{1D122}", y_of(bottom_step + 6), 1.05, 2.54) } else { ("\u{1D11E}", y_of(bottom_step + 2), 4.39, 2.63) };
     let (clef_top, clef_bottom) = (line - above * space, line + below * space);
-    if !(theme::has_music_font() && draw_glyph_fitted(painter, glyph, clef_x, clef_top, clef_bottom, theme::TEXT_DIM)) {
-        painter.text(pos2(clef_x, middle), Align2::CENTER_CENTER, if bass { "F" } else { "G" }, FontId::proportional(h * 4.0), theme::TEXT_DIM);
+    if !(theme::has_music_font() && draw_glyph_fitted(painter, glyph, clef_x, clef_top, clef_bottom, ctx.pal.dim)) {
+        painter.text(pos2(clef_x, middle), Align2::CENTER_CENTER, if bass { "F" } else { "G" }, FontId::proportional(h * 4.0), ctx.pal.dim);
     }
     // "8" under the clef: written an octave above where it sounds.
     let eight_y = clef_bottom.max(y_bottom) + h * 1.8;
-    painter.text(pos2(clef_x, eight_y), Align2::CENTER_CENTER, "8", FontId::proportional(h * 2.2), theme::TEXT_FAINT);
+    painter.text(pos2(clef_x, eight_y), Align2::CENTER_CENTER, "8", FontId::proportional(h * 2.2), ctx.pal.faint);
 
     let content = Rect::from_x_y_ranges(ctx.content.x_range(), rect.y_range());
     let p = painter.with_clip_rect(content);
     for k in 0..5 {
-        p.hline(content.x_range(), y_of(bottom_step + 2 * k), Stroke::new(1.0, theme::TEXT_FAINT));
+        p.hline(content.x_range(), y_of(bottom_step + 2 * k), Stroke::new(1.0, ctx.pal.faint));
     }
 
     for (clip, layout) in clips {
@@ -598,10 +692,10 @@ fn draw_staff(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], r
             continue;
         }
         for (t, _) in bar_times(clip, layout) {
-            p.vline(ctx.x(t), Rangef::new(y_top, y_bottom), Stroke::new(1.0, theme::TEXT_FAINT));
+            p.vline(ctx.x(t), Rangef::new(y_top, y_bottom), Stroke::new(1.0, ctx.pal.faint));
         }
 
-        let staff = Staff { p: &p, h, bottom_step, bottom_y };
+        let staff = Staff { p: &p, pal: ctx.pal, h, bottom_step, bottom_y };
         let chords = chords_of(ctx, clip, layout, content);
         for group in beam_groups(&chords) {
             let members: Vec<&Chord> = group.iter().map(|&i| &chords[i]).collect();

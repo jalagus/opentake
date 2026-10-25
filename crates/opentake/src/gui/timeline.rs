@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use opentake_engine::{RegionData, TrackUpdate, Waveform};
-use opentake_engine::project::{Clip, MidiClip, Project, Track};
+use opentake_engine::project::tempo::{bar_len_q, beat_len_q};
+use opentake_engine::project::{BarLine, Clip, Grid, MidiClip, Project, TempoChange, TempoMap, Track};
 use eframe::egui;
 use egui::{Align, Align2, Color32, CursorIcon, FontId, Layout, Painter, Pos2, Rangef, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
 
@@ -13,8 +14,8 @@ use super::{Action, DawApp, Snapshot, theme};
 const HEADER_W: f32 = 260.0;
 const ROW_H: f32 = 64.0;
 const RULER_H: f32 = 30.0;
-/// Extra ruler row for song tempo markings, shown when regions carry tempo marks.
-const TEMPO_ROW_H: f32 = 15.0;
+/// Ruler row with the project's tempo changes (the tempo track).
+const TEMPO_ROW_H: f32 = 17.0;
 /// Height of the cycle (loop) strip at the top of the ruler.
 const CYCLE_H: f32 = 12.0;
 const CYCLE_COLOR: Color32 = Color32::from_rgb(232, 190, 60);
@@ -209,6 +210,18 @@ pub struct View {
     cycle_drag: Option<CycleDrag>,
     /// Timeline position of the last right-click (for "Split Here").
     context_time: f64,
+    tempo_drag: Option<TempoDrag>,
+    /// Timeline position of the last right-click on the tempo track.
+    tempo_context: f64,
+}
+
+/// A drag on the tempo track.
+#[derive(Debug, Clone, Copy)]
+enum TempoDrag {
+    /// Moving tempo change `index` (into the sorted changes).
+    Move { index: usize, from: f64 },
+    /// Changing the tempo of the section governed by `index` (`None` = the opening tempo).
+    Bpm { index: Option<usize>, from: f64 },
 }
 
 impl Default for View {
@@ -222,6 +235,8 @@ impl Default for View {
             marquee: None,
             cycle_drag: None,
             context_time: 0.0,
+            tempo_drag: None,
+            tempo_context: 0.0,
         }
     }
 }
@@ -297,44 +312,38 @@ impl View {
     }
 }
 
-/// Length of one beat in seconds (the time-signature denominator's note value).
-pub fn beat_secs(project: &Project) -> f64 {
-    60.0 / project.tempo_bpm * 4.0 / project.time_signature.1.max(1) as f64
-}
-
-pub fn bar_secs(project: &Project) -> f64 {
-    beat_secs(project) * project.time_signature.0.max(1) as f64
-}
-
-/// Grid size in seconds for a snap mode, or `None` when snapping is off.
-pub fn grid_secs(mode: SnapMode, project: &Project, px_per_sec: f32) -> Option<f64> {
-    let quarter = 60.0 / project.tempo_bpm;
+/// The snap grid at time `t` (it follows the tempo map), or `None` when snapping is off.
+pub fn grid_at(mode: SnapMode, map: &TempoMap, t: f64, px_per_sec: f32) -> Option<Grid> {
+    let seg = map.segment_at(t.max(0.0));
     Some(match mode {
         SnapMode::Off => return None,
-        SnapMode::Bar => bar_secs(project),
-        SnapMode::Beat => beat_secs(project),
-        SnapMode::Eighth => quarter / 2.0,
-        SnapMode::Sixteenth => quarter / 4.0,
-        SnapMode::ThirtySecond => quarter / 8.0,
+        SnapMode::Bar => Grid::Bar,
+        SnapMode::Beat => Grid::Quarters(seg.beat_len_q()),
+        SnapMode::Eighth => Grid::Quarters(0.5),
+        SnapMode::Sixteenth => Grid::Quarters(0.25),
+        SnapMode::ThirtySecond => Grid::Quarters(0.125),
         SnapMode::Smart => {
             // Finest musical value that is still at least ~14 px wide.
-            let min = 14.0 / px_per_sec as f64;
-            let mut candidates = vec![quarter / 4.0, quarter / 2.0, beat_secs(project)];
-            let mut bars = bar_secs(project);
-            for _ in 0..12 {
-                candidates.push(bars);
-                bars *= 2.0;
-            }
-            candidates.into_iter().find(|&g| g >= min).unwrap_or(bars)
+            let min_q = 14.0 / px_per_sec as f64 * seg.bpm / 60.0;
+            [0.25, 0.5, seg.beat_len_q()].into_iter().find(|&q| q >= min_q).map_or(Grid::Bar, Grid::Quarters)
         }
     })
+}
+
+/// Length in seconds of one grid step at `t`.
+pub fn grid_step_secs(grid: Grid, map: &TempoMap, t: f64) -> f64 {
+    match grid {
+        Grid::Bar => map.bar_secs_at(t.max(0.0)),
+        Grid::Quarters(q) => q * 60.0 / map.tempo_at(t.max(0.0)),
+    }
 }
 
 /// Snap `t` to the grid (unless snapping is off or Alt is held).
 pub fn snap_to(mode: SnapMode, ui: &egui::Ui, t: f64, project: &Project, px_per_sec: f32) -> f64 {
     let bypass = ui.input(|i| i.modifiers.alt);
-    match grid_secs(mode, project, px_per_sec) {
-        Some(grid) if !bypass => ((t / grid).round() * grid).max(0.0),
+    let map = project.tempo_map();
+    match grid_at(mode, &map, t, px_per_sec) {
+        Some(grid) if !bypass => map.snap(t, grid),
         _ => t.max(0.0),
     }
 }
@@ -349,9 +358,9 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
     let playhead = snap.status.position_secs;
     ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
 
-    // Ruler row: tools on the left, bar ruler on the right (plus song tempo markings).
-    let tempos = tempo_marks(project);
-    let ruler_h = RULER_H + if tempos.is_empty() { 0.0 } else { TEMPO_ROW_H };
+    // Ruler row: tools on the left, bar ruler and tempo track on the right.
+    let map = project.tempo_map();
+    let ruler_h = RULER_H + TEMPO_ROW_H;
     ui.horizontal(|ui| {
         let (bar, _) = ui.allocate_exact_size(vec2(HEADER_W, ruler_h), Sense::hover());
         ui.painter().rect_filled(bar, 0.0, theme::BG_HEADER);
@@ -360,21 +369,17 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
         ui.scope_builder(UiBuilder::new().max_rect(tools.shrink2(vec2(8.0, 3.0))).layout(Layout::left_to_right(Align::Center)), |ui| {
             toolbar(app, ui, snap);
         });
-        if !tempos.is_empty() {
-            ui.painter().text(pos2(bar.right() - 10.0, bar.bottom() - TEMPO_ROW_H / 2.0), Align2::RIGHT_CENTER, "Song Tempo", FontId::proportional(10.0), theme::TEXT_FAINT);
-        }
+        ui.painter().text(pos2(bar.right() - 10.0, bar.bottom() - TEMPO_ROW_H / 2.0), Align2::RIGHT_CENTER, "Tempo", FontId::proportional(10.0), theme::TEXT_FAINT);
 
         let (resp, painter) = ui.allocate_painter(vec2(ui.available_width(), ruler_h), Sense::hover());
         let full_rect = resp.rect;
         let rect = Rect::from_min_size(full_rect.min, vec2(full_rect.width(), RULER_H));
         app.view.x_range = rect.x_range();
-        draw_ruler(&painter, rect, &app.view, project);
-        if !tempos.is_empty() {
-            draw_tempo_row(&painter, Rect::from_min_max(pos2(rect.left(), rect.bottom()), full_rect.max), &app.view, &tempos, playhead);
-        }
+        draw_ruler(&painter, rect, &app.view, &map);
+        tempo_track(app, ui, &painter, Rect::from_min_max(pos2(rect.left(), rect.bottom()), full_rect.max), project, &map, playhead);
         let cycle_rect = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + CYCLE_H));
         cycle_strip(app, ui, &painter, cycle_rect, project);
-        let seek_rect = Rect::from_min_max(pos2(rect.left(), cycle_rect.bottom()), full_rect.max);
+        let seek_rect = Rect::from_min_max(pos2(rect.left(), cycle_rect.bottom()), rect.max);
         let seek = ui.interact(seek_rect, ui.make_persistent_id("ruler_seek"), Sense::click_and_drag());
         if seek.clicked() || seek.dragged() {
             if let Some(t) = seek.interact_pointer_pos().and_then(|p| app.view.time_at(p.x)) {
@@ -393,7 +398,7 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
 
     let mut rows = Vec::with_capacity(project.tracks.len());
     let mut edit: Option<Edit> = None;
-    let grid = grid_secs(app.snap_mode, project, app.view.px_per_sec);
+    let grid = grid_at(app.snap_mode, &map, app.view.start + app.view.visible_secs() / 2.0, app.view.px_per_sec);
 
     egui::ScrollArea::vertical().id_salt("arrange").auto_shrink([false, false]).show(ui, |ui| {
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
@@ -420,7 +425,7 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
                     theme::BG_LANE_ALT
                 };
                 painter.rect_filled(rect, 0.0, bg);
-                draw_grid(&painter, rect, &app.view, project, grid);
+                draw_grid(&painter, rect, &app.view, &map, grid);
                 draw_loop_tint(&painter, rect, &app.view, project);
                 painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
 
@@ -452,9 +457,9 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
                 // Double-click an empty instrument lane: new one-bar MIDI region.
                 if resp.double_clicked() && track.is_instrument() {
                     if let Some(t) = resp.interact_pointer_pos().and_then(|p| app.view.time_at(p.x)) {
-                        let bar = bar_secs(project);
-                        let at = (t / bar).floor() * bar;
-                        app.act(Action::AddMidiRegion { track: ti, position: at, length: bar });
+                        let map = project.tempo_map();
+                        let bar = map.bar_at(t);
+                        app.act(Action::AddMidiRegion { track: ti, position: bar.secs, length: map.bar_secs_at(bar.secs) });
                     }
                 }
 
@@ -482,7 +487,7 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
             ui.painter().rect_filled(left, 0.0, theme::BG_PANEL);
             ui.painter().vline(left.right() - 0.5, left.y_range(), Stroke::new(1.0, theme::BORDER));
             let (resp, painter) = ui.allocate_painter(vec2(ui.available_width(), height), Sense::click());
-            draw_grid(&painter, resp.rect, &app.view, project, grid);
+            draw_grid(&painter, resp.rect, &app.view, &map, grid);
             draw_loop_tint(&painter, resp.rect, &app.view, project);
             draw_playhead(&painter, resp.rect, &app.view, playhead, false);
             painter.text(
@@ -1052,97 +1057,249 @@ fn draw_loop_tint(painter: &Painter, rect: Rect, view: &View, project: &Project)
     }
 }
 
-/// Bar spacing that keeps bar numbers at least ~70 px apart.
-fn bar_step(view: &View, project: &Project) -> (f64, u64) {
-    let bar = bar_secs(project);
-    let mut step = 1u64;
-    while bar * step as f64 * (view.px_per_sec as f64) < 70.0 && step < 4096 {
+/// Visible bar lines and the bar-number step that keeps numbers at least ~70 px apart
+/// (based on the shortest bar on screen).
+pub(crate) fn visible_bars(view: &View, map: &TempoMap) -> (Vec<BarLine>, i64) {
+    let (t0, t1) = (view.start, view.start + view.visible_secs());
+    let bars = map.bars(t0, t1);
+    let shortest = bars.iter().map(|b| map.bar_secs_at(b.secs)).fold(f64::INFINITY, f64::min).min(map.bar_secs_at(t0));
+    let mut step = 1i64;
+    while shortest * step as f64 * (view.px_per_sec as f64) < 70.0 && step < 4096 {
         step *= 2;
     }
-    (bar, step)
+    (bars, step)
 }
 
-/// Bar lines, beat lines and (when snapping finer than a beat) subdivision lines.
-fn draw_grid(painter: &Painter, rect: Rect, view: &View, project: &Project, snap_grid: Option<f64>) {
-    let (bar, step) = bar_step(view, project);
-    let beat = beat_secs(project);
-    let pps = view.px_per_sec as f64;
-    let (t0, t1) = (view.start, view.start + view.visible_secs());
-
-    // Finest visible subdivision: the snap grid if it's finer than a beat and not too dense.
-    if let Some(g) = snap_grid.filter(|&g| g < beat - 1e-9 && g * pps >= 8.0) {
-        let mut k = (t0 / g).floor() as i64;
-        while (k as f64) * g <= t1 {
-            painter.vline(view.x_of(k as f64 * g), rect.y_range(), Stroke::new(1.0, theme::GRID_SUB));
+/// Lines inside each visible bar every `step_q` quarter notes (bar lines excluded), where
+/// they're at least `min_px` apart.
+pub(crate) fn lines_in_bars(bars: &[BarLine], map: &TempoMap, view: &View, min_px: f32, step_q: impl Fn(&BarLine) -> f64, mut f: impl FnMut(f32)) {
+    for (i, bar) in bars.iter().enumerate() {
+        let step = step_q(bar);
+        if step <= 0.0 || (step * 60.0 / map.tempo_at(bar.secs)) as f32 * view.px_per_sec < min_px {
+            continue;
+        }
+        let end_q = bars.get(i + 1).map_or_else(|| bar.q + bar_len_q(bar.sig), |b| b.q);
+        let mut k = 1;
+        while bar.q + k as f64 * step < end_q - 1e-6 && k < 2048 {
+            f(view.x_of(map.secs_at(bar.q + k as f64 * step)));
             k += 1;
         }
     }
-    if step == 1 && beat * pps >= 12.0 {
-        let mut k = (t0 / beat).floor() as i64;
-        while (k as f64) * beat <= t1 {
-            painter.vline(view.x_of(k as f64 * beat), rect.y_range(), Stroke::new(1.0, theme::GRID_BEAT));
-            k += 1;
+}
+
+/// Bar lines, beat lines and (when snapping finer than a beat) subdivision lines, all
+/// following the tempo map.
+pub(crate) fn draw_grid(painter: &Painter, rect: Rect, view: &View, map: &TempoMap, snap_grid: Option<Grid>) {
+    let (bars, step) = visible_bars(view, map);
+    if step == 1 {
+        if let Some(Grid::Quarters(q)) = snap_grid {
+            lines_in_bars(&bars, map, view, 8.0, |b| if q < beat_len_q(b.sig) - 1e-9 { q } else { 0.0 }, |x| {
+                painter.vline(x, rect.y_range(), Stroke::new(1.0, theme::GRID_SUB));
+            });
         }
+        lines_in_bars(&bars, map, view, 12.0, |b| beat_len_q(b.sig), |x| {
+            painter.vline(x, rect.y_range(), Stroke::new(1.0, theme::GRID_BEAT));
+        });
     }
-    let first = (t0 / bar).floor() as u64;
-    let last = (t1 / bar).ceil() as u64;
-    for b in (first..=last).filter(|b| b % step == 0) {
-        painter.vline(view.x_of(b as f64 * bar), rect.y_range(), Stroke::new(1.0, theme::GRID_BAR));
+    for b in bars.iter().filter(|b| b.index % step == 0 || b.sig_change) {
+        painter.vline(view.x_of(b.secs), rect.y_range(), Stroke::new(1.0, theme::GRID_BAR));
     }
 }
 
-fn draw_ruler(painter: &Painter, rect: Rect, view: &View, project: &Project) {
+fn draw_ruler(painter: &Painter, rect: Rect, view: &View, map: &TempoMap) {
     painter.rect_filled(rect, 0.0, theme::BG_HEADER);
     painter.rect_filled(Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + CYCLE_H)), 0.0, theme::shade(theme::BG_HEADER, 0.85));
-    let (bar, step) = bar_step(view, project);
-    let beat = beat_secs(project);
-    let first = (view.start / bar).floor() as u64;
-    let last = ((view.start + view.visible_secs()) / bar).ceil() as u64;
-    let show_beats = step == 1 && beat * (view.px_per_sec as f64) >= 12.0;
-    for b in first..=last {
-        if show_beats {
-            for k in 1..project.time_signature.0 {
-                let xb = view.x_of(b as f64 * bar + k as f64 * beat);
-                painter.vline(xb, Rangef::new(rect.bottom() - 5.0, rect.bottom()), Stroke::new(1.0, theme::HAIRLINE));
-            }
+    let (bars, step) = visible_bars(view, map);
+    if step == 1 {
+        lines_in_bars(&bars, map, view, 12.0, |b| beat_len_q(b.sig), |x| {
+            painter.vline(x, Rangef::new(rect.bottom() - 5.0, rect.bottom()), Stroke::new(1.0, theme::HAIRLINE));
+        });
+    }
+    let mut last_right = f32::NEG_INFINITY;
+    for b in bars.iter().filter(|b| b.index % step == 0 || b.sig_change) {
+        let x = view.x_of(b.secs);
+        painter.vline(x, Rangef::new(rect.bottom() - 11.0, rect.bottom()), Stroke::new(1.0, theme::TEXT_FAINT));
+        if x + 4.0 < last_right {
+            continue;
         }
-        if b % step == 0 {
-            let x = view.x_of(b as f64 * bar);
-            painter.vline(x, Rangef::new(rect.bottom() - 11.0, rect.bottom()), Stroke::new(1.0, theme::TEXT_FAINT));
-            painter.text(pos2(x + 4.0, rect.top() + CYCLE_H + 1.0), Align2::LEFT_TOP, (b + 1).to_string(), FontId::proportional(11.0), theme::TEXT_DIM);
+        let r = painter.text(pos2(x + 4.0, rect.top() + CYCLE_H + 1.0), Align2::LEFT_TOP, (b.index + 1).to_string(), FontId::proportional(11.0), theme::TEXT_DIM);
+        last_right = r.right() + 6.0;
+        // Time signature where it changes (and at the start).
+        if b.sig_change || b.index == 0 {
+            let r = painter.text(pos2(r.right() + 5.0, rect.top() + CYCLE_H + 2.0), Align2::LEFT_TOP, format!("{}/{}", b.sig.0, b.sig.1), FontId::proportional(9.5), theme::TEXT_FAINT);
+            last_right = r.right() + 6.0;
         }
     }
     painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
 }
 
-/// Song tempo changes on the timeline (absolute seconds, bpm), from unmuted regions with
-/// tempo marks; duplicates (several tracks of one song) are merged.
-pub(crate) fn tempo_marks(project: &Project) -> Vec<(f64, f64)> {
-    let mut marks: Vec<(f64, f64)> = project
-        .tracks
-        .iter()
-        .filter(|t| !t.mute)
-        .flat_map(|t| &t.midi_clips)
-        .filter(|c| !c.mute)
-        .flat_map(|c| c.tempos.iter().filter(|m| m.start_secs < c.length_secs).map(|m| (c.position_secs + m.start_secs, m.bpm)))
-        .collect();
-    marks.sort_by(|a, b| a.0.total_cmp(&b.0));
-    marks.dedup_by(|b, a| (b.0 - a.0).abs() < 1e-3 && (b.1 - a.1).abs() < 1e-6);
-    marks
-}
+/// Common time signatures offered in menus.
+const SIGNATURES: [(u32, u32); 9] = [(2, 4), (3, 4), (4, 4), (5, 4), (6, 4), (6, 8), (7, 8), (9, 8), (12, 8)];
 
-fn draw_tempo_row(painter: &Painter, rect: Rect, view: &View, marks: &[(f64, f64)], playhead: f64) {
+/// The tempo track: the project's tempo changes along the timeline, editable. Drag a
+/// section up/down to change its tempo, drag a marker sideways to move it, double-click to
+/// add a change, right-click for exact values, time signatures and deleting.
+fn tempo_track(app: &mut DawApp, ui: &egui::Ui, painter: &Painter, rect: Rect, project: &Project, map: &TempoMap, playhead: f64) {
     let p = painter.with_clip_rect(rect);
     let bg = theme::shade(theme::BG_HEADER, 0.9);
     p.rect_filled(rect, 0.0, bg);
-    let screen: Vec<(f32, f64)> = marks.iter().map(|&(t, bpm)| (view.x_of(t), bpm)).collect();
-    let current = marks.iter().rposition(|m| m.0 <= playhead + 1e-9);
-    for (i, &(x, _)) in screen.iter().enumerate().filter(|(_, m)| rect.x_range().contains(m.0)) {
+    let mut sorted = project.tempo_changes.clone();
+    sorted.sort_by(|a, b| a.at_secs.total_cmp(&b.at_secs));
+    let changes = &sorted;
+    let governing = |t: f64| changes.iter().rposition(|c| c.at_secs <= t + 1e-9);
+    let tempo_of = |i: Option<usize>| i.map_or(project.tempo_bpm, |i| changes[i].bpm);
+
+    // Markings: the opening tempo, then each change.
+    let mut marks: Vec<(f32, f64)> = vec![(app.view.x_of(0.0), project.tempo_bpm)];
+    marks.extend(changes.iter().map(|c| (app.view.x_of(c.at_secs), c.bpm)));
+    let current = Some(governing(playhead).map_or(0, |i| i + 1));
+    for (i, &(x, _)) in marks.iter().enumerate().skip(1).filter(|(_, m)| rect.x_range().contains(m.0)) {
         let color = if Some(i) == current { theme::TEMPO } else { theme::with_alpha(theme::TEMPO, 150) };
         p.vline(x, Rangef::new(rect.top() + 2.0, rect.bottom()), Stroke::new(1.0, color));
     }
-    draw_tempo_labels(&p, rect.x_range(), rect.center().y, &screen, current, bg);
+    draw_tempo_labels(&p, rect.x_range(), rect.center().y, &marks, current, bg);
     p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+
+    let resp = ui.interact(rect, ui.make_persistent_id("tempo_track"), Sense::click_and_drag());
+    widgets::label(&resp, egui::Role::Group, "Tempo Track");
+    let hover = resp.hover_pos().or(resp.interact_pointer_pos());
+    let near_marker = |x: f32| changes.iter().position(|c| (app.view.x_of(c.at_secs) - x).abs() <= 5.0);
+    if let Some(pos) = hover {
+        ui.ctx().set_cursor_icon(if near_marker(pos.x).is_some() { CursorIcon::ResizeHorizontal } else { CursorIcon::ResizeVertical });
+    }
+    let resp = resp.on_hover_text("Tempo track: drag up/down to change a tempo (Shift = fine), drag a marker to move it, double-click to add a change, right-click for more");
+
+    if resp.drag_started() {
+        if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
+            app.view.tempo_drag = Some(match near_marker(origin.x) {
+                Some(index) => TempoDrag::Move { index, from: changes[index].at_secs },
+                None => {
+                    let index = app.view.time_at(origin.x).and_then(governing);
+                    TempoDrag::Bpm { index, from: tempo_of(index) }
+                }
+            });
+        }
+    }
+    if resp.dragged() {
+        let total = ui.input(|i| i.pointer.press_origin().zip(i.pointer.latest_pos()).map(|(a, b)| b - a)).unwrap_or_default();
+        match app.view.tempo_drag {
+            Some(TempoDrag::Move { index, from }) => {
+                let lo = if index > 0 { changes[index - 1].at_secs } else { 0.0 } + 0.01;
+                let hi = changes.get(index + 1).map_or(f64::INFINITY, |c| c.at_secs - 0.01);
+                let t = snap_time(app, ui, from + (total.x / app.view.px_per_sec) as f64, project).clamp(lo, hi.max(lo));
+                if (t - changes[index].at_secs).abs() > 1e-9 {
+                    let mut c = changes.clone();
+                    c[index].at_secs = t;
+                    app.act(Action::SetTempoChanges { changes: c, merge: Some(format!("tempo-move:{index}")) });
+                }
+            }
+            Some(TempoDrag::Bpm { index, from }) => {
+                let per_px = if ui.input(|i| i.modifiers.shift) { 0.05 } else { 0.5 };
+                let bpm = ((from - total.y as f64 * per_px) * 10.0).round().clamp(200.0, 9990.0) / 10.0;
+                if (bpm - tempo_of(index)).abs() > 1e-9 {
+                    match index {
+                        None => app.act(Action::SetTempo(bpm)),
+                        Some(i) => {
+                            let mut c = changes.clone();
+                            c[i].bpm = bpm;
+                            app.act(Action::SetTempoChanges { changes: c, merge: Some(format!("tempo-bpm:{i}")) });
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    if resp.drag_stopped() {
+        app.view.tempo_drag = None;
+    }
+    if resp.double_clicked() {
+        if let Some(t) = resp.interact_pointer_pos().and_then(|p| app.view.time_at(p.x)) {
+            let t = snap_time(app, ui, t, project);
+            if t > 0.01 && !changes.iter().any(|c| (c.at_secs - t).abs() < 0.01) {
+                let mut c = changes.clone();
+                c.push(TempoChange { at_secs: t, bpm: map.tempo_at(t), time_signature: None });
+                c.sort_by(|a, b| a.at_secs.total_cmp(&b.at_secs));
+                app.act(Action::SetTempoChanges { changes: c, merge: None });
+            }
+        }
+    }
+    if resp.secondary_clicked() {
+        if let Some(t) = resp.interact_pointer_pos().and_then(|p| app.view.time_at(p.x)) {
+            app.view.tempo_context = t;
+        }
+    }
+    resp.context_menu(|ui| {
+        let t = app.view.tempo_context;
+        let index = governing(t);
+        let pos = map.position(t);
+        widgets::section(ui, &format!("Tempo at bar {}", pos.bar));
+        ui.horizontal(|ui| {
+            ui.label("Tempo");
+            let mut bpm = tempo_of(index);
+            if ui.add(egui::DragValue::new(&mut bpm).range(20.0..=999.0).speed(0.5).fixed_decimals(1).suffix(" BPM")).changed() {
+                match index {
+                    None => app.act(Action::SetTempo(bpm)),
+                    Some(i) => {
+                        let mut c = changes.clone();
+                        c[i].bpm = bpm;
+                        app.act(Action::SetTempoChanges { changes: c, merge: Some(format!("tempo-bpm:{i}")) });
+                    }
+                }
+            }
+        });
+        ui.menu_button("Time Signature", |ui| {
+            let current = map.signature_at(t);
+            for sig in SIGNATURES {
+                if ui.add(egui::Button::new(format!("{}/{}", sig.0, sig.1)).selected(sig == current)).clicked() {
+                    match index {
+                        None => app.act(Action::SetTimeSignature(sig)),
+                        Some(i) => {
+                            let mut c = changes.clone();
+                            c[i].time_signature = Some(sig);
+                            app.act(Action::SetTempoChanges { changes: c, merge: None });
+                        }
+                    }
+                    ui.close();
+                }
+            }
+        });
+        ui.separator();
+        if ui.button("Add Tempo Change Here").clicked() {
+            let at = snap_time(app, ui, t, project);
+            if at > 0.01 && !changes.iter().any(|c| (c.at_secs - at).abs() < 0.01) {
+                let mut c = changes.clone();
+                c.push(TempoChange { at_secs: at, bpm: map.tempo_at(at), time_signature: None });
+                c.sort_by(|a, b| a.at_secs.total_cmp(&b.at_secs));
+                app.act(Action::SetTempoChanges { changes: c, merge: None });
+            }
+            ui.close();
+        }
+        if ui.button("Add Time Signature Change at Bar").clicked() {
+            // At the bar line nearest the click, keeping the signature (pick one after).
+            let bar = map.bar_at(t);
+            let at = if t - bar.secs > map.bar_secs_at(t) / 2.0 { map.secs_of(bar.index + 2, 1.0) } else { bar.secs };
+            if at > 0.01 && !changes.iter().any(|c| (c.at_secs - at).abs() < 0.01) {
+                let mut c = changes.clone();
+                c.push(TempoChange { at_secs: at, bpm: map.tempo_at(at), time_signature: Some(map.signature_at(at)) });
+                c.sort_by(|a, b| a.at_secs.total_cmp(&b.at_secs));
+                app.act(Action::SetTempoChanges { changes: c, merge: None });
+            }
+            ui.close();
+        }
+        if let Some(i) = index {
+            if ui.button("Delete Tempo Change").clicked() {
+                let mut c = changes.clone();
+                c.remove(i);
+                app.act(Action::SetTempoChanges { changes: c, merge: None });
+                ui.close();
+            }
+        }
+        if !changes.is_empty() && ui.button("Remove All Tempo Changes").clicked() {
+            app.act(Action::SetTempoChanges { changes: Vec::new(), merge: None });
+            ui.close();
+        }
+    });
 }
 
 /// Where tempo labels go along a row spanning `span`: (mark index, label left x).
@@ -1358,16 +1515,18 @@ mod tests {
     }
 
     #[test]
-    fn grid_sizes_follow_tempo_and_signature() {
-        let mut p = Project { tempo_bpm: 120.0, ..Project::default() };
-        assert_eq!(grid_secs(SnapMode::Bar, &p, 50.0), Some(2.0));
-        assert_eq!(grid_secs(SnapMode::Beat, &p, 50.0), Some(0.5));
-        assert_eq!(grid_secs(SnapMode::Sixteenth, &p, 50.0), Some(0.125));
-        assert_eq!(grid_secs(SnapMode::Off, &p, 50.0), None);
-        p.time_signature = (6, 8);
-        assert_eq!(grid_secs(SnapMode::Beat, &p, 50.0), Some(0.25));
-        assert_eq!(grid_secs(SnapMode::Bar, &p, 50.0), Some(1.5));
+    fn grids_follow_the_tempo_map() {
+        let p = Project { tempo_bpm: 120.0, tempo_changes: vec![TempoChange { at_secs: 4.0, bpm: 60.0, time_signature: Some((6, 8)) }], ..Project::default() };
+        let map = p.tempo_map();
+        assert_eq!(grid_at(SnapMode::Off, &map, 1.0, 50.0), None);
+        assert_eq!(grid_at(SnapMode::Beat, &map, 1.0, 50.0), Some(Grid::Quarters(1.0)));
+        assert_eq!(grid_at(SnapMode::Beat, &map, 5.0, 50.0), Some(Grid::Quarters(0.5)), "eighth-note beats in 6/8");
+        assert_eq!(grid_step_secs(Grid::Bar, &map, 1.0), 2.0);
+        assert_eq!(grid_step_secs(Grid::Bar, &map, 5.0), 3.0, "6/8 at 60 bpm");
+        assert_eq!(grid_step_secs(Grid::Quarters(0.25), &map, 5.0), 0.25);
+        assert_eq!(map.snap(5.6, Grid::Quarters(0.5)), 5.5);
         // Smart picks coarser grids when zoomed out.
-        assert!(grid_secs(SnapMode::Smart, &p, 2.0).unwrap() > grid_secs(SnapMode::Smart, &p, 400.0).unwrap());
+        assert_eq!(grid_at(SnapMode::Smart, &map, 1.0, 2.0), Some(Grid::Bar));
+        assert_eq!(grid_at(SnapMode::Smart, &map, 1.0, 400.0), Some(Grid::Quarters(0.25)));
     }
 }

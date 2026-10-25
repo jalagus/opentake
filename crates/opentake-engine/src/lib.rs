@@ -6,6 +6,7 @@ pub mod media;
 pub mod mixer;
 pub mod recorder;
 pub mod drums;
+pub mod eq;
 pub mod synth;
 
 pub use audio::{AudioConfig, DeviceInfo, DeviceList};
