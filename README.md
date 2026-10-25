@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/opentake-wordmark-dark.png">
+    <img src="assets/logo/opentake-wordmark-light.png" alt="OpenTake" width="560">
+  </picture>
+</p>
+
 # OpenTake
 
 **The open-source DAW you can make music with — together with your AI agent.**

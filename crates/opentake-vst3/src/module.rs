@@ -1,6 +1,8 @@
 //! Loading a VST3 binary and reading its plugin factory.
 
-use std::ffi::{c_char, c_void};
+use std::ffi::c_char;
+#[cfg(not(target_os = "windows"))]
+use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -28,13 +28,19 @@ use menu::{MenuCommand, MenuState};
 use timeline::{RegionKind, RegionRef};
 use widgets::Icon;
 
+/// The app icon for the window and dock/taskbar.
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../../../../assets/logo/opentake-256.png")).unwrap_or_default()
+}
+
 pub fn run(engine: SharedEngine, mcp_url: Option<String>, settings_path: Option<PathBuf>) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("OpenTake")
             .with_inner_size([1360.0, 860.0])
             .with_min_inner_size([1000.0, 600.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(std::sync::Arc::new(app_icon())),
         ..Default::default()
     };
     eframe::run_native(
@@ -2504,11 +2510,15 @@ mod tests {
         let piano = out.replace(".png", "-piano.png");
         harness.render().expect("render").save(&piano).expect("save png");
 
-        // Third shot: tablature from the Guitar Pro fixture, playing in bar 3.
-        let fixture = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../opentake-project/tests/fixtures/simple.gp"));
+        // Third shot: tablature from the Guitar Pro fixture (or OPENTAKE_SCREENSHOT_GP, seeking
+        // to OPENTAKE_SCREENSHOT_AT seconds).
+        let fixture = std::env::var("OPENTAKE_SCREENSHOT_GP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../opentake-project/tests/fixtures/simple.gp")));
+        let at: f64 = std::env::var("OPENTAKE_SCREENSHOT_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(8.5);
         let opts = opentake_engine::GuitarProImport { set_tempo: false, ..Default::default() };
         let created = engine.lock().unwrap().import_guitar_pro(&fixture, &opts).unwrap();
-        engine.lock().unwrap().seek(8.5).unwrap();
+        engine.lock().unwrap().seek(at).unwrap();
         harness.state_mut().selected_track = created.first().copied();
         harness.state_mut().bottom = Some(BottomTab::Tab);
         harness.state_mut().view.px_per_sec = 90.0;

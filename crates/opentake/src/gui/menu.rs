@@ -46,6 +46,8 @@ pub enum MenuCommand {
     McpInfo,
 }
 
+// Ids and accelerators are only needed by the native (macOS) menu bar.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl MenuCommand {
     pub fn id(self) -> String {
         match self {

@@ -272,26 +272,294 @@ enum Value {
     Quarter,
     Eighth,
     Sixteenth,
+    ThirtySecond,
 }
 
-/// Note value for a length in quarter notes.
-fn value_of(quarters: f64) -> Value {
-    match quarters {
-        q if q >= 3.5 => Value::Whole,
-        q if q >= 1.75 => Value::Half,
-        q if q >= 0.875 => Value::Quarter,
-        q if q >= 0.4375 => Value::Eighth,
-        _ => Value::Sixteenth,
+impl Value {
+    /// Flags (or beams) on the stem.
+    fn beams(self) -> usize {
+        match self {
+            Value::Eighth => 1,
+            Value::Sixteenth => 2,
+            Value::ThirtySecond => 3,
+            _ => 0,
+        }
     }
 }
 
-/// Seconds per quarter note at region-relative time `t`, from the bar it falls in.
-fn quarter_secs(layout: &TabLayout, clip_len: f64, t: f64) -> f64 {
+/// How a length (in quarter notes) is written: the nearest plain, dotted or triplet value.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Written {
+    value: Value,
+    dotted: bool,
+    triplet: bool,
+}
+
+fn written(quarters: f64) -> Written {
+    use Value::*;
+    const T: f64 = 1.0 / 3.0;
+    // (length in quarters, value, dotted, triplet)
+    let table = [
+        (4.0, Whole, false, false),
+        (3.0, Half, true, false),
+        (2.0, Half, false, false),
+        (1.5, Quarter, true, false),
+        (1.0, Quarter, false, false),
+        (2.0 * T, Quarter, false, true),
+        (0.75, Eighth, true, false),
+        (0.5, Eighth, false, false),
+        (T, Eighth, false, true),
+        (0.375, Sixteenth, true, false),
+        (0.25, Sixteenth, false, false),
+        (T / 2.0, Sixteenth, false, true),
+        (0.125, ThirtySecond, false, false),
+    ];
+    let q = quarters.clamp(0.1, 4.0);
+    let (_, value, dotted, triplet) =
+        table.iter().copied().min_by(|a, b| (a.0 / q).ln().abs().total_cmp(&(b.0 / q).ln().abs())).unwrap_or((1.0, Quarter, false, false));
+    Written { value, dotted, triplet }
+}
+
+/// The bar a region-relative time falls in: (index, start, seconds per quarter, beat length in quarters).
+fn bar_info(layout: &TabLayout, clip_len: f64, t: f64) -> (usize, f64, f64, f64) {
     let i = layout.bars.partition_point(|b| b.start_secs <= t + 1e-6).saturating_sub(1);
-    let Some(bar) = layout.bars.get(i) else { return 0.5 };
+    let Some(bar) = layout.bars.get(i) else { return (0, 0.0, 0.5, 1.0) };
     let end = layout.bars.get(i + 1).map_or(clip_len, |b| b.start_secs);
     let quarters = bar.numerator as f64 * 4.0 / bar.denominator.max(1) as f64;
-    ((end - bar.start_secs) / quarters.max(0.25)).max(0.01)
+    let quarter = ((end - bar.start_secs) / quarters.max(0.25)).max(0.01);
+    // Beams group by beat: dotted quarters in compound meters (6/8, 9/8, 12/8), else quarters.
+    let beat = if bar.denominator == 8 && bar.numerator % 3 == 0 && bar.numerator > 3 { 1.5 } else { 1.0 };
+    (i, bar.start_secs, quarter, beat)
+}
+
+/// A chord laid out on the staff.
+struct Chord {
+    x: f32,
+    /// Region-relative onset and written end.
+    onset: f64,
+    end: f64,
+    /// (diatonic step, sharp), sorted low to high.
+    heads: Vec<(i32, bool)>,
+    written: Written,
+    /// (bar index, beat index) for beaming.
+    beat: (usize, i64),
+    quarter: f64,
+    ink: Color32,
+}
+
+/// Staff geometry shared by the drawing helpers.
+struct Staff<'a> {
+    p: &'a Painter,
+    h: f32,
+    bottom_step: i32,
+    bottom_y: f32,
+}
+
+impl Staff<'_> {
+    fn y(&self, step: i32) -> f32 {
+        self.bottom_y - (step - self.bottom_step) as f32 * self.h
+    }
+
+    fn rx(&self) -> f32 {
+        self.h * 1.3
+    }
+
+    /// Note heads, ledger lines, accidentals and dots. Returns the stem x.
+    fn heads(&self, c: &Chord, stem_up: bool) -> f32 {
+        let (h, rx) = (self.h, self.rx());
+        let cx = c.x + rx + 1.0;
+        let hollow = matches!(c.written.value, Value::Whole | Value::Half);
+        let mut prev: Option<(i32, bool)> = None; // (step, shifted)
+        for &(step, sharp) in &c.heads {
+            let y = self.y(step);
+            // Seconds in a chord: the second head goes on the other side of the stem.
+            let shifted = matches!(prev, Some((s, false)) if step - s == 1);
+            prev = Some((step, shifted));
+            let hx = match (shifted, stem_up) {
+                (false, _) => cx,
+                (true, true) => cx + 2.0 * rx,
+                (true, false) => cx - 2.0 * rx,
+            };
+            let ledger = |s: i32| self.p.hline(Rangef::new(hx - rx * 1.7, hx + rx * 1.7), self.y(s), Stroke::new(1.0, theme::TEXT_FAINT));
+            for s in (step..self.bottom_step).filter(|s| (self.bottom_step - s) % 2 == 0) {
+                ledger(s);
+            }
+            for s in (self.bottom_step + 10..=step).filter(|s| (s - self.bottom_step) % 2 == 0) {
+                ledger(s);
+            }
+            let radius = vec2(rx, h * 0.92);
+            if hollow {
+                self.p.add(Shape::ellipse_stroke(pos2(hx, y), radius - vec2(0.6, 0.6), Stroke::new(1.4, c.ink)));
+            } else {
+                self.p.add(Shape::ellipse_filled(pos2(hx, y), radius, c.ink));
+            }
+            if sharp {
+                draw_sharp(self.p, pos2(cx - rx - h * 1.6, y), h, c.ink);
+            }
+            if c.written.dotted {
+                // Dots sit in a space: a note on a line gets its dot just above.
+                let on_line = (step - self.bottom_step) % 2 == 0;
+                let dy = if on_line { -h } else { 0.0 };
+                self.p.circle_filled(pos2(hx + rx + h * 0.9, y + dy), h * 0.32, c.ink);
+            }
+        }
+        if stem_up { cx + rx - 0.5 } else { cx - rx + 0.5 }
+    }
+
+    fn stem_up(&self, chords: &[&Chord]) -> bool {
+        let (sum, n) = chords.iter().flat_map(|c| &c.heads).fold((0i32, 0i32), |(s, n), h| (s + h.0, n + 1));
+        (sum as f32 / n.max(1) as f32) < (self.bottom_step + 4) as f32
+    }
+
+    /// A chord on its own: stem and flags.
+    fn single(&self, c: &Chord) {
+        let up = self.stem_up(&[c]);
+        let sx = self.heads(c, up);
+        if c.written.value == Value::Whole {
+            return;
+        }
+        let h = self.h;
+        let (lo, hi) = (self.y(c.heads[0].0), self.y(c.heads[c.heads.len() - 1].0));
+        let (y0, y1) = if up { (lo, hi - 7.0 * h) } else { (hi, lo + 7.0 * h) };
+        self.p.vline(sx, Rangef::new(y0.min(y1), y0.max(y1)), Stroke::new(1.0, c.ink));
+        // Flags curl back toward the heads.
+        let dir = if up { 1.0 } else { -1.0 };
+        for f in 0..c.written.value.beams() {
+            let from = pos2(sx, y1 + dir * f as f32 * 1.6 * h);
+            self.p.line_segment([from, from + vec2(h * 1.8, dir * h * 2.6)], Stroke::new(1.6, c.ink));
+        }
+    }
+
+    /// Beamed group: shared stem direction, a sloped primary beam, and secondary beams (or
+    /// stubs) for the shorter values.
+    fn beamed(&self, group: &[&Chord]) {
+        let h = self.h;
+        let up = self.stem_up(group);
+        let dir = if up { -1.0 } else { 1.0 }; // from the heads toward the beam (screen y)
+        let stems: Vec<f32> = group.iter().map(|c| self.heads(c, up)).collect();
+        // Per chord: the head nearest the beam, and the farthest one (where the stem starts).
+        let near = |c: &Chord| if up { self.y(c.heads[c.heads.len() - 1].0) } else { self.y(c.heads[0].0) };
+        let far = |c: &Chord| if up { self.y(c.heads[0].0) } else { self.y(c.heads[c.heads.len() - 1].0) };
+        let natural = |c: &Chord| near(c) + dir * 7.0 * h;
+        let (first, last) = (group[0], group[group.len() - 1]);
+        let (x0, x1) = (stems[0], stems[stems.len() - 1]);
+        // Gentle slope following the contour, capped at one staff space.
+        let rise = (natural(last) - natural(first)).clamp(-2.0 * h, 2.0 * h);
+        let slope = if x1 > x0 { rise / (x1 - x0) } else { 0.0 };
+        let mut base = natural(first);
+        // Move the beam away from the heads until every stem is at least 5½ half-spaces long.
+        for (c, &sx) in group.iter().zip(&stems) {
+            let y = base + slope * (sx - x0);
+            let min_end = near(c) + dir * 5.5 * h;
+            if (y - min_end) * dir < 0.0 {
+                base += min_end - y;
+            }
+        }
+        let line = |x: f32| base + slope * (x - x0);
+        for (c, &sx) in group.iter().zip(&stems) {
+            let (ya, yb) = (far(c), line(sx));
+            self.p.vline(sx, Rangef::new(ya.min(yb), ya.max(yb)), Stroke::new(1.0, c.ink));
+        }
+        let thick = h * 0.95;
+        let beam = |xa: f32, xb: f32, level: usize| {
+            // Primary beam at the stem ends; further beams step back toward the heads.
+            let shift = -dir * level as f32 * h * 1.55;
+            let (ya, yb) = (line(xa) + shift, line(xb) + shift);
+            let t = -dir * thick;
+            self.p.add(Shape::convex_polygon(vec![pos2(xa, ya), pos2(xb, yb), pos2(xb, yb + t), pos2(xa, ya + t)], theme::TEXT, Stroke::NONE));
+        };
+        beam(x0 - 0.5, x1 + 0.5, 0);
+        // Secondary beams join neighbours that both need them; a lone short note gets a stub
+        // pointing at its neighbour.
+        let stub = self.rx() * 1.6;
+        for level in 1..3 {
+            let mut i = 0;
+            while i < group.len() {
+                if group[i].written.value.beams() <= level {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i;
+                while j + 1 < group.len() && group[j + 1].written.value.beams() > level {
+                    j += 1;
+                }
+                if j > i {
+                    beam(stems[i] - 0.5, stems[j] + 0.5, level);
+                } else if i + 1 < group.len() {
+                    beam(stems[i], stems[i] + stub, level);
+                } else {
+                    beam(stems[i] - stub, stems[i], level);
+                }
+                i = j + 1;
+            }
+        }
+        // Triplet number beyond the beam.
+        if group.iter().all(|c| c.written.triplet) && (group.len() == 3 || group.len() == 6) {
+            let mx = (x0 + x1) / 2.0;
+            self.p.text(pos2(mx, line(mx) + dir * h * 2.2), Align2::CENTER_CENTER, group.len().to_string(), FontId::proportional(h * 2.2), theme::TEXT_DIM);
+        }
+    }
+}
+
+/// Lay out a region's chords (notes starting together share a stem) around the visible area.
+fn chords_of(ctx: &Ctx, clip: &MidiClip, layout: &TabLayout, content: Rect) -> Vec<Chord> {
+    let notes: Vec<&Note> = clip.notes.iter().filter(|n| n.start_secs < clip.length_secs).collect();
+    let start = clip.position_secs;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < notes.len() {
+        let onset = notes[i].start_secs;
+        let mut j = i;
+        while j < notes.len() && notes[j].start_secs - onset < 0.004 {
+            j += 1;
+        }
+        let chord = &notes[i..j];
+        let next_onset = notes.get(j).map(|n| n.start_secs);
+        i = j;
+        let x = ctx.x(start + onset);
+        // Some margin so beams reaching in from off-screen still draw.
+        if x < content.left() - 400.0 || x > content.right() + 400.0 {
+            continue;
+        }
+        // Written length: up to the next onset, so let-ring notes don't all read as whole notes.
+        let len = chord.iter().map(|n| n.length_secs).fold(0.0, f64::max);
+        let len = next_onset.map_or(len, |next| len.min(next - onset));
+        let (bar, bar_start, quarter, beat_q) = bar_info(layout, clip.length_secs, onset);
+        let beat = ((onset - bar_start) / (quarter * beat_q) + 1e-3).floor() as i64;
+        let mut heads: Vec<(i32, bool)> = chord.iter().map(|n| diatonic(n.pitch.saturating_add(12))).collect();
+        heads.sort();
+        heads.dedup();
+        let sounding = chord.iter().any(|n| ctx.sounding(start + n.start_secs, start + n.start_secs + n.length_secs));
+        out.push(Chord {
+            x,
+            onset,
+            end: onset + len,
+            heads,
+            written: written(len / quarter),
+            beat: (bar, beat),
+            quarter,
+            ink: if sounding { ctx.color } else { theme::TEXT },
+        });
+    }
+    out
+}
+
+/// Split chords into beam groups: consecutive eighths (and shorter) within one beat with no
+/// rest between them. Everything else comes back as a group of one.
+fn beam_groups(chords: &[Chord]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, c) in chords.iter().enumerate() {
+        let joins = c.written.value.beams() > 0
+            && groups.last().and_then(|g| g.last()).is_some_and(|&k| {
+                let prev = &chords[k];
+                prev.written.value.beams() > 0 && prev.beat == c.beat && (c.onset - prev.end).abs() < 0.1 * c.quarter
+            });
+        match groups.last_mut() {
+            Some(g) if joins => g.push(i),
+            _ => groups.push(vec![i]),
+        }
+    }
+    groups
 }
 
 fn draw_staff(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], rect: Rect, gutter: Rangef) {
@@ -332,89 +600,16 @@ fn draw_staff(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], r
             p.vline(ctx.x(t), Rangef::new(y_top, y_bottom), Stroke::new(1.0, theme::TEXT_FAINT));
         }
 
-        // Chords: notes that start together share a stem.
-        let notes: Vec<&Note> = clip.notes.iter().filter(|n| n.start_secs < clip.length_secs).collect();
-        let mut i = 0;
-        while i < notes.len() {
-            let onset = notes[i].start_secs;
-            let mut j = i;
-            while j < notes.len() && notes[j].start_secs - onset < 0.004 {
-                j += 1;
+        let staff = Staff { p: &p, h, bottom_step, bottom_y };
+        let chords = chords_of(ctx, clip, layout, content);
+        for group in beam_groups(&chords) {
+            let members: Vec<&Chord> = group.iter().map(|&i| &chords[i]).collect();
+            if members.len() > 1 {
+                staff.beamed(&members);
+            } else {
+                staff.single(members[0]);
             }
-            let chord = &notes[i..j];
-            let next_onset = notes.get(j).map(|n| n.start_secs);
-            i = j;
-
-            let x = ctx.x(start + onset);
-            if x < content.left() - 30.0 || x > content.right() + 30.0 {
-                continue;
-            }
-            // Written length: up to the next onset, so let-ring notes don't all read as whole notes.
-            let len = chord.iter().map(|n| n.length_secs).fold(0.0, f64::max);
-            let len = next_onset.map_or(len, |next| len.min(next - onset));
-            let value = value_of(len / quarter_secs(layout, clip.length_secs, onset));
-            let sounding = chord.iter().any(|n| ctx.sounding(start + n.start_secs, start + n.start_secs + n.length_secs));
-            let ink = if sounding { ctx.color } else { theme::TEXT };
-            draw_chord(&p, chord, value, x, h, bottom_step, &y_of, ink);
         }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_chord(p: &Painter, chord: &[&Note], value: Value, x: f32, h: f32, bottom_step: i32, y_of: &dyn Fn(i32) -> f32, ink: Color32) {
-    let mut heads: Vec<(i32, bool)> = chord.iter().map(|n| diatonic(n.pitch.saturating_add(12))).collect();
-    heads.sort();
-    heads.dedup();
-    let (lo, hi) = (heads[0].0, heads[heads.len() - 1].0);
-    let stem_up = (lo + hi) as f32 / 2.0 < (bottom_step + 4) as f32;
-    let rx = h * 1.3;
-    let cx = x + rx + 1.0;
-
-    let mut prev: Option<(i32, bool)> = None; // (step, shifted)
-    for &(step, sharp) in &heads {
-        let y = y_of(step);
-        // Seconds in a chord: the second head goes on the other side of the stem.
-        let shifted = matches!(prev, Some((s, false)) if step - s == 1);
-        prev = Some((step, shifted));
-        let hx = match (shifted, stem_up) {
-            (false, _) => cx,
-            (true, true) => cx + 2.0 * rx,
-            (true, false) => cx - 2.0 * rx,
-        };
-        let ledger = |s: i32| p.hline(Rangef::new(hx - rx * 1.7, hx + rx * 1.7), y_of(s), Stroke::new(1.0, theme::TEXT_FAINT));
-        for s in (step..bottom_step).filter(|s| (bottom_step - s) % 2 == 0) {
-            ledger(s);
-        }
-        for s in (bottom_step + 10..=step).filter(|s| (s - bottom_step) % 2 == 0) {
-            ledger(s);
-        }
-        let radius = vec2(rx, h * 0.92);
-        if matches!(value, Value::Whole | Value::Half) {
-            p.add(Shape::ellipse_stroke(pos2(hx, y), radius - vec2(0.6, 0.6), Stroke::new(1.4, ink)));
-        } else {
-            p.add(Shape::ellipse_filled(pos2(hx, y), radius, ink));
-        }
-        if sharp {
-            draw_sharp(p, pos2(cx - rx - h * 1.6, y), h, ink);
-        }
-    }
-
-    if value == Value::Whole {
-        return;
-    }
-    let stem_len = 7.0 * h;
-    let (sx, y0, y1) = if stem_up { (cx + rx - 0.5, y_of(lo), y_of(hi) - stem_len) } else { (cx - rx + 0.5, y_of(hi), y_of(lo) + stem_len) };
-    p.vline(sx, Rangef::new(y0.min(y1), y0.max(y1)), Stroke::new(1.0, ink));
-    let flags = match value {
-        Value::Eighth => 1,
-        Value::Sixteenth => 2,
-        _ => 0,
-    };
-    // Flags curl back toward the heads.
-    let dir = if stem_up { 1.0 } else { -1.0 };
-    for f in 0..flags {
-        let from = pos2(sx, y1 + dir * f as f32 * 1.6 * h);
-        p.line_segment([from, from + vec2(h * 1.8, dir * h * 2.6)], Stroke::new(1.6, ink));
     }
 }
 
@@ -442,10 +637,33 @@ mod tests {
 
     #[test]
     fn note_values_from_quarter_lengths() {
-        assert_eq!(value_of(4.0), Value::Whole);
-        assert_eq!(value_of(2.0), Value::Half);
-        assert_eq!(value_of(1.0), Value::Quarter);
-        assert_eq!(value_of(0.5), Value::Eighth);
-        assert_eq!(value_of(1.0 / 3.0), Value::Sixteenth);
+        assert_eq!(written(4.0).value, Value::Whole);
+        assert_eq!(written(2.0).value, Value::Half);
+        assert_eq!(written(1.0).value, Value::Quarter);
+        assert_eq!(written(0.5).value, Value::Eighth);
+        assert_eq!(written(0.25).value, Value::Sixteenth);
+        assert_eq!(written(1.0 / 3.0), Written { value: Value::Eighth, dotted: false, triplet: true });
+        assert_eq!(written(0.75), Written { value: Value::Eighth, dotted: true, triplet: false });
+        assert_eq!(written(0.48).value, Value::Eighth, "slightly short eighths stay eighths");
+    }
+
+    fn chord(onset: f64, len: f64, beat: (usize, i64)) -> Chord {
+        Chord { x: 0.0, onset, end: onset + len, heads: vec![(30, false)], written: written(len / 0.5), beat, quarter: 0.5, ink: theme::TEXT }
+    }
+
+    #[test]
+    fn eighths_beam_within_a_beat_and_break_at_rests_and_longer_notes() {
+        // Beat 0: two eighths; beat 1: an eighth then a rest; beat 2: a quarter; beat 3: four sixteenths.
+        let chords = vec![
+            chord(0.0, 0.25, (0, 0)),
+            chord(0.25, 0.25, (0, 0)),
+            chord(0.5, 0.25, (0, 1)),
+            chord(1.0, 0.5, (0, 2)),
+            chord(1.5, 0.125, (0, 3)),
+            chord(1.625, 0.125, (0, 3)),
+            chord(1.75, 0.125, (0, 3)),
+            chord(1.875, 0.125, (0, 3)),
+        ];
+        assert_eq!(beam_groups(&chords), vec![vec![0, 1], vec![2], vec![3], vec![4, 5, 6, 7]]);
     }
 }

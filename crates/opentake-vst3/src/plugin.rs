@@ -368,12 +368,13 @@ impl Vst3Processor {
 
         use ProcessContext_::StatesAndFlags_::*;
         let mut ctx: ProcessContext = unsafe { std::mem::zeroed() };
-        ctx.state = kTempoValid | kTimeSigValid;
+        // The flag constants are u32 on some platforms and i32 on others.
+        ctx.state = (kTempoValid | kTimeSigValid) as _;
         if transport.playing {
-            ctx.state |= kPlaying;
+            ctx.state |= kPlaying as u32;
         }
         if transport.recording {
-            ctx.state |= kRecording;
+            ctx.state |= kRecording as u32;
         }
         ctx.sampleRate = self.sample_rate;
         ctx.projectTimeSamples = transport.position_samples;

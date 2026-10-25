@@ -147,6 +147,8 @@ fn install_system_font(ctx: &egui::Context) {
     let candidates: &[(&str, FontFamily, &str)] = &[
         ("sf-pro", FontFamily::Proportional, "/System/Library/Fonts/SFNS.ttf"),
         ("sf-mono", FontFamily::Monospace, "/System/Library/Fonts/SFNSMono.ttf"),
+        ("segoe-ui", FontFamily::Proportional, "C:\\Windows\\Fonts\\segoeui.ttf"),
+        ("consolas", FontFamily::Monospace, "C:\\Windows\\Fonts\\consola.ttf"),
     ];
     for (name, family, path) in candidates {
         if let Ok(bytes) = std::fs::read(path) {
@@ -170,19 +172,33 @@ pub fn tempo_label(bpm: f64) -> String {
     if has_music_font() { format!("\u{2669} = {n}") } else { format!("{n} BPM") }
 }
 
-/// Whether a font with music symbols (clefs) is installed as a fallback.
+/// Whether a font with music symbols (clefs, ♩) is installed as a fallback.
 pub fn has_music_font() -> bool {
     MUSIC_FONT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Apple Symbols has the clef glyphs (𝄞 𝄢); add it as the last fallback.
+/// Symbol fonts added as the last fallbacks, for shortcut glyphs (⌘ ⌫ ⇧ →) and music
+/// symbols (𝄞 𝄢 ♩). (path, has the music symbols)
+const SYMBOL_FONTS: &[(&str, bool)] = &[
+    ("/System/Library/Fonts/Apple Symbols.ttf", true),
+    ("C:\\Windows\\Fonts\\seguisym.ttf", true),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", false),
+    ("/usr/share/fonts/TTF/DejaVuSans.ttf", false),
+    ("/usr/share/fonts/dejavu/DejaVuSans.ttf", false),
+    ("/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf", false),
+];
+
 fn install_music_font(ctx: &egui::Context) {
-    if let Ok(bytes) = std::fs::read("/System/Library/Fonts/Apple Symbols.ttf") {
+    for (i, &(path, music)) in SYMBOL_FONTS.iter().enumerate() {
+        let Ok(bytes) = std::fs::read(path) else { continue };
         ctx.add_font(egui::epaint::text::FontInsert::new(
-            "apple-symbols",
+            &format!("symbols-{i}"),
             egui::FontData::from_owned(bytes),
             vec![egui::epaint::text::InsertFontFamily { family: FontFamily::Proportional, priority: egui::epaint::text::FontPriority::Lowest }],
         ));
-        MUSIC_FONT.store(true, std::sync::atomic::Ordering::Relaxed);
+        if music {
+            MUSIC_FONT.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        break;
     }
 }

@@ -44,7 +44,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libgtk-3-dev libxkbcommon-dev libwayland-dev \
+          sudo apt-get install -y fonts-dejavu-core libasound2-dev libgtk-3-dev libxkbcommon-dev libwayland-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
@@ -81,8 +81,9 @@ jobs:
               ;;
             macOS)
               app=stage/OpenTake.app/Contents
-              mkdir -p "$app/MacOS"
+              mkdir -p "$app/MacOS" "$app/Resources"
               cp "$bin/opentake" "$app/MacOS/opentake"
+              cp assets/logo/AppIcon.icns "$app/Resources/AppIcon.icns"
               sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Info.plist"
               # Ad-hoc signature so Apple Silicon will launch it (not notarized).
               codesign --force --deep --sign - stage/OpenTake.app
