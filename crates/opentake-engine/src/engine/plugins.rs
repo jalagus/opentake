@@ -18,6 +18,8 @@ use crate::dynamics::{self, Compressor, GainMeter, Limiter, comp, limiter};
 use crate::eq::{self, Eq};
 use crate::multiband::{self, Multiband, MultibandMeter};
 use crate::reverb::{self, Reverb};
+use crate::gate::{self, Gate};
+use crate::deesser::{self, DeEsser};
 use crate::synth::{self, Synth};
 
 pub(super) enum Loaded {
@@ -33,6 +35,8 @@ pub(super) enum Loaded {
     Multiband(std::sync::Arc<MultibandMeter>),
     Delay,
     Reverb(std::sync::Arc<GainMeter>),
+    Gate(std::sync::Arc<GainMeter>),
+    DeEsser(std::sync::Arc<GainMeter>),
 }
 
 impl Loaded {
@@ -59,9 +63,11 @@ fn builtin_effect_for(query: &str) -> Option<(&'static str, &'static str)> {
         "delay" | "echo" => Some((delay::NAME, delay::PATH)),
         "multiband" | "multiband compressor" | "multiband comp" | "mbc" => Some((multiband::NAME, multiband::PATH)),
         "reverb" | "verb" | "reverb send" | "hall" | "room" => Some((reverb::NAME, reverb::PATH)),
-        _ => [eq::NAME, comp::NAME, limiter::NAME, delay::NAME, multiband::NAME, reverb::NAME]
+        "gate" | "noise gate" | "expander" => Some((gate::NAME, gate::PATH)),
+        "deesser" | "de-esser" | "de esser" | "sibilance" => Some((deesser::NAME, deesser::PATH)),
+        _ => [eq::NAME, comp::NAME, limiter::NAME, delay::NAME, multiband::NAME, reverb::NAME, gate::NAME, deesser::NAME]
             .into_iter()
-            .zip([eq::PATH, comp::PATH, limiter::PATH, delay::PATH, multiband::PATH, reverb::PATH])
+            .zip([eq::PATH, comp::PATH, limiter::PATH, delay::PATH, multiband::PATH, reverb::PATH, gate::PATH, deesser::PATH])
             .find(|(n, _)| n.to_lowercase() == q),
     }
 }
@@ -80,6 +86,8 @@ fn builtin_effect_instance(path: &str) -> Option<Loaded> {
         multiband::PATH => Loaded::Multiband(MultibandMeter::new()),
         delay::PATH => Loaded::Delay,
         reverb::PATH => Loaded::Reverb(GainMeter::new()),
+        gate::PATH => Loaded::Gate(GainMeter::new()),
+        deesser::PATH => Loaded::DeEsser(GainMeter::new()),
         _ => return None,
     })
 }
@@ -94,6 +102,8 @@ fn builtin_effect_params(loaded: &Loaded) -> Option<(ParamList, fn(u32, f64) -> 
         Loaded::Multiband(_) => (multiband::params(), multiband::display),
         Loaded::Delay => (delay::params(), delay::display),
         Loaded::Reverb(_) => (reverb::params(), reverb::display),
+        Loaded::Gate(_) => (gate::params(), gate::display),
+        Loaded::DeEsser(_) => (deesser::params(), deesser::display),
         _ => return None,
     })
 }
@@ -374,6 +384,8 @@ impl Engine {
             (PluginFormat::Builtin, multiband::PATH) => Box::new(Multiband::new(sr, None)),
             (PluginFormat::Builtin, delay::PATH) => Box::new(Delay::new(sr)),
             (PluginFormat::Builtin, reverb::PATH) => Box::new(Reverb::new(sr, None)),
+            (PluginFormat::Builtin, gate::PATH) => Box::new(Gate::new(sr, None)),
+            (PluginFormat::Builtin, deesser::PATH) => Box::new(DeEsser::new(sr, None)),
             (PluginFormat::Vst3, _) => {
                 let plugin = self.instantiate_vst3_slot(slot)?;
                 let mut p = plugin.create_processor(sr, MAX_BLOCK, 2)?;
@@ -426,6 +438,8 @@ impl Engine {
             Some(Loaded::Multiband(meter)) => with_params(Box::new(Multiband::new(sr as f64, Some(meter.clone()))), &slot.params),
             Some(Loaded::Delay) => with_params(Box::new(Delay::new(sr as f64)), &slot.params),
             Some(Loaded::Reverb(meter)) => with_params(Box::new(Reverb::new(sr as f64, Some(meter.clone()))), &slot.params),
+            Some(Loaded::Gate(meter)) => with_params(Box::new(Gate::new(sr as f64, Some(meter.clone()))), &slot.params),
+            Some(Loaded::DeEsser(meter)) => with_params(Box::new(DeEsser::new(sr as f64, Some(meter.clone()))), &slot.params),
             None => return Ok(None),
         };
         Ok(Some(Box::new(PluginRt { instance: slot.instance, processor, bypass: slot.bypass })))
@@ -565,7 +579,7 @@ impl Engine {
     pub fn fx_meter(&self, track: usize, which: SlotRef) -> Option<std::sync::Arc<GainMeter>> {
         let slot = self.slot_ref(track, which).ok()?;
         match self.pool.get(&slot.instance) {
-            Some(Loaded::Compressor(m) | Loaded::Limiter(m) | Loaded::Reverb(m)) => Some(m.clone()),
+            Some(Loaded::Compressor(m) | Loaded::Limiter(m) | Loaded::Reverb(m) | Loaded::Gate(m) | Loaded::DeEsser(m)) => Some(m.clone()),
             _ => None,
         }
     }
@@ -591,7 +605,7 @@ impl Engine {
     /// Effects available to insert: the built-ins plus scanned VST3 and AU effects.
     pub fn available_effects(&self) -> Vec<(String, String)> {
         let mut list: Vec<(String, String)> =
-            [(eq::NAME, eq::PATH), (comp::NAME, comp::PATH), (multiband::NAME, multiband::PATH), (limiter::NAME, limiter::PATH), (delay::NAME, delay::PATH), (reverb::NAME, reverb::PATH)].iter().map(|(n, p)| (n.to_string(), p.to_string())).collect();
+            [(eq::NAME, eq::PATH), (comp::NAME, comp::PATH), (multiband::NAME, multiband::PATH), (limiter::NAME, limiter::PATH), (delay::NAME, delay::PATH), (reverb::NAME, reverb::PATH), (gate::NAME, gate::PATH), (deesser::NAME, deesser::PATH)].iter().map(|(n, p)| (n.to_string(), p.to_string())).collect();
         for p in self.scanned.iter().filter(|p| !p.class.is_instrument()) {
             list.push((format!("{} — {}", p.class.name, p.class.vendor), p.bundle.to_string_lossy().into_owned()));
         }
@@ -721,7 +735,7 @@ impl Engine {
                     }
                 })
                 .collect()),
-            Some(builtin @ (Loaded::Eq(_) | Loaded::Compressor(_) | Loaded::Limiter(_) | Loaded::Multiband(_) | Loaded::Delay | Loaded::Reverb(_))) => {
+            Some(builtin @ (Loaded::Eq(_) | Loaded::Compressor(_) | Loaded::Limiter(_) | Loaded::Multiband(_) | Loaded::Delay | Loaded::Reverb(_) | Loaded::Gate(_) | Loaded::DeEsser(_))) => {
                 let (list, display) = builtin_effect_params(builtin).expect("checked");
                 Ok(list
                     .into_iter()
@@ -851,6 +865,20 @@ mod tests {
         assert!(!e.project().tracks[t].is_instrument(), "undo removes the instrument");
         e.redo().unwrap();
         assert!(e.project().tracks[t].is_instrument());
+    }
+
+    #[test]
+    fn builtin_gate_and_deesser_by_name() {
+        let mut e = Engine::new();
+        let t = e.add_track("Vox").unwrap();
+        for (query, path, count) in [("gate", gate::PATH, 8), ("noise gate", gate::PATH, 8), ("de-esser", deesser::PATH, 6), ("deesser", deesser::PATH, 6)] {
+            let slot = e.insert_plugin(t, query, None).unwrap();
+            assert_eq!(e.project().tracks[t].plugins[slot].path, path, "{query}");
+            assert_eq!(e.slot_params(t, SlotRef::Effect(slot)).unwrap().len(), count);
+            assert!(e.fx_meter(t, SlotRef::Effect(slot)).is_some(), "metered");
+        }
+        assert_eq!(e.set_plugin_param(t, 0, gate::THRESHOLD, gate::norm_threshold(-50.0)).unwrap().as_deref(), Some("-50.0"));
+        assert!(e.available_effects().iter().any(|(n, _)| n == deesser::NAME));
     }
 
     #[test]

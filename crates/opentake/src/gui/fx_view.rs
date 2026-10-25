@@ -10,6 +10,7 @@ use egui::{Align2, Color32, FontId, Rect, RichText, Sense, Shape, Stroke, pos2, 
 use opentake_engine::delay;
 use opentake_engine::multiband::{self, MultibandMeter};
 use opentake_engine::reverb;
+use opentake_engine::{deesser, gate};
 use opentake_engine::dynamics::{self, CompSettings, GainMeter, comp, limiter};
 use opentake_engine::{ParamView, SlotRef};
 
@@ -23,6 +24,8 @@ pub enum Kind {
     Limiter,
     Delay,
     Reverb,
+    Gate,
+    DeEsser,
 }
 
 impl Kind {
@@ -33,6 +36,8 @@ impl Kind {
             limiter::PATH => Some(Kind::Limiter),
             delay::PATH => Some(Kind::Delay),
             reverb::PATH => Some(Kind::Reverb),
+            gate::PATH => Some(Kind::Gate),
+            deesser::PATH => Some(Kind::DeEsser),
             _ => None,
         }
     }
@@ -44,6 +49,8 @@ impl Kind {
             Kind::Limiter => [420.0, 400.0],
             Kind::Delay => [560.0, 250.0],
             Kind::Reverb => [770.0, 360.0],
+            Kind::Gate => [560.0, 500.0],
+            Kind::DeEsser => [560.0, 420.0],
         }
     }
 }
@@ -56,6 +63,8 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, kind: Kin
         Kind::Limiter => limiter_view(app, ui, t, s, params, meter),
         Kind::Delay => delay_view(app, ui, t, s, params, bpm),
         Kind::Reverb => reverb_view(app, ui, t, s, params, meter),
+        Kind::Gate => gate_view(app, ui, t, s, params, meter),
+        Kind::DeEsser => deesser_view(app, ui, t, s, params, meter),
     }
 }
 
@@ -365,6 +374,55 @@ fn delay_view(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params:
         ids.insert(0, delay::TIME);
     }
     knob_row(app, ui, t, s, params, &ids);
+}
+
+fn gate_view(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params: &[ParamView], meter: Option<&Arc<GainMeter>>) {
+    let raw = meter.map_or((0.0, -120.0, -120.0), |m| m.take());
+    let levels = smoothed(ui, ui.make_persistent_id(("gate_meter", t, s)), raw);
+    ui.horizontal_top(|ui| {
+        bar(ui, "IN", levels.1, false);
+        bar(ui, "ATT", levels.0, true);
+        bar(ui, "OUT", levels.2, false);
+        ui.add_space(12.0);
+        ui.vertical(|ui| {
+            knob_row(app, ui, t, s, params, &[gate::THRESHOLD, gate::HYSTERESIS, gate::RANGE]);
+            knob_row(app, ui, t, s, params, &[gate::ATTACK, gate::HOLD, gate::RELEASE]);
+            knob_row(app, ui, t, s, params, &[gate::KEY_LOW_CUT, gate::KEY_HIGH_CUT]);
+        });
+    });
+    ui.add_space(8.0);
+    history(ui, ui.make_persistent_id(("gate_history", t, s)), raw.0, raw.1);
+}
+
+fn deesser_view(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params: &[ParamView], meter: Option<&Arc<GainMeter>>) {
+    let raw = meter.map_or((0.0, -120.0, -120.0), |m| m.take());
+    let levels = smoothed(ui, ui.make_persistent_id(("deesser_meter", t, s)), raw);
+    let (wide, listen) = (value(params, deesser::MODE) >= 0.5, value(params, deesser::LISTEN) >= 0.5);
+    ui.horizontal(|ui| {
+        for (label, on) in [("SPLIT", !wide), ("WIDEBAND", wide)] {
+            let tip = if on { "Reducing this way" } else { "Reduce this way" };
+            if widgets::chip(ui, on, label, theme::ACCENT, tip, vec2(if label == "WIDEBAND" { 74.0 } else { 48.0 }, 20.0)).clicked() && !on {
+                app.act(Action::SetParam(t, s, deesser::MODE, if wide { 0.0 } else { 1.0 }));
+            }
+        }
+        ui.add_space(12.0);
+        if widgets::chip(ui, listen, "LISTEN", theme::TEMPO, "Hear only the band being detected", vec2(56.0, 20.0)).clicked() {
+            app.act(Action::SetParam(t, s, deesser::LISTEN, if listen { 0.0 } else { 1.0 }));
+        }
+    });
+    ui.add_space(8.0);
+    ui.horizontal_top(|ui| {
+        bar(ui, "IN", levels.1, false);
+        bar(ui, "GR", levels.0, true);
+        bar(ui, "OUT", levels.2, false);
+        ui.add_space(12.0);
+        ui.vertical(|ui| {
+            knob_row(app, ui, t, s, params, &[deesser::FREQUENCY, deesser::THRESHOLD]);
+            knob_row(app, ui, t, s, params, &[deesser::RANGE, deesser::RELEASE]);
+        });
+    });
+    ui.add_space(8.0);
+    history(ui, ui.make_persistent_id(("deesser_history", t, s)), raw.0, raw.1);
 }
 
 fn reverb_view(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params: &[ParamView], meter: Option<&Arc<GainMeter>>) {

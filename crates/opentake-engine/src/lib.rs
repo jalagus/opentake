@@ -12,6 +12,9 @@ pub mod drums;
 pub mod dynamics;
 pub mod multiband;
 pub mod reverb;
+pub mod gate;
+pub mod deesser;
+mod filter;
 pub mod eq;
 pub mod synth;
 

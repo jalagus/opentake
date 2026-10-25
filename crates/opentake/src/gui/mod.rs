@@ -2900,6 +2900,21 @@ mod tests {
     }
 
     #[test]
+    fn deesser_editor_switches_mode_and_listen() {
+        let (mut harness, engine) = harness_with_track();
+        let d = engine.lock().unwrap().insert_plugin(0, "de-esser", None).unwrap();
+        harness.state_mut().open_plugins = vec![(0, SlotRef::Effect(d))];
+        harness.step();
+        harness.step();
+        let value = |e: &SharedEngine, id: u32| e.lock().unwrap().slot_params(0, SlotRef::Effect(d)).unwrap().iter().find(|p| p.id == id).unwrap().value;
+        click(&mut harness, "Reduce this way"); // Wideband
+        assert_eq!(value(&engine, opentake_engine::deesser::MODE), 1.0);
+        click(&mut harness, "Hear only the band being detected");
+        assert_eq!(value(&engine, opentake_engine::deesser::LISTEN), 1.0);
+        harness.get_by_label("Frequency");
+    }
+
+    #[test]
     fn take_folder_badge_picks_the_take() {
         let (mut harness, engine, dir) = harness_with_region();
         {
