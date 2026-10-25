@@ -92,6 +92,8 @@ pub struct EngineStatus {
     pub recording: bool,
     /// Counting in before playback or recording starts.
     pub counting_in: bool,
+    /// Plug-in delay being compensated (milliseconds).
+    pub latency_ms: f64,
     pub position_secs: f64,
     pub record_overrun_samples: u64,
     /// Peak level in dBFS with a 30 dB/s fall (floored at -120).
@@ -596,6 +598,7 @@ impl Engine {
             playing: self.shared.playing.load(Ordering::Relaxed),
             recording: self.shared.recording.load(Ordering::Relaxed),
             counting_in: self.shared.counting_in.load(Ordering::Relaxed),
+            latency_ms: self.shared.latency.load(Ordering::Relaxed) as f64 * 1000.0 / sr.max(1) as f64,
             position_secs: self.shared.position.load(Ordering::Relaxed) as f64 / sr as f64,
             record_overrun_samples: self.shared.record_overruns.load(Ordering::Relaxed),
             master_peak_db: self.meters.master.map(db),

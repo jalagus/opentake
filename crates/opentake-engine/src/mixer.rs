@@ -20,6 +20,8 @@ pub const PLUGIN_CAPACITY: usize = 32;
 const MIDI_CLIP_CAPACITY: usize = 512;
 const EVENT_CAPACITY: usize = 1024;
 const LIVE_CAPACITY: usize = 128;
+/// Longest plug-in delay that's compensated per track (samples, a power of two).
+const MAX_COMP: usize = 16_384;
 /// Track id addressing the master bus in plug-in commands.
 pub const MASTER: u64 = u64::MAX;
 
@@ -46,6 +48,10 @@ pub trait Processor: Send {
     /// (sorted by offset) are only non-empty for instruments.
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, transport: &Transport, events: &[MidiEvent]);
     fn set_param(&mut self, id: u32, normalized: f64);
+    /// Processing delay in samples (look-ahead etc.); the mixer compensates for it.
+    fn latency(&self) -> usize {
+        0
+    }
 }
 
 pub struct PluginRt {
@@ -108,6 +114,11 @@ pub struct TrackRt {
     /// Which pitches are sounding, so they can be released on stop/seek/edit.
     active: [bool; 128],
     flush: bool,
+    /// This track's plug-in delay (samples), refreshed every callback.
+    latency: usize,
+    /// Delay line that lines the track up with the slowest track (plug-in delay compensation).
+    comp: [Vec<f32>; 2],
+    comp_write: usize,
 }
 
 impl TrackRt {
@@ -125,6 +136,9 @@ impl TrackRt {
             live: Vec::with_capacity(LIVE_CAPACITY),
             active: [false; 128],
             flush: false,
+            latency: 0,
+            comp: [vec![0.0; MAX_COMP], vec![0.0; MAX_COMP]],
+            comp_write: 0,
         }
     }
 }
@@ -192,6 +206,8 @@ pub struct SharedState {
     pub master_peak: [AtomicU32; 2],
     /// Counting in before playback/recording starts.
     pub counting_in: AtomicBool,
+    /// Total plug-in delay being compensated (samples).
+    pub latency: AtomicU32,
 }
 
 impl SharedState {
@@ -205,6 +221,7 @@ impl SharedState {
             track_peaks: (0..MAX_TRACKS).map(|_| AtomicU32::new(0)).collect(),
             master_peak: [AtomicU32::new(0), AtomicU32::new(0)],
             counting_in: AtomicBool::new(false),
+            latency: AtomicU32::new(0),
         }
     }
 
@@ -240,6 +257,9 @@ pub struct Mixer {
     counting: Option<CountIn>,
     song_end: u64,
     master_plugins: Vec<Box<PluginRt>>,
+    /// Slowest track's plug-in delay, and the timeline read-ahead that hides all delays.
+    max_track_latency: usize,
+    lookahead: u64,
     sample_rate: f64,
     loop_range: Option<(u64, u64)>,
     input: Vec<Vec<f32>>,
@@ -274,6 +294,8 @@ impl Mixer {
             counting: None,
             song_end: 0,
             master_plugins: Vec::with_capacity(PLUGIN_CAPACITY),
+            max_track_latency: 0,
+            lookahead: 0,
             sample_rate: sample_rate.max(1) as f64,
             loop_range: None,
             input: (0..MAX_INPUT_CHANNELS).map(|_| vec![0.0; MAX_BLOCK]).collect(),
@@ -311,6 +333,43 @@ impl Mixer {
         }
     }
 
+    /// Plug-in delay compensation: each track's latency, the slowest one, and the read-ahead
+    /// (slowest track + master chain). Tracks read the timeline that far ahead and the faster
+    /// ones are delayed to match, so the output lines up with the playhead.
+    fn update_latency(&mut self) {
+        let chain = |plugins: &[Box<PluginRt>]| plugins.iter().filter(|p| !p.bypass).map(|p| p.processor.latency()).sum::<usize>();
+        let mut max = 0;
+        for t in &mut self.tracks {
+            let inst = t.instrument.as_ref().filter(|p| !p.bypass).map_or(0, |p| p.processor.latency());
+            t.latency = (inst + chain(&t.plugins)).min(MAX_COMP - 1);
+            max = max.max(t.latency);
+        }
+        self.max_track_latency = max;
+        self.lookahead = (max + chain(&self.master_plugins)) as u64;
+        self.shared.latency.store(self.lookahead as u32, Ordering::Relaxed);
+    }
+
+    /// Where the tracks read the timeline for output at playhead `pos`: `lookahead` ahead,
+    /// wrapping at the cycle end. (`pos` is negative during a start's pre-roll.)
+    fn read_position(&self, pos: i64) -> u64 {
+        let ahead = (pos + self.lookahead as i64).max(0) as u64;
+        match self.active_loop() {
+            Some((start, end)) if pos >= 0 && (pos as u64) < end && ahead >= end => start + (ahead - end),
+            _ => ahead,
+        }
+    }
+
+    /// Start the transport. It starts `lookahead` samples early (a few milliseconds), so
+    /// plug-ins with latency are already filled when the playhead reaches the start and
+    /// nothing at the start is skipped.
+    fn start_rolling(&mut self) {
+        if !self.transport.playing {
+            self.update_latency(); // a plug-in may have arrived in this same callback
+            self.transport.position_samples -= self.lookahead as i64;
+        }
+        self.transport.playing = true;
+    }
+
     fn plugin_mut(&mut self, track: u64, instance: u64) -> Option<&mut Box<PluginRt>> {
         if track == MASTER {
             return self.master_plugins.iter_mut().find(|p| p.instance == instance);
@@ -338,7 +397,7 @@ impl Mixer {
                     if !self.transport.playing && self.counting.is_none() && self.count_in.on_play && self.count_in.bars > 0 {
                         self.start_count_in(false);
                     } else if self.counting.is_none() {
-                        self.transport.playing = true;
+                        self.start_rolling();
                     }
                 }
                 Command::Stop => {
@@ -349,6 +408,11 @@ impl Mixer {
                 }
                 Command::Seek(pos) => {
                     self.transport.position_samples = pos as i64;
+                    if self.transport.playing {
+                        // Pre-roll so the compensated tracks don't skip the first samples.
+                        self.update_latency();
+                        self.transport.position_samples -= self.lookahead as i64;
+                    }
                     self.flush_all_notes();
                 }
                 // Recording from a stop counts in first (if set); punching in while playing doesn't.
@@ -367,7 +431,7 @@ impl Mixer {
                     }
                     self.transport.recording = on;
                     if on {
-                        self.transport.playing = true;
+                        self.start_rolling();
                     }
                 }
                 Command::SetMasterGain(g) => self.master_gain = g,
@@ -490,6 +554,7 @@ impl Mixer {
     /// Process interleaved device buffers. `input` may be empty (no input device).
     pub fn process(&mut self, input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize) {
         self.handle_commands();
+        self.update_latency();
         let frames = output.len() / out_channels.max(1);
         let in_frames = if in_channels > 0 { input.len() / in_channels } else { 0 };
         let mut done = 0;
@@ -505,6 +570,11 @@ impl Mixer {
                 let pos = self.transport.position_samples.max(0) as u64;
                 if pos < end {
                     n = n.min((end - pos) as usize).max(1);
+                }
+                // ...and where the read-ahead crosses it, so the tracks wrap exactly too.
+                let ahead = (self.transport.position_samples + self.lookahead as i64).max(0) as u64;
+                if ahead < end {
+                    n = n.min((end - ahead) as usize).max(1);
                 }
             }
             let in_chunk = if done < in_frames {
@@ -571,7 +641,10 @@ impl Mixer {
         self.transport.tempo_bpm = seg.bpm;
         self.transport.time_sig = (seg.sig.0 as i32, seg.sig.1 as i32);
         let any_solo = self.tracks.iter().any(|t| t.params.solo);
-        let pos = self.transport.position_samples.max(0) as u64;
+        // Tracks render the timeline `lookahead` ahead; plug-ins see that position.
+        let pos = self.read_position(self.transport.position_samples);
+        let block_transport = Transport { position_samples: pos as i64, ..self.transport };
+        let max_latency = self.max_track_latency;
 
         for (ti, track) in self.tracks.iter_mut().enumerate() {
             let [l, r] = &mut track.buf;
@@ -613,7 +686,7 @@ impl Mixer {
                 if !inst.bypass {
                     let inputs: [&[f32]; 2] = [&l[..n], &r[..n]];
                     let mut outputs: [&mut [f32]; 2] = [&mut sl[..n], &mut sr[..n]];
-                    inst.processor.process(&inputs, &mut outputs, n, &self.transport, &track.events);
+                    inst.processor.process(&inputs, &mut outputs, n, &block_transport, &track.events);
                 }
                 for i in 0..n {
                     l[i] += sl[i];
@@ -626,12 +699,27 @@ impl Mixer {
                 {
                     let inputs: [&[f32]; 2] = [&l[..n], &r[..n]];
                     let mut outputs: [&mut [f32]; 2] = [&mut sl[..n], &mut sr[..n]];
-                    plugin.processor.process(&inputs, &mut outputs, n, &self.transport, &[]);
+                    plugin.processor.process(&inputs, &mut outputs, n, &block_transport, &[]);
                 }
                 l[..n].copy_from_slice(&sl[..n]);
                 r[..n].copy_from_slice(&sr[..n]);
             }
 
+            // Line the track up with the slowest one (plug-in delay compensation).
+            let delay = max_latency - track.latency;
+            {
+                let [cl, cr] = &mut track.comp;
+                let mut w = track.comp_write;
+                for i in 0..n {
+                    cl[w] = l[i];
+                    cr[w] = r[i];
+                    let read = (w + MAX_COMP - delay) & (MAX_COMP - 1);
+                    l[i] = cl[read];
+                    r[i] = cr[read];
+                    w = (w + 1) & (MAX_COMP - 1);
+                }
+                track.comp_write = w;
+            }
             let (gl, gr) = pan_gains(p.volume, p.pan);
             let mut peak = 0.0f32;
             let audible = !p.mute && (!any_solo || p.solo);
@@ -653,7 +741,7 @@ impl Mixer {
                 let [ml, mr] = &self.master;
                 let inputs: [&[f32]; 2] = [&ml[..n], &mr[..n]];
                 let mut outputs: [&mut [f32]; 2] = [&mut sl[..n], &mut sr[..n]];
-                plugin.processor.process(&inputs, &mut outputs, n, &self.transport, &[]);
+                plugin.processor.process(&inputs, &mut outputs, n, &block_transport, &[]);
             }
             self.master[0][..n].copy_from_slice(&sl[..n]);
             self.master[1][..n].copy_from_slice(&sr[..n]);
@@ -703,11 +791,12 @@ impl Mixer {
         // Start after this block, so playback begins exactly where the count-in ends.
         if let Some(record) = count_in_done {
             self.counting = None;
-            self.transport.playing = true;
             if record {
+                // The recording starts at the playhead (before the pre-roll shift).
                 self.shared.record_start.store(self.transport.position_samples.max(0) as u64, Ordering::Relaxed);
                 self.transport.recording = true;
             }
+            self.start_rolling();
         }
     }
 }
@@ -1036,6 +1125,76 @@ mod tests {
         tx.push(Command::Record(true)).ok();
         run(&mut m, 30);
         assert!(shared.recording.load(Ordering::Relaxed));
+    }
+
+    /// Delays its input by its latency and says so.
+    struct Latent(usize, Vec<f32>, Vec<f32>);
+
+    impl Latent {
+        fn new(samples: usize) -> Self {
+            Self(samples, vec![0.0; samples], vec![0.0; samples])
+        }
+    }
+
+    impl Processor for Latent {
+        fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, _: &Transport, _: &[MidiEvent]) {
+            for i in 0..frames {
+                // Shift through a FIFO of `latency` samples.
+                self.1.push(inputs[0][i]);
+                self.2.push(inputs[1][i]);
+                outputs[0][i] = self.1.remove(0);
+                outputs[1][i] = self.2.remove(0);
+            }
+        }
+        fn set_param(&mut self, _: u32, _: f64) {}
+        fn latency(&self) -> usize {
+            self.0
+        }
+    }
+
+    #[test]
+    fn plugin_delay_is_compensated_across_tracks_and_the_master() {
+        let (mut m, mut tx, _g, shared) = mixer();
+        let mut impulse = vec![0.0f32; 4];
+        impulse[0] = 0.4; // two of them sum to 0.8, below the output clamp
+        let data = Arc::new(AudioData { channels: vec![impulse], sample_rate: 48_000 });
+        for id in [1, 2] {
+            tx.push(Command::AddTrack(Box::new(TrackRt::new(id, params())))).ok();
+            tx.push(Command::AddClip { track: id, clip: ClipRt { start: 1000, len: 4, offset: 0, gain: 1.0, mute: false, data: data.clone() } }).ok();
+        }
+        // Track 1 has a 300-sample plug-in, the master a 200-sample one.
+        let slow = Box::new(PluginRt { instance: 9, processor: Box::new(Latent::new(300)), bypass: false });
+        tx.push(Command::SetPluginChain { track: 1, order: Box::new(vec![(9, false)]), new: Box::new(vec![slow]), target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)) }).ok();
+        let master = Box::new(PluginRt { instance: 10, processor: Box::new(Latent::new(200)), bypass: false });
+        tx.push(Command::SetPluginChain { track: MASTER, order: Box::new(vec![(10, false)]), new: Box::new(vec![master]), target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)) }).ok();
+        tx.push(Command::Play).ok();
+        let out = run(&mut m, 10);
+        assert_eq!(shared.latency.load(Ordering::Relaxed), 500);
+        // Both impulses land together at the clips' timeline position. The transport started
+        // 500 samples early (pre-roll), so output sample i is timeline position i - 500.
+        let hits: Vec<(usize, f32)> = out.iter().enumerate().filter(|(_, v)| v.abs() > 1e-6).map(|(i, v)| (i, *v)).collect();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].0 - 500, 1000);
+        assert!((hits[0].1 - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn compensated_playback_wraps_exactly_at_the_cycle() {
+        let (mut m, mut tx, _g, _s) = mixer();
+        let mut impulse = vec![0.0f32; 4];
+        impulse[0] = 0.5;
+        let data = Arc::new(AudioData { channels: vec![impulse], sample_rate: 48_000 });
+        tx.push(Command::AddTrack(Box::new(TrackRt::new(1, params())))).ok();
+        tx.push(Command::AddClip { track: 1, clip: ClipRt { start: 100, len: 4, offset: 0, gain: 1.0, mute: false, data } }).ok();
+        let slow = Box::new(PluginRt { instance: 9, processor: Box::new(Latent::new(300)), bypass: false });
+        tx.push(Command::SetPluginChain { track: 1, order: Box::new(vec![(9, false)]), new: Box::new(vec![slow]), target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)) }).ok();
+        tx.push(Command::SetLoop { enabled: true, start: 0, end: 2000 }).ok();
+        tx.push(Command::Play).ok();
+        let out = run(&mut m, 10); // 4800 samples = 2.4 passes
+        let hits: Vec<usize> = out.iter().enumerate().filter(|(_, v)| v.abs() > 1e-6).map(|(i, _)| i).collect();
+        // Every pass hears the impulse 100 samples in, including the first (nothing is skipped
+        // at the start). Output index = timeline position + the 300-sample pre-roll.
+        assert_eq!(hits, vec![100 + 300, 2100 + 300, 4100 + 300], "{hits:?}");
     }
 
     struct Gain(f32);

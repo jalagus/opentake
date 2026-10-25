@@ -18,7 +18,7 @@ you watch the changes appear live — and undo anything you don't like.
 
 - 🎙️ Multitrack recording from any audio interface (CoreAudio, WASAPI, ALSA/JACK via cpal)
 - 🎹 Instrument tracks, piano roll, a built-in synth and GM drum kit; VST3 instruments and effects
-- 🎛️ Built-in parametric EQ on any track or the master bus, with a draggable curve
+- 🎛️ Built-in EQ, compressor, limiter and delay on any track or the master bus; plug-in delay compensation
 - ⏱️ Project tempo map (tempo and time-signature changes), metronome with count-in
 - ✂️ Region editing: select, move, copy, split, trim, snap, cycle/loop
 - 🎚️ Full mixer, metronome, undo/redo for everything
@@ -154,6 +154,18 @@ recording) appears live in the window and vice versa.
   analyzer of the audio going in (grey) and coming out (teal): drag a band's point to set
   frequency and gain, scroll on it for Q, double-click it to switch the band on/off; knobs
   below for exact values. Each drag is one undo step.
+- **Compressor** (built-in **OpenTake Compressor**): threshold, ratio, knee, attack, release,
+  makeup and mix (for parallel compression). The editor shows the transfer curve with the
+  current level on it, and input, gain-reduction and output meters.
+- **Limiter** (built-in **OpenTake Limiter**): a brickwall limiter with 1.5 ms look-ahead —
+  gain, ceiling (peaks never go above it) and release. Put it last on the master to set the
+  final loudness without clipping.
+- **Delay** (built-in **OpenTake Delay**): time in ms or synced to the tempo map (1/32 to 1/1,
+  dotted and triplet), feedback, mix, low and high cuts on the repeats, ping-pong.
+- **Plug-in delay compensation**: plug-ins that delay audio (the limiter's look-ahead, VST3s
+  that report latency) are compensated automatically — tracks and the master stay in time
+  with each other and the playhead, also across cycle loops. The status bar shows the delay
+  being compensated; live input monitoring is delayed by that much.
 - **Mixer** (X): every track's channel strip side by side, Stereo Out pinned on the right,
   in the editor area below the tracks.
 - **Instrument tracks & MIDI**: create one from the "+" above the track list or
@@ -266,11 +278,12 @@ back on export, but they aren't applied to the loaded plugin.
 
 - f32 devices only (fine for CoreAudio; some ASIO/ALSA setups need sample conversion).
 - WAV media only; add `symphonia` for MP3/FLAC/OGG. Resampling is linear.
-- No latency compensation for plugins or input.
+- No compensation for audio-interface input latency yet (recordings may sit a few ms late);
+  plug-in delay is compensated.
 - VST3: no MIDI/instruments yet, no plugin editor windows, and no `IMessage` host
   objects (some plugins need them for processor ↔ controller messaging). Plugin
   parameters are saved by value in our JSON format, but full state chunks aren't saved yet.
-- Plugin parameter values, MIDI regions, the built-in synth/drums/EQ and master-bus effects
+- Plugin parameter values, MIDI regions, the built-in synth/drums/effects and master-bus effects
   are saved in `.otp` projects only (`.rpp` export skips them; VST3 instruments are exported).
 - Guitar Pro: only GP7/8 (`.gp`, `.gpif`); `.gp3`–`.gp5` and `.gpx` are recognised but not
   imported yet. Bends, slides and vibrato aren't played back (no pitch bend yet).
@@ -282,6 +295,7 @@ back on export, but they aren't applied to the loaded plugin.
 - GUI: no plugin editor windows (generic parameter sliders instead), no region fades,
   multi-selection or undo yet.
 - Offline bounce/render to file.
+- No built-in reverb yet (EQ, compressor, limiter and delay are built in; any VST3 reverb works).
 
 ## Development
 

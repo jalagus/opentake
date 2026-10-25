@@ -30,8 +30,9 @@ get_history lists the steps.
 
 Tempo: set_tempo sets the opening tempo/signature; set_tempo_map adds tempo and time-signature changes. \
 Region and note times are always seconds; get_tempo_map and convert_time translate between seconds and \
-bars/beats. Effects: insert_plugin with \"eq\" adds the built-in 6-band EQ to a track; \
-insert_master_plugin puts effects on the master bus (address them with master: true).
+bars/beats. Effects: insert_plugin with \"eq\", \"comp\", \"limiter\" or \"delay\" adds a built-in effect to a track; \
+insert_master_plugin puts effects on the master bus (address them with master: true). Plug-in delay \
+(e.g. the limiter's look-ahead) is compensated automatically.
 
 Mixing: analyze_mix renders the mix offline and reports peak, LUFS, band energy and phone-speaker \
 translation per track and for the master — balance with update_track (volume_db, pan) and EQs, \
@@ -887,12 +888,12 @@ impl DawServer {
         .await
     }
 
-    #[tool(description = "Insert an effect into a track's chain: \"eq\" for the built-in OpenTake EQ (low cut, low shelf, two bells, high shelf, high cut, output — see list_plugin_params), or a VST3 effect. Returns the slot index.")]
+    #[tool(description = "Insert an effect into a track's chain. Built-ins: \"eq\" (6-band parametric EQ), \"comp\" (compressor: threshold, ratio, attack, release, knee, makeup, mix), \"limiter\" (look-ahead brickwall: gain, ceiling, release), \"delay\" (ms or tempo-synced note values, feedback, mix, repeat filters, ping-pong); or a VST3 effect. list_plugin_params shows ids and values. Plug-in latency is compensated automatically. Returns the slot index.")]
     async fn insert_plugin(&self, Parameters(a): Parameters<InsertPluginArgs>) -> ToolResult {
         self.with_engine(move |e| e.insert_plugin(a.track, &a.plugin, a.position).map(|s| json!({ "slot": s }))).await
     }
 
-    #[tool(description = "Insert an effect on the master bus (\"eq\" or a VST3 effect). Returns the slot index; use master: true with list_plugin_params / set_plugin_param / set_plugin_bypass.")]
+    #[tool(description = "Insert an effect on the master bus (\"eq\", \"comp\", \"limiter\", \"delay\" or a VST3 effect; a limiter last in the chain sets the final peak ceiling and loudness). Returns the slot index; use master: true with list_plugin_params / set_plugin_param / set_plugin_bypass.")]
     async fn insert_master_plugin(&self, Parameters(a): Parameters<InsertMasterPluginArgs>) -> ToolResult {
         self.with_engine(move |e| e.insert_master_plugin(&a.plugin, a.position).map(|s| json!({ "slot": s }))).await
     }

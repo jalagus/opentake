@@ -5,7 +5,9 @@ pub mod engine;
 pub mod media;
 pub mod mixer;
 pub mod recorder;
+pub mod delay;
 pub mod drums;
+pub mod dynamics;
 pub mod eq;
 pub mod synth;
 

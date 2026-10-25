@@ -7,6 +7,7 @@
 mod menu;
 mod mixer;
 mod eq_view;
+mod fx_view;
 mod piano_roll;
 mod tab_view;
 mod theme;
@@ -90,6 +91,8 @@ pub(crate) struct Snapshot {
     pub params: HashMap<(usize, SlotRef), Vec<ParamView>>,
     /// Analyzer taps of built-in EQs whose windows are open.
     pub taps: HashMap<(usize, SlotRef), Arc<opentake_engine::eq::Tap>>,
+    /// Gain-reduction meters of built-in compressors/limiters whose windows are open.
+    pub meters: HashMap<(usize, SlotRef), Arc<opentake_engine::dynamics::GainMeter>>,
 }
 
 /// Copied regions (⌘C): each with its track offset from the top-most copied track, and
@@ -309,6 +312,7 @@ impl DawApp {
             }
         }
         let taps = open.iter().filter_map(|&(t, s)| Some(((t, s), e.eq_tap(t, s)?))).collect();
+        let meters = open.iter().filter_map(|&(t, s)| Some(((t, s), e.fx_meter(t, s)?))).collect();
         let params = open.into_iter().filter_map(|(t, s)| Some(((t, s), e.slot_params(t, s).ok()?))).collect();
         Snapshot {
             project_path: e.project_path().map(|p| p.to_path_buf()),
@@ -322,6 +326,7 @@ impl DawApp {
             waveforms,
             params,
             taps,
+            meters,
             project,
         }
     }
@@ -1616,12 +1621,18 @@ impl DawApp {
             let Some(slot) = slot_of(t, s) else { continue };
             let name = short_plugin_name(&slot.name).to_string();
             let owner = if matches!(s, SlotRef::Master(_)) { "Stereo Out".to_string() } else { project.tracks[t].name.clone() };
-            let is_eq = slot.format == opentake_engine::project::PluginFormat::Builtin && slot.path == opentake_engine::eq::PATH;
+            let builtin = slot.format == opentake_engine::project::PluginFormat::Builtin;
+            let is_eq = builtin && slot.path == opentake_engine::eq::PATH;
+            let fx = if builtin { fx_view::Kind::of(&slot.path) } else { None };
             let mut open = true;
             egui::Window::new(format!("{owner} — {name}"))
                 .id(ui.make_persistent_id(("plugin_window", t, s)))
                 .open(&mut open)
-                .default_size(if is_eq { [660.0, 440.0] } else { [400.0, 360.0] })
+                .default_size(if is_eq {
+                    [660.0, 440.0]
+                } else {
+                    fx.map_or([400.0, 360.0], fx_view::Kind::window_size)
+                })
                 .default_pos(pos2(640.0 + 28.0 * n as f32, 260.0))
                 .show(ui.ctx(), |ui| {
                     ui.horizontal(|ui| {
@@ -1637,6 +1648,11 @@ impl DawApp {
                     let params = snap.params.get(&(t, s)).map(Vec::as_slice).unwrap_or_default();
                     if is_eq && !params.is_empty() {
                         eq_view::show(self, ui, t, s, params, snap.status.sample_rate as f64, snap.taps.get(&(t, s)));
+                        return;
+                    }
+                    if let Some(kind) = fx.filter(|_| !params.is_empty()) {
+                        let bpm = snap.project.tempo_map().tempo_at(snap.status.position_secs.max(0.0));
+                        fx_view::show(self, ui, t, s, kind, params, snap.meters.get(&(t, s)), bpm);
                         return;
                     }
                     if params.is_empty() {
@@ -1767,6 +1783,11 @@ impl DawApp {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(RichText::new("Space  play / stop    R  record    Home  start    I  inspector").size(10.0).color(theme::TEXT_FAINT));
+                if snap.status.latency_ms > 0.05 {
+                    ui.label(RichText::new(format!("Plug-in delay {:.1} ms (compensated)", snap.status.latency_ms)).size(10.0).color(theme::TEXT_DIM))
+                        .on_hover_text("Tracks are lined up automatically; live input monitoring is delayed by this much.");
+                    ui.add_space(12.0);
+                }
             });
         });
     }
@@ -2623,6 +2644,42 @@ mod tests {
     }
 
     #[test]
+    fn compressor_limiter_and_delay_from_the_add_effect_menu() {
+        let (mut harness, engine) = harness_with_track();
+        harness.key_press(egui::Key::X);
+        harness.step();
+        harness.step();
+        let add_fx = |harness: &mut Harness<'static, DawApp>| {
+            // The mixer strip's add button (the inspector has one too): the lowest on screen.
+            let r = harness.query_all_by_label("Add audio effect").map(|n| n.rect()).max_by(|a, b| a.top().total_cmp(&b.top())).unwrap();
+            harness.hover_at(r.center());
+            harness.step();
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton { pos: r.center(), button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+            }
+            harness.step();
+            harness.step();
+        };
+        for name in [opentake_engine::dynamics::comp::NAME, opentake_engine::dynamics::limiter::NAME, opentake_engine::delay::NAME] {
+            add_fx(&mut harness);
+            click(&mut harness, name);
+        }
+        let names: Vec<String> = engine.lock().unwrap().project().tracks[0].plugins.iter().map(|p| p.name.clone()).collect();
+        assert_eq!(names, ["OpenTake Compressor", "OpenTake Limiter", "OpenTake Delay"]);
+        for _ in 0..3 {
+            harness.step();
+        }
+        // Each opens its editor.
+        harness.get_by_label("Compressor Curve");
+        harness.get_by_label("Ping-pong repeats");
+        assert!(harness.query_all_by_label("Ceiling").next().is_some());
+        // The limiter's look-ahead shows up as compensated latency (once audio runs it's in
+        // the status bar); the engine reports it per slot through the processor.
+        let p = engine.lock().unwrap().plugin_params(0, 1).unwrap();
+        assert!(p.iter().any(|p| p.title == "Ceiling" && p.display.as_deref() == Some("-1.0")));
+    }
+
+    #[test]
     fn tablature_size_and_paper_mode() {
         let (mut harness, engine) = harness_with_track();
         let fixture = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../opentake-project/tests/fixtures/simple.gp"));
@@ -2808,10 +2865,31 @@ mod tests {
         }
         harness.state_mut().bottom = Some(BottomTab::Mixer);
         harness.state_mut().open_plugins = vec![(MASTER_UI, SlotRef::Master(0))];
+        let fx_shot = std::env::var("OPENTAKE_SCREENSHOT_FX").is_ok();
         for _ in 0..6 {
             harness.step();
         }
         harness.render().expect("render").save(out.replace(".png", "-eq.png")).expect("save png");
+        if fx_shot {
+            // Compressor, limiter and delay editors.
+            {
+                use opentake_engine::dynamics::{self, comp};
+                let mut e = engine.lock().unwrap();
+                let c = e.insert_plugin(1, "comp", None).unwrap();
+                e.set_plugin_param(1, c, comp::THRESHOLD, dynamics::norm_threshold(-24.0)).unwrap();
+                e.set_plugin_param(1, c, comp::MAKEUP, 4.0 / 24.0).unwrap();
+                let d = e.insert_plugin(1, "delay", None).unwrap();
+                let l = e.insert_master_plugin("limiter", None).unwrap();
+                drop(e);
+                for (name, slot) in [("comp", (1, SlotRef::Effect(c))), ("delay", (1, SlotRef::Effect(d))), ("limiter", (MASTER_UI, SlotRef::Master(l)))] {
+                    harness.state_mut().open_plugins = vec![slot];
+                    for _ in 0..6 {
+                        harness.step();
+                    }
+                    harness.render().expect("render").save(out.replace(".png", &format!("-{name}.png"))).expect("save png");
+                }
+            }
+        }
         std::fs::remove_dir_all(&dir).ok();
         eprintln!("wrote {out}, {piano} and {tab}");
     }

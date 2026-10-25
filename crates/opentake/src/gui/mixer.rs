@@ -237,9 +237,17 @@ fn add_fx_button(app: &mut DawApp, ui: &mut egui::Ui, t: usize, w: f32, snap: &S
     egui::Popup::menu(&resp).show(|ui| {
         ui.set_min_width(220.0);
         widgets::section(ui, "Built-in");
-        if ui.button(opentake_engine::eq::NAME).clicked() {
-            insert(app, opentake_engine::eq::PATH.into());
-            ui.close();
+        let builtins = [
+            (opentake_engine::eq::NAME, opentake_engine::eq::PATH),
+            (opentake_engine::dynamics::comp::NAME, opentake_engine::dynamics::comp::PATH),
+            (opentake_engine::dynamics::limiter::NAME, opentake_engine::dynamics::limiter::PATH),
+            (opentake_engine::delay::NAME, opentake_engine::delay::PATH),
+        ];
+        for (name, path) in builtins {
+            if ui.button(name).clicked() {
+                insert(app, path.into());
+                ui.close();
+            }
         }
         ui.separator();
         widgets::section(ui, "VST3");

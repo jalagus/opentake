@@ -13,6 +13,8 @@ use opentake_vst3::{ClassInfo, Module, NoteEvent, ScannedPlugin, Vst3Plugin, Vst
 use super::{Engine, ParamView, display_name};
 use crate::mixer::{Command, MASTER, MAX_BLOCK, MidiEvent, PLUGIN_CAPACITY, PluginRt, Processor, Transport};
 use crate::drums::{self, DrumSynth};
+use crate::delay::{self, Delay};
+use crate::dynamics::{self, Compressor, GainMeter, Limiter, comp, limiter};
 use crate::eq::{self, Eq};
 use crate::synth::{self, Synth};
 
@@ -22,6 +24,48 @@ pub(super) enum Loaded {
     Drums,
     /// The tap feeds the editor's analyzer (shared by every processor of this instance).
     Eq(std::sync::Arc<eq::Tap>),
+    Compressor(std::sync::Arc<GainMeter>),
+    Limiter(std::sync::Arc<GainMeter>),
+    Delay,
+}
+
+/// The built-in effect a query names: (name, path).
+fn builtin_effect_for(query: &str) -> Option<(&'static str, &'static str)> {
+    let q = query.trim().to_lowercase();
+    let q = q.strip_prefix("builtin:").unwrap_or(&q);
+    match q {
+        "eq" | "equalizer" | "equaliser" | "channel eq" | "parametric eq" => Some((eq::NAME, eq::PATH)),
+        "comp" | "compressor" => Some((comp::NAME, comp::PATH)),
+        "limiter" | "brickwall" | "brickwall limiter" => Some((limiter::NAME, limiter::PATH)),
+        "delay" | "echo" => Some((delay::NAME, delay::PATH)),
+        _ => [eq::NAME, comp::NAME, limiter::NAME, delay::NAME]
+            .into_iter()
+            .zip([eq::PATH, comp::PATH, limiter::PATH, delay::PATH])
+            .find(|(n, _)| n.to_lowercase() == q),
+    }
+}
+
+/// A fresh pooled instance for a built-in effect path.
+fn builtin_effect_instance(path: &str) -> Option<Loaded> {
+    Some(match path {
+        eq::PATH => Loaded::Eq(eq::Tap::new()),
+        comp::PATH => Loaded::Compressor(GainMeter::new()),
+        limiter::PATH => Loaded::Limiter(GainMeter::new()),
+        delay::PATH => Loaded::Delay,
+        _ => return None,
+    })
+}
+
+/// Parameter list and display function of a built-in effect.
+type ParamList = Vec<(u32, String, &'static str, f64, i32)>;
+fn builtin_effect_params(loaded: &Loaded) -> Option<(ParamList, fn(u32, f64) -> String)> {
+    Some(match loaded {
+        Loaded::Eq(_) => (eq::params(), eq::display),
+        Loaded::Compressor(_) => (dynamics::comp_params(), dynamics::comp_display),
+        Loaded::Limiter(_) => (dynamics::limiter_params(), dynamics::limiter_display),
+        Loaded::Delay => (delay::params(), delay::display),
+        _ => return None,
+    })
 }
 
 /// Which plugin: a track's instrument or effect slot, or a slot on the master bus (the
@@ -33,14 +77,13 @@ pub enum SlotRef {
     Master(usize),
 }
 
-fn is_builtin_eq(query: &str) -> bool {
-    let q = query.trim().to_lowercase();
-    matches!(q.as_str(), "eq" | "equalizer" | "equaliser" | "channel eq" | "parametric eq" | "builtin:eq") || q == eq::NAME.to_lowercase()
-}
+
 
 struct Vst3Insert {
     processor: Vst3Processor,
     notes: Vec<NoteEvent>,
+    /// Reported when the processor was set up (not queried on the audio thread).
+    latency: usize,
 }
 
 impl Processor for Vst3Insert {
@@ -61,6 +104,10 @@ impl Processor for Vst3Insert {
 
     fn set_param(&mut self, id: u32, normalized: f64) {
         self.processor.queue_param(id, normalized);
+    }
+
+    fn latency(&self) -> usize {
+        self.latency
     }
 }
 
@@ -87,6 +134,14 @@ fn builtin_slot(name: &str, path: &str) -> PluginSlot {
         params: Vec::new(),
         instance: 0,
     }
+}
+
+/// Apply stored parameter values to a fresh processor.
+fn with_params(mut p: Box<dyn Processor>, params: &[(u32, f64)]) -> Box<dyn Processor> {
+    for &(id, value) in params {
+        p.set_param(id, value);
+    }
+    p
 }
 
 impl Engine {
@@ -204,12 +259,12 @@ impl Engine {
             slot.instance = self.add_to_pool(Loaded::Drums);
             return Ok(slot);
         }
-        if is_builtin_eq(query) {
+        if let Some((name, path)) = builtin_effect_for(query) {
             if instrument {
-                bail!("{} is an effect, not an instrument", eq::NAME);
+                bail!("{name} is an effect, not an instrument");
             }
-            let mut slot = builtin_slot(eq::NAME, eq::PATH);
-            slot.instance = self.add_to_pool(Loaded::Eq(eq::Tap::new()));
+            let mut slot = builtin_slot(name, path);
+            slot.instance = self.add_to_pool(builtin_effect_instance(path).expect("known built-in"));
             return Ok(slot);
         }
         let (bundle, cid) = self.resolve_plugin(query, instrument)?;
@@ -234,7 +289,9 @@ impl Engine {
         match slot.format {
             PluginFormat::Builtin if slot.path == synth::PATH => return Ok(self.add_to_pool(Loaded::Synth)),
             PluginFormat::Builtin if slot.path == drums::PATH => return Ok(self.add_to_pool(Loaded::Drums)),
-            PluginFormat::Builtin if slot.path == eq::PATH => return Ok(self.add_to_pool(Loaded::Eq(eq::Tap::new()))),
+            PluginFormat::Builtin if builtin_effect_instance(&slot.path).is_some() => {
+                return Ok(self.add_to_pool(builtin_effect_instance(&slot.path).expect("known built-in")));
+            }
             PluginFormat::Vst3 => {}
             _ => bail!("unsupported plugin format"),
         }
@@ -269,7 +326,8 @@ impl Engine {
                 for &(id, value) in &slot.params {
                     p.queue_param(id, value);
                 }
-                Box::new(Vst3Insert { processor: p, notes: Vec::with_capacity(1024) })
+                let latency = p.latency_samples() as usize;
+                Box::new(Vst3Insert { processor: p, notes: Vec::with_capacity(1024), latency })
             }
             Some(Loaded::Synth) => {
                 let mut s = Synth::new(sr as f64);
@@ -285,13 +343,10 @@ impl Engine {
                 }
                 Box::new(d)
             }
-            Some(Loaded::Eq(tap)) => {
-                let mut q = Eq::with_tap(sr as f64, Some(tap.clone()));
-                for &(id, value) in &slot.params {
-                    q.set_param(id, value);
-                }
-                Box::new(q)
-            }
+            Some(Loaded::Eq(tap)) => with_params(Box::new(Eq::with_tap(sr as f64, Some(tap.clone()))), &slot.params),
+            Some(Loaded::Compressor(meter)) => with_params(Box::new(Compressor::new(sr as f64, Some(meter.clone()))), &slot.params),
+            Some(Loaded::Limiter(meter)) => with_params(Box::new(Limiter::new(sr as f64, Some(meter.clone()))), &slot.params),
+            Some(Loaded::Delay) => with_params(Box::new(Delay::new(sr as f64)), &slot.params),
             None => return Ok(None),
         };
         Ok(Some(Box::new(PluginRt { instance: slot.instance, processor, bypass: slot.bypass })))
@@ -424,6 +479,15 @@ impl Engine {
         })
     }
 
+    /// The gain-reduction meter of a built-in compressor or limiter slot.
+    pub fn fx_meter(&self, track: usize, which: SlotRef) -> Option<std::sync::Arc<GainMeter>> {
+        let slot = self.slot_ref(track, which).ok()?;
+        match self.pool.get(&slot.instance) {
+            Some(Loaded::Compressor(m) | Loaded::Limiter(m)) => Some(m.clone()),
+            _ => None,
+        }
+    }
+
     /// The analyzer tap of a built-in EQ slot.
     pub fn eq_tap(&self, track: usize, which: SlotRef) -> Option<std::sync::Arc<eq::Tap>> {
         let slot = self.slot_ref(track, which).ok()?;
@@ -435,7 +499,8 @@ impl Engine {
 
     /// Effects available to insert: the built-in EQ plus scanned VST3 effects.
     pub fn available_effects(&self) -> Vec<(String, String)> {
-        let mut list = vec![(eq::NAME.to_string(), eq::PATH.to_string())];
+        let mut list: Vec<(String, String)> =
+            [(eq::NAME, eq::PATH), (comp::NAME, comp::PATH), (limiter::NAME, limiter::PATH), (delay::NAME, delay::PATH)].iter().map(|(n, p)| (n.to_string(), p.to_string())).collect();
         for p in self.scanned.iter().filter(|p| !p.class.is_instrument()) {
             list.push((format!("{} — {}", p.class.name, p.class.vendor), p.bundle.to_string_lossy().into_owned()));
         }
@@ -534,13 +599,16 @@ impl Engine {
                     }
                 })
                 .collect()),
-            Some(Loaded::Eq(_)) => Ok(eq::params()
-                .into_iter()
-                .map(|(id, title, units, default, steps)| {
-                    let value = slot.params.iter().find(|(pid, _)| *pid == id).map_or(default, |p| p.1);
-                    ParamView { id, title, units: units.into(), value, display: Some(eq::display(id, value)), step_count: steps, read_only: false }
-                })
-                .collect()),
+            Some(builtin @ (Loaded::Eq(_) | Loaded::Compressor(_) | Loaded::Limiter(_) | Loaded::Delay)) => {
+                let (list, display) = builtin_effect_params(builtin).expect("checked");
+                Ok(list
+                    .into_iter()
+                    .map(|(id, title, units, default, steps)| {
+                        let value = slot.params.iter().find(|(pid, _)| *pid == id).map_or(default, |p| p.1);
+                        ParamView { id, title, units: units.into(), value, display: Some(display(id, value)), step_count: steps, read_only: false }
+                    })
+                    .collect())
+            }
             None => bail!("plugin '{}' is not loaded", slot.name),
         }
     }

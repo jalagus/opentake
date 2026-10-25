@@ -10,11 +10,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use opentake_project::{PluginFormat, PluginSlot, Project, Track};
+use opentake_project::{PluginFormat, PluginSlot, Project, TempoMap, Track};
 use serde::Serialize;
 
 use super::Engine;
+use crate::delay::{self, Delay};
 use crate::drums::{self, DrumSynth};
+use crate::dynamics::{Compressor, Limiter, comp, limiter};
 use crate::eq::{self, Eq};
 use crate::media::AudioData;
 use crate::mixer::{MidiEvent, Processor, Transport};
@@ -100,10 +102,11 @@ impl MixJob {
         let to = to.unwrap_or(end + 1.0).max(from + 0.5);
         let (start, len) = ((from * SR) as usize, ((to - from) * SR) as usize);
         let any_solo = self.project.tracks.iter().any(|t| t.solo);
+        let map = self.project.tempo_map();
         let mut mix = [vec![0.0f32; len], vec![0.0f32; len]];
         let mut tracks = Vec::new();
         for track in &self.project.tracks {
-            let mono = render_track(track, start, len, &self.media, &mut self.warnings);
+            let mono = render_track(track, start, len, &self.media, &mut self.warnings, &map);
             let (gl, gr) = pan_gains(track.volume, track.pan);
             let l: Vec<f32> = mono.iter().map(|v| v * gl).collect();
             let r: Vec<f32> = mono.iter().map(|v| v * gr).collect();
@@ -122,7 +125,7 @@ impl MixJob {
             match builtin_effect(slot) {
                 Some(mut fx) => {
                     let [l, r] = &mut mix;
-                    process_stereo(fx.as_mut(), l, r);
+                    process_stereo(fx.as_mut(), l, r, &map, start);
                 }
                 None => self.warnings.push(format!("master: '{}' isn't rendered offline (only built-in effects are)", slot.name)),
             }
@@ -161,21 +164,30 @@ fn builtin_instrument(slot: &PluginSlot) -> Option<Box<dyn Processor>> {
 }
 
 fn builtin_effect(slot: &PluginSlot) -> Option<Box<dyn Processor>> {
-    if slot.format != PluginFormat::Builtin || slot.path != eq::PATH {
+    if slot.format != PluginFormat::Builtin {
         return None;
     }
-    let mut p = Eq::new(SR);
+    let mut p: Box<dyn Processor> = match slot.path.as_str() {
+        eq::PATH => Box::new(Eq::new(SR)),
+        comp::PATH => Box::new(Compressor::new(SR, None)),
+        limiter::PATH => Box::new(Limiter::new(SR, None)),
+        delay::PATH => Box::new(Delay::new(SR)),
+        _ => return None,
+    };
     for &(id, v) in &slot.params {
         p.set_param(id, v);
     }
-    Some(Box::new(p))
+    Some(p)
 }
 
-fn process_stereo(p: &mut dyn Processor, l: &mut [f32], r: &mut [f32]) {
-    let t = Transport::default();
+/// Run an effect over a whole stereo buffer (starting `offset` samples into the song, for
+/// the tempo), then shift the result back by the effect's latency, as the mixer's
+/// delay compensation does.
+fn process_stereo(p: &mut dyn Processor, l: &mut [f32], r: &mut [f32], map: &TempoMap, offset: usize) {
     let (mut ol, mut or) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
     for start in (0..l.len()).step_by(BLOCK) {
         let n = BLOCK.min(l.len() - start);
+        let t = Transport { tempo_bpm: map.tempo_at((offset + start) as f64 / SR), ..Transport::default() };
         {
             let inputs: [&[f32]; 2] = [&l[start..start + n], &r[start..start + n]];
             let mut outputs: [&mut [f32]; 2] = [&mut ol[..n], &mut or[..n]];
@@ -184,10 +196,18 @@ fn process_stereo(p: &mut dyn Processor, l: &mut [f32], r: &mut [f32]) {
         l[start..start + n].copy_from_slice(&ol[..n]);
         r[start..start + n].copy_from_slice(&or[..n]);
     }
+    let latency = p.latency().min(l.len());
+    if latency > 0 {
+        for ch in [l, r] {
+            ch.copy_within(latency.., 0);
+            let len = ch.len();
+            ch[len - latency..].fill(0.0);
+        }
+    }
 }
 
 /// One track before fader/pan (mono sum of its stereo output).
-fn render_track(track: &Track, start: usize, len: usize, media: &[(PathBuf, Arc<AudioData>)], warnings: &mut Vec<String>) -> Vec<f32> {
+fn render_track(track: &Track, start: usize, len: usize, media: &[(PathBuf, Arc<AudioData>)], warnings: &mut Vec<String>, map: &TempoMap) -> Vec<f32> {
     let (mut l, mut r) = (vec![0.0f32; len], vec![0.0f32; len]);
     // Audio regions.
     for clip in track.clips.iter().filter(|c| !c.mute) {
@@ -258,7 +278,7 @@ fn render_track(track: &Track, start: usize, len: usize, media: &[(PathBuf, Arc<
     }
     for slot in track.plugins.iter().filter(|s| !s.bypass) {
         match builtin_effect(slot) {
-            Some(mut fx) => process_stereo(fx.as_mut(), &mut l, &mut r),
+            Some(mut fx) => process_stereo(fx.as_mut(), &mut l, &mut r, map, start),
             None => warnings.push(format!("track '{}': '{}' isn't rendered offline (only built-in effects are)", track.name, slot.name)),
         }
     }
@@ -443,5 +463,16 @@ mod tests {
         assert!(bass(&after.tracks[0]) < bass(&r.tracks[0]) - 10.0);
         assert!(after.master.lufs < r.master.lufs);
         assert_eq!(after.clipped_samples, 0);
+
+        // A limiter on the master holds the peak at its ceiling even with +18 dB of drive.
+        e.set_master_volume(1.0).unwrap();
+        e.insert_master_plugin("limiter", None).unwrap();
+        let m = super::super::SlotRef::Master(0);
+        e.set_slot_param(0, m, crate::dynamics::limiter::GAIN, crate::dynamics::norm_input_gain(18.0)).unwrap();
+        e.set_slot_param(0, m, crate::dynamics::limiter::CEILING, crate::dynamics::norm_ceiling(-1.0)).unwrap();
+        let limited = e.analyze_mix(None, None).unwrap();
+        assert!(limited.master.peak_db <= -0.99, "{}", limited.master.peak_db);
+        assert!(limited.master.lufs > after.master.lufs + 6.0, "louder: {} vs {}", limited.master.lufs, after.master.lufs);
+        assert!(limited.warnings.is_empty(), "{:?}", limited.warnings);
     }
 }
