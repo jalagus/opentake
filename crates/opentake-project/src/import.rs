@@ -103,7 +103,7 @@ pub(crate) fn parse_xml(text: &str) -> Result<roxmltree::Document<'_>, roxmltree
 }
 
 pub(crate) fn audio_clip(name: impl Into<String>, file: PathBuf, position_secs: f64, length_secs: f64, source_offset_secs: f64) -> Clip {
-    Clip { name: name.into(), file, position_secs, length_secs, source_offset_secs, gain: 1.0, mute: false, takes: Vec::new(), active_take: 0, pitch_semitones: 0, pitch_cents: 0, stretch: 1.0 }
+    Clip { name: name.into(), file, position_secs, length_secs, source_offset_secs, gain: 1.0, mute: false, takes: Vec::new(), active_take: 0, pitch_semitones: 0, pitch_cents: 0, stretch: 1.0, fade_in: Default::default(), fade_out: Default::default() }
 }
 
 /// OpenTake's built-in synth, for MIDI tracks whose instrument can't be loaded here.

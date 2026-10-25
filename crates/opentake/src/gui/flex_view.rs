@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use eframe::egui;
 use egui::RichText;
-use opentake_engine::{CLIP_GAIN_DB, Engine, FlexRender, MAX_SEMITONES, PitchStretch, STRETCH_RANGE};
+use opentake_engine::project::FadeCurve;
+use opentake_engine::{CLIP_GAIN_DB, Engine, FadeUpdate, FlexRender, MAX_SEMITONES, PitchStretch, STRETCH_RANGE};
 
 use super::{Action, DawApp, Snapshot, theme, widgets};
 use super::timeline::RegionKind;
@@ -79,7 +80,7 @@ impl DawApp {
         widgets::section(ui, "Region");
         ui.label(RichText::new(&c.name).color(theme::TEXT_DIM));
         let busy = self.flex_task.is_some();
-        let (mut ps, mut gain, mut normalize) = (None, None, false);
+        let (mut ps, mut gain, mut normalize, mut fades) = (None, None, false, None);
         let id = ui.make_persistent_id(("flex", r));
         egui::Grid::new(id).num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
             let semis = MAX_SEMITONES as f64;
@@ -119,12 +120,40 @@ impl DawApp {
                 }
             });
             ui.end_row();
+            // Fades also apply live; the handles in the region's top corners set them too.
+            for (i, (label, fade)) in [("Fade In", c.fade_in), ("Fade Out", c.fade_out)].into_iter().enumerate() {
+                ui.label(RichText::new(label).color(theme::TEXT_DIM)).on_hover_text("Drag the handle in the region's top corner, or set the length and curve here");
+                ui.horizontal(|ui| {
+                    let mut ms = fade.secs * 1000.0;
+                    let drag = ui.add(egui::DragValue::new(&mut ms).range(0.0..=c.length_secs * 1000.0).speed(1.0).fixed_decimals(0).suffix(" ms"));
+                    widgets::label(&drag, egui::Role::SpinButton, label);
+                    let mut curve = fade.curve;
+                    egui::ComboBox::from_id_salt(id.with(("fade", i))).width(96.0).selected_text(curve.label()).show_ui(ui, |ui| {
+                        for c in FadeCurve::ALL {
+                            ui.selectable_value(&mut curve, c, c.label());
+                        }
+                    });
+                    let secs = drag.changed().then_some(ms / 1000.0);
+                    if secs.is_some() || curve != fade.curve {
+                        let curve = (curve != fade.curve).then_some(curve);
+                        fades = Some(if i == 0 {
+                            FadeUpdate { fade_in_secs: secs, curve_in: curve, ..Default::default() }
+                        } else {
+                            FadeUpdate { fade_out_secs: secs, curve_out: curve, ..Default::default() }
+                        });
+                    }
+                });
+                ui.end_row();
+            }
         });
         if let Some(gain_db) = gain {
             self.act(Action::ClipGain { track: r.track, clip: r.index, gain_db });
         }
         if normalize {
             self.act(Action::NormalizeClip { track: r.track, clip: r.index });
+        }
+        if let Some(update) = fades {
+            self.act(Action::ClipFades { track: r.track, clip: r.index, update });
         }
         if c.is_flexed() && ui.add_enabled(!busy, egui::Button::new("Reset Pitch & Stretch").small()).clicked() {
             ps = Some(PitchStretch { semitones: Some(0), cents: Some(0), stretch: Some(1.0), length_secs: None });

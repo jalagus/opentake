@@ -129,6 +129,8 @@ impl Engine {
                 pitch_semitones: 0,
                 pitch_cents: 0,
                 stretch: 1.0,
+                fade_in: Default::default(),
+                fade_out: Default::default(),
             };
             let clips = &mut self.project.tracks[index].clips;
             if let Some(p) = &layout.plain {

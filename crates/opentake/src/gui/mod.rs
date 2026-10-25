@@ -173,6 +173,11 @@ pub(crate) enum Action {
     MoveTrack { from: usize, to: usize },
     /// Region gain in dB, or normalize the region's peak to 0 dBFS.
     ClipGain { track: usize, clip: usize, gain_db: f32 },
+    /// Region fades (a handle drag or the inspector; drags merge into one undo step).
+    ClipFades { track: usize, clip: usize, update: opentake_engine::FadeUpdate },
+    Crossfade { track: usize, a: usize, b: usize, secs: f64 },
+    /// Merge (join) audio regions of a track into one new region.
+    MergeRegions { track: usize, clips: Vec<usize> },
     NormalizeClip { track: usize, clip: usize },
     /// Paste the clipboard with its top-most track at `track`, starting at `position`.
     Paste { track: usize, position: f64 },
@@ -667,6 +672,12 @@ impl DawApp {
             }
             Action::ClipGain { track, clip, gain_db } => {
                 e.set_clip_gain(track, clip, gain_db)?;
+            }
+            Action::ClipFades { track, clip, update } => drop(e.set_clip_fades(track, clip, update)?),
+            Action::Crossfade { track, a, b, secs } => drop(e.crossfade_clips(track, a, b, Some(secs))?),
+            Action::MergeRegions { track, clips } => {
+                let (index, _) = e.merge_clips(track, &clips)?;
+                self.selection = vec![RegionRef::audio(track, index)];
             }
             Action::NormalizeClip { track, clip } => {
                 let c = e.normalize_clip(track, clip, 0.0)?;
@@ -1204,6 +1215,8 @@ impl DawApp {
         MenuState {
             has_selected_track: self.selected_track.is_some(),
             has_selected_region: !self.selection.is_empty(),
+            can_merge: self.audio_selection().is_some(),
+            can_crossfade: self.audio_selection().is_some_and(|(_, c)| c.len() == 2),
             cycle_on: snap.project.loop_enabled,
             has_clipboard: self.clipboard.is_some(),
             inspector_visible: self.show_inspector,
@@ -1269,6 +1282,7 @@ impl DawApp {
             (Modifiers::COMMAND, Key::Comma, MenuCommand::AudioSettings),
             (Modifiers::COMMAND, Key::T, MenuCommand::SplitAtPlayhead),
             (Modifiers::COMMAND, Key::D, MenuCommand::DuplicateRegion),
+            (Modifiers::COMMAND, Key::J, MenuCommand::MergeRegions),
             (Modifiers::COMMAND, Key::G, MenuCommand::ToggleSnap),
             (Modifiers::COMMAND, Key::ArrowRight, MenuCommand::ZoomIn),
             (Modifiers::COMMAND, Key::ArrowLeft, MenuCommand::ZoomOut),
@@ -1302,6 +1316,14 @@ impl DawApp {
             })
             .collect();
         self.clipboard = Some(Clipboard { items });
+    }
+
+    /// The selected regions as (track, audio clip indices) when they're two or more audio
+    /// regions on one track (what merge and crossfade work on).
+    pub(crate) fn audio_selection(&self) -> Option<(usize, Vec<usize>)> {
+        let track = self.selection.first()?.track;
+        let ok = self.selection.len() >= 2 && self.selection.iter().all(|r| r.track == track && r.kind == RegionKind::Audio);
+        ok.then(|| (track, self.selection.iter().map(|r| r.index).collect()))
     }
 
     /// Duplicate the selection right after its end (⌘D).
@@ -1408,6 +1430,16 @@ impl DawApp {
                 }
             }
             MenuCommand::DuplicateRegion => self.duplicate_selection(&snap.project),
+            MenuCommand::MergeRegions => {
+                if let Some((track, clips)) = self.audio_selection() {
+                    self.act(Action::MergeRegions { track, clips });
+                }
+            }
+            MenuCommand::CrossfadeRegions => {
+                if let Some((track, [a, b])) = self.audio_selection().and_then(|(t, c)| Some((t, <[usize; 2]>::try_from(c).ok()?))) {
+                    self.act(Action::Crossfade { track, a, b, secs: opentake_engine::CROSSFADE_SECS });
+                }
+            }
             MenuCommand::ToggleCycle => self.toggle_cycle(snap),
             MenuCommand::DeleteRegion => self.delete_selection(snap),
             MenuCommand::ToggleSnap => {
@@ -2448,6 +2480,62 @@ mod tests {
     }
 
     #[test]
+    fn fade_handle_drag_sets_fade_in_and_merge_joins_regions() {
+        let (mut harness, engine, dir) = harness_with_region(); // 1.0 .. 5.0
+        engine.lock().unwrap().save_project(Some(&dir.join("song.otp"))).unwrap();
+        let px = harness.state().view.px_per_sec;
+        let rect = harness.get_by_label("Region riff").rect();
+        // The fade-in handle sits in the top-left corner, just below the name bar.
+        let handle = egui::pos2(rect.left() + 1.0 + 3.5, rect.top() + 17.0 + 3.5);
+        drag(&mut harness, handle, handle + egui::vec2(0.5 * px, 0.0));
+        {
+            let e = engine.lock().unwrap();
+            let c = &e.project().tracks[0].clips[0];
+            assert!((c.fade_in.secs - 0.5).abs() < 0.05, "fade-in {:?}", c.fade_in);
+            assert!(c.position_secs == 1.0 && c.length_secs == 4.0 && c.fade_out.secs == 0.0, "the drag neither trimmed nor moved");
+            assert_eq!(e.history_info().undo.as_deref(), Some("Region Fades"));
+        }
+        // The vertical edge below the handle still trims.
+        let edge = egui::pos2(rect.left() + 2.0, rect.bottom() - 6.0);
+        drag(&mut harness, edge, edge + egui::vec2(0.25 * px, 0.0));
+        assert!((clips(&engine)[0].0 - 1.25).abs() < 0.05, "{:?}", clips(&engine));
+
+        // Split, select both halves and join them again with ⌘J.
+        engine.lock().unwrap().split_clip(0, 0, 3.0).unwrap();
+        harness.step();
+        let halves: Vec<egui::Rect> = harness.query_all_by_label("Region riff").map(|n| n.rect()).collect();
+        assert_eq!(halves.len(), 2);
+        click_at(&mut harness, halves[0].center());
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
+        click_at(&mut harness, halves[1].center());
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        assert_eq!(harness.state().selection.len(), 2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::J);
+        harness.step();
+        harness.step();
+        {
+            let e = engine.lock().unwrap();
+            let c = &e.project().tracks[0].clips;
+            assert_eq!(c.len(), 1, "merged into one region");
+            assert!((c[0].position_secs - 1.25).abs() < 0.05 && (c[0].length_secs - 3.75).abs() < 0.05, "{:?}", c[0]);
+            assert!(c[0].file.starts_with(dir.join("Audio")), "{}", c[0].file.display());
+            assert_eq!(e.history_info().undo.as_deref(), Some("Merge Regions"));
+        }
+        assert_eq!(harness.state().selection, vec![RegionRef::audio(0, 0)]);
+
+        // Undo brings the halves back; the Edit menu merges too.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        harness.step();
+        harness.step();
+        assert_eq!(clips(&engine).len(), 2);
+        harness.state_mut().selection = vec![RegionRef::audio(0, 0), RegionRef::audio(0, 1)];
+        click(&mut harness, "Edit");
+        click(&mut harness, &menu_label(MenuCommand::MergeRegions));
+        assert_eq!(clips(&engine).len(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn cmd_drag_copies_region_and_keeps_original() {
         let (mut harness, engine, dir) = harness_with_region();
         let px = harness.state().view.px_per_sec;
@@ -3469,6 +3557,11 @@ mod tests {
             e.add_clip(0, &drums, 8.73).unwrap();
             e.split_clip(1, 0, 3.27).unwrap();
             e.trim_clip(1, 1, Some(3.8), None).unwrap();
+            // Region fades, and drums overlapping into a crossfade.
+            let fade = |secs, curve| opentake_engine::FadeUpdate { fade_out_secs: Some(secs), curve_out: Some(curve), ..Default::default() };
+            e.set_clip_fades(1, 0, fade(0.8, opentake_engine::project::FadeCurve::SCurve)).unwrap();
+            e.set_clip_fades(1, 1, opentake_engine::FadeUpdate { fade_in_secs: Some(0.5), ..Default::default() }).unwrap();
+            e.move_clip(0, 1, 8.2, None).unwrap();
             e.update_track(1, TrackUpdate { volume: Some(0.6), pan: Some(-0.25), ..Default::default() }).unwrap();
             // A built-in effect, so the shot doesn't depend on the VST3s installed here.
             e.insert_plugin(1, "comp", None).unwrap();

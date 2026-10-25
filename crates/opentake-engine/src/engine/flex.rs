@@ -60,7 +60,13 @@ impl PitchStretch {
         // Snap to neutral so float noise doesn't keep a region "stretched".
         let stretch = if (stretch - 1.0).abs() < 1e-6 { 1.0 } else { stretch.clamp(lo, hi) };
         let length_secs = self.length_secs.unwrap_or(c.length_secs * stretch / c.stretch);
-        Ok(Clip { pitch_semitones: semitones, pitch_cents: cents, stretch, length_secs, ..c.clone() })
+        // Fades stretch with the region.
+        let scale = length_secs / c.length_secs;
+        let (mut fade_in, mut fade_out) = (c.fade_in, c.fade_out);
+        (fade_in.secs, fade_out.secs) = (fade_in.secs * scale, fade_out.secs * scale);
+        let mut out = Clip { pitch_semitones: semitones, pitch_cents: cents, stretch, length_secs, fade_in, fade_out, ..c.clone() };
+        out.clamp_fades();
+        Ok(out)
     }
 }
 

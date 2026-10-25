@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use rtrb::{Consumer, Producer};
 
-use opentake_project::TempoMap;
+use opentake_project::{Fade, FadeCurve, TempoMap};
 use opentake_project::automation::{AutomationPoint, envelope_at, pos_to_gain};
 
 use crate::media::AudioData;
@@ -95,6 +95,47 @@ pub struct ClipRt {
     pub gain: f32,
     pub mute: bool,
     pub data: Arc<AudioData>,
+    pub fades: ClipFades,
+}
+
+/// A region's fade-in and fade-out in timeline samples, evaluated per sample.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClipFades {
+    /// The region's timeline span (before any silent lead-in of a later take).
+    pub start: u64,
+    pub end: u64,
+    pub fade_in: u64,
+    pub fade_out: u64,
+    pub curve_in: FadeCurve,
+    pub curve_out: FadeCurve,
+}
+
+impl ClipFades {
+    pub const NONE: ClipFades = ClipFades { start: 0, end: u64::MAX, fade_in: 0, fade_out: 0, curve_in: FadeCurve::Linear, curve_out: FadeCurve::Linear };
+
+    /// Fades for a region at `start..end` samples with (effective) fades in seconds.
+    pub fn new(start: u64, end: u64, (fade_in, fade_out): (Fade, Fade), sr: f64) -> Self {
+        let samples = |f: Fade| ((f.secs.max(0.0) * sr).round() as u64).min(end - start);
+        ClipFades { start, end, fade_in: samples(fade_in), fade_out: samples(fade_out), curve_in: fade_in.curve, curve_out: fade_out.curve }
+    }
+
+    /// Whether `from..to` (timeline samples) plays at full level, so gain needn't be
+    /// evaluated per sample.
+    pub fn flat(&self, from: u64, to: u64) -> bool {
+        from >= self.start + self.fade_in && to <= self.end.saturating_sub(self.fade_out)
+    }
+
+    /// Fade gain at timeline sample `t`.
+    pub fn gain(&self, t: u64) -> f32 {
+        let mut g = 1.0;
+        if t < self.start + self.fade_in {
+            g = self.curve_in.gain((t.saturating_sub(self.start)) as f32 / self.fade_in as f32);
+        }
+        if self.fade_out > 0 && t + self.fade_out >= self.end {
+            g *= self.curve_out.gain(self.end.saturating_sub(t) as f32 / self.fade_out as f32);
+        }
+        g
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -935,9 +976,17 @@ impl Mixer {
                     let count = ((to - from) as usize).min(clip.data.frames().saturating_sub(src_start));
                     let src_l = &clip.data.channels[0];
                     let src_r = clip.data.channels.get(1).unwrap_or(src_l);
-                    for i in 0..count {
-                        l[dst_start + i] += src_l[src_start + i] * clip.gain;
-                        r[dst_start + i] += src_r[src_start + i] * clip.gain;
+                    if clip.fades.flat(from, to) {
+                        for i in 0..count {
+                            l[dst_start + i] += src_l[src_start + i] * clip.gain;
+                            r[dst_start + i] += src_r[src_start + i] * clip.gain;
+                        }
+                    } else {
+                        for i in 0..count {
+                            let g = clip.gain * clip.fades.gain(from + i as u64);
+                            l[dst_start + i] += src_l[src_start + i] * g;
+                            r[dst_start + i] += src_r[src_start + i] * g;
+                        }
                     }
                 }
             }
@@ -1398,7 +1447,7 @@ mod tests {
         let (mut m, mut tx, _g, shared) = mixer();
         let data = Arc::new(AudioData { channels: vec![vec![0.5; 100]], sample_rate: 48_000 });
         tx.push(Command::AddTrack(Box::new(TrackRt::new(1, params())))).ok();
-        tx.push(Command::AddClip { track: 1, clip: ClipRt { start: 10, len: 100, offset: 0, gain: 1.0, mute: false, data } }).ok();
+        tx.push(Command::AddClip { track: 1, clip: ClipRt { start: 10, len: 100, offset: 0, gain: 1.0, mute: false, data, fades: ClipFades::NONE } }).ok();
         tx.push(Command::Play).ok();
 
         let mut out = vec![0.0; 2 * 64];
@@ -1594,7 +1643,7 @@ mod tests {
         let data = Arc::new(AudioData { channels: vec![impulse], sample_rate: 48_000 });
         for id in [1, 2] {
             tx.push(Command::AddTrack(Box::new(TrackRt::new(id, params())))).ok();
-            tx.push(Command::AddClip { track: id, clip: ClipRt { start: 1000, len: 4, offset: 0, gain: 1.0, mute: false, data: data.clone() } }).ok();
+            tx.push(Command::AddClip { track: id, clip: ClipRt { start: 1000, len: 4, offset: 0, gain: 1.0, mute: false, data: data.clone(), fades: ClipFades::NONE } }).ok();
         }
         // Track 1 has a 300-sample plug-in, the master a 200-sample one.
         let slow = Box::new(PluginRt { instance: 9, processor: Box::new(Latent::new(300)), bypass: false });
@@ -1679,7 +1728,7 @@ mod tests {
         // 1 (dry) and 4 (120) feed bus 3 (300); 2 (100) goes to the master (50).
         for (id, output) in [(1, 3), (2, MASTER), (4, 3)] {
             tx.push(Command::AddTrack(Box::new(TrackRt::new(id, TrackParams { output, ..params() })))).ok();
-            tx.push(Command::AddClip { track: id, clip: ClipRt { start: 1000, len: 4, offset: 0, gain: 1.0, mute: false, data: data.clone() } }).ok();
+            tx.push(Command::AddClip { track: id, clip: ClipRt { start: 1000, len: 4, offset: 0, gain: 1.0, mute: false, data: data.clone(), fades: ClipFades::NONE } }).ok();
         }
         tx.push(Command::AddTrack(Box::new(TrackRt::new_bus(3, params())))).ok();
         chain(&mut tx, 4, 10, Box::new(Latent::new(120)));
@@ -1745,7 +1794,7 @@ mod tests {
         impulse[0] = 0.5;
         let data = Arc::new(AudioData { channels: vec![impulse], sample_rate: 48_000 });
         tx.push(Command::AddTrack(Box::new(TrackRt::new(1, params())))).ok();
-        tx.push(Command::AddClip { track: 1, clip: ClipRt { start: 100, len: 4, offset: 0, gain: 1.0, mute: false, data } }).ok();
+        tx.push(Command::AddClip { track: 1, clip: ClipRt { start: 100, len: 4, offset: 0, gain: 1.0, mute: false, data, fades: ClipFades::NONE } }).ok();
         let slow = Box::new(PluginRt { instance: 9, processor: Box::new(Latent::new(300)), bypass: false });
         tx.push(Command::SetPluginChain { track: 1, order: Box::new(vec![(9, false)]), new: Box::new(vec![slow]), target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)) }).ok();
         tx.push(Command::SetLoop { enabled: true, start: 0, end: 2000 }).ok();
@@ -1896,7 +1945,48 @@ mod tests {
     }
 
     fn dc_clip(start: u64, len: usize, v: f32) -> ClipRt {
-        ClipRt { start, len: len as u64, offset: 0, gain: 1.0, mute: false, data: Arc::new(AudioData { channels: vec![vec![v; len]], sample_rate: 48_000 }) }
+        ClipRt { start, len: len as u64, offset: 0, gain: 1.0, mute: false, data: Arc::new(AudioData { channels: vec![vec![v; len]], sample_rate: 48_000 }), fades: ClipFades::NONE }
+    }
+
+    fn faded(start: u64, len: usize, fade_in: Fade, fade_out: Fade) -> ClipRt {
+        let end = start + len as u64;
+        ClipRt { fades: ClipFades::new(start, end, (fade_in, fade_out), 48_000.0), ..dc_clip(start, len, 0.5) }
+    }
+
+    #[test]
+    fn clip_fades_play_sample_accurately() {
+        let (mut m, mut tx, _g, _s) = mixer();
+        tx.push(Command::AddTrack(Box::new(TrackRt::new(1, params())))).ok();
+        // 100 samples of linear fade-in, 200 of S-curve fade-out, across block boundaries.
+        let ms = |samples: f64| samples / 48_000.0;
+        let clip = faded(400, 1000, Fade::new(ms(100.0), FadeCurve::Linear), Fade::new(ms(200.0), FadeCurve::SCurve));
+        tx.push(Command::AddClip { track: 1, clip }).ok();
+        tx.push(Command::Play).ok();
+        let out = run(&mut m, 4);
+        assert_eq!(out[400], 0.0, "starts from silence");
+        assert!((out[450] - 0.25).abs() < 1e-6, "halfway through the fade-in");
+        assert!(out[500..1200].iter().all(|&v| v == 0.5), "full level between the fades");
+        assert!((out[1300] - 0.25).abs() < 1e-6 && out[1399] < 1e-3 && out[1400] == 0.0);
+    }
+
+    #[test]
+    fn overlapping_clips_crossfade_instead_of_doubling() {
+        // Two identical signals overlapping over 1000..1400.
+        for (curve, bound) in [(FadeCurve::Linear, 0.5), (FadeCurve::EqualPower, 0.5 * std::f32::consts::SQRT_2)] {
+            let (mut m, mut tx, _g, _s) = mixer();
+            tx.push(Command::AddTrack(Box::new(TrackRt::new(1, params())))).ok();
+            let x = Fade::new(400.0 / 48_000.0, curve);
+            tx.push(Command::AddClip { track: 1, clip: faded(0, 1400, Fade::default(), x) }).ok();
+            tx.push(Command::AddClip { track: 1, clip: faded(1000, 1000, x, Fade::default()) }).ok();
+            tx.push(Command::Play).ok();
+            let out = run(&mut m, 5);
+            let peak = out[..2000].iter().fold(0.0f32, |a, &v| a.max(v));
+            let dip = out[..2000].iter().fold(1.0f32, |a, &v| a.min(v));
+            assert!(peak <= bound + 1e-5 && dip >= 0.5 - 1e-5, "{curve:?}: {dip}..{peak}");
+            if curve == FadeCurve::Linear {
+                assert!(out[..2000].iter().all(|&v| (v - 0.5).abs() < 1e-5), "equal gain keeps unity through the overlap");
+            }
+        }
     }
 
     fn env(target: EnvTarget, points: &[(u64, f32, opentake_project::Curve)]) -> EnvelopeRt {

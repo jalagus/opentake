@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::automation::{AutomationLane, AutomationTarget};
+use crate::fade::Fade;
 use crate::tempo::{TempoChange, TempoMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -475,6 +476,11 @@ pub struct Clip {
     /// stay in source seconds, so `t` seconds of the region play `t / stretch` of the source.
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub stretch: f64,
+    /// The region's own fades (timeline seconds). Overlaps add crossfades; see `fade.rs`.
+    #[serde(default, skip_serializing_if = "Fade::is_none")]
+    pub fade_in: Fade,
+    #[serde(default, skip_serializing_if = "Fade::is_none")]
+    pub fade_out: Fade,
 }
 
 fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
@@ -511,15 +517,26 @@ impl Clip {
     }
 
     /// Split `cut` timeline seconds after the region start into (left, right).
+    /// Each part keeps the fade at its outer end.
     pub fn split(&self, cut: f64) -> (Clip, Clip) {
-        let left = Clip { length_secs: cut, ..self.clone() };
-        let right = Clip {
+        let mut left = Clip { length_secs: cut, fade_out: Fade::default(), ..self.clone() };
+        let mut right = Clip {
             position_secs: self.position_secs + cut,
             length_secs: self.length_secs - cut,
             source_offset_secs: self.source_offset_secs + cut / self.stretch,
+            fade_in: Fade::default(),
             ..self.clone()
         };
+        left.clamp_fades();
+        right.clamp_fades();
         (left, right)
+    }
+
+    /// Keep the fades within the region: the fade-in first, the fade-out in what's left.
+    pub fn clamp_fades(&mut self) {
+        let len = self.length_secs.max(0.0);
+        self.fade_in.secs = self.fade_in.secs.clamp(0.0, len);
+        self.fade_out.secs = self.fade_out.secs.clamp(0.0, len - self.fade_in.secs);
     }
 
     /// Make take `index` the one that plays. Returns false if there's no such take.
@@ -609,7 +626,7 @@ mod tests {
     use super::*;
 
     fn clip(file: &str, offset: f64) -> Clip {
-        Clip { name: "c".into(), file: file.into(), position_secs: 4.0, length_secs: 2.0, source_offset_secs: offset, gain: 1.0, mute: false, takes: Vec::new(), active_take: 0, pitch_semitones: 0, pitch_cents: 0, stretch: 1.0 }
+        Clip { name: "c".into(), file: file.into(), position_secs: 4.0, length_secs: 2.0, source_offset_secs: offset, gain: 1.0, mute: false, takes: Vec::new(), active_take: 0, pitch_semitones: 0, pitch_cents: 0, stretch: 1.0, fade_in: Fade::default(), fade_out: Fade::default() }
     }
 
     #[test]

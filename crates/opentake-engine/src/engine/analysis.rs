@@ -10,13 +10,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use opentake_project::automation::pos_to_gain;
-use opentake_project::{AutomationLane, AutomationTarget, Project, TempoMap, automated};
+use opentake_project::{AutomationLane, AutomationTarget, Clip, Project, TempoMap, automated, effective_fades};
 use serde::Serialize;
 
 use super::Engine;
 use super::flex::{self, FlexKey};
 use crate::media::AudioData;
-use crate::mixer::{AUTOMATION_BLOCK, MidiEvent, Processor, Transport};
+use crate::mixer::{AUTOMATION_BLOCK, ClipFades, MidiEvent, Processor, Transport};
 
 /// Analysis render rate.
 const ANALYSIS_RATE: f64 = 48_000.0;
@@ -309,27 +309,34 @@ fn process_stereo(p: &mut dyn Processor, lanes: &[(u32, &AutomationLane)], l: &m
 }
 
 fn render_audio_regions(track: &opentake_project::Track, start: usize, sr: f64, media: &[(FlexKey, Arc<AudioData>)], l: &mut [f32], r: &mut [f32]) {
+    render_clips(&track.clips, start, sr, |clip| media.iter().find(|(k, _)| *k == flex::key(clip, sr as u32)).map(|(_, d)| d.clone()), l, r);
+}
+
+/// Add audio regions (as the audio thread plays them: gain, fades, crossfades over overlaps)
+/// into `l`/`r`, which start at timeline sample `start`. `media` gives each region's audio.
+pub(super) fn render_clips(clips: &[Clip], start: usize, sr: f64, media: impl Fn(&Clip) -> Option<Arc<AudioData>>, l: &mut [f32], r: &mut [f32]) {
     let len = l.len();
-    for clip in track.clips.iter().filter(|c| !c.mute) {
-        let key = flex::key(clip, sr as u32);
-        let Some((_, data)) = media.iter().find(|(k, _)| *k == key) else { continue };
-        let clip_start = (clip.position_secs * sr) as i64;
+    for (clip, fades) in clips.iter().zip(effective_fades(clips)).filter(|(c, _)| !c.mute) {
+        let Some(data) = media(clip) else { continue };
+        let samples = |secs: f64| (secs.max(0.0) * sr).round() as u64;
+        let (clip_start, clip_end) = (samples(clip.position_secs), samples(clip.position_secs + clip.length_secs));
+        let fades = ClipFades::new(clip_start, clip_end.max(clip_start), fades, sr);
         // The processed audio is already stretched (offsets are in source seconds).
-        let offset = (clip.source_offset_secs * clip.stretch * sr) as i64;
-        let clip_len = (clip.length_secs * sr) as i64;
+        let offset = (clip.source_offset_secs * clip.stretch * sr).round() as i64;
         let src_l = &data.channels[0];
         let src_r = data.channels.get(1).unwrap_or(src_l);
-        for i in 0..len as i64 {
-            let rel = start as i64 + i - clip_start;
-            if rel < 0 || rel >= clip_len {
+        for i in 0..len {
+            let t = (start + i) as u64;
+            if t < clip_start || t >= clip_end {
                 continue;
             }
-            let Ok(src) = usize::try_from(offset + rel) else { continue }; // a take starting later
+            let Ok(src) = usize::try_from(offset + (t - clip_start) as i64) else { continue }; // a take starting later
             if src >= src_l.len() {
                 break;
             }
-            l[i as usize] += src_l[src] * clip.gain;
-            r[i as usize] += src_r[src] * clip.gain;
+            let g = clip.gain * fades.gain(t);
+            l[i] += src_l[src] * g;
+            r[i] += src_r[src] * g;
         }
     }
 }

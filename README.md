@@ -23,10 +23,11 @@ you watch the changes appear live — and undo anything you don't like.
 - 📈 Automation of volume, pan, mute and any plug-in parameter, in lanes under each track, with Read, Touch and Latch modes
 - ⏱️ Project tempo map (tempo and time-signature changes), metronome with count-in
 - 🔁 Cycle recording: loop a section and record take after take, then pick the one that plays
-- ✂️ Region editing: select, move, copy, split, trim, snap, cycle/loop; region gain and normalize
+- ✂️ Region editing: select, move, copy, split, trim, snap, cycle/loop; region gain and normalize;
+  fades, crossfades and click-free merging of regions
 - 🎚️ Full mixer, metronome, undo/redo for everything
 - 💾 Export the mix and stems to WAV or FLAC, faster than real time
-- 🤖 MCP server (stdio or HTTP) with 77 tools — the agent and you share one session
+- 🤖 MCP server (stdio or HTTP) with 80 tools — the agent and you share one session
 - 📂 Its own `.otp` project files (double-click to open), Reaper `.rpp` and DAWproject (Bitwig, Studio One, Cubase) projects
 - 🔀 Imports Ableton Live sets (`.als`), Ardour sessions, and Logic Pro projects exported as Final Cut Pro XML
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
@@ -133,6 +134,16 @@ agent.
   playing. The master's volume and plug-ins can be automated too (over MCP).
 - **Region gain**: select an audio region and set its Gain in the inspector, or Normalize it so
   its peak reaches 0 dBFS.
+- **Fades and crossfades**: hover an audio region and drag the small square in its top-left
+  (fade in) or top-right (fade out) corner; the inspector sets the lengths and curves (linear,
+  equal power, exponential, logarithmic, S-curve), as does the region menu's Fade In / Fade Out.
+  Overlapping regions on a track crossfade automatically (equal power, drawn as an X); select two
+  neighbours and choose Edit → Crossfade Regions (or a length from the region menu's Crossfade)
+  to overlap them around their boundary.
+- **Merge regions**: select two or more audio regions on a track and press ⌘J (Edit → Merge
+  Regions). They're rendered into one new file in the project's Audio folder — gain, fades,
+  pitch/stretch and the active take included, gaps as silence — with a 5 ms crossfade where
+  regions butt against each other, so the join doesn't click. Undo restores the originals.
 - **Arrange tracks**: drag a track's header (or its mixer strip) to move it; click a strip to
   select its track. The buttons left of the transport show the inspector, mixer, piano roll and
   tablature.
@@ -186,7 +197,7 @@ of the tool calls behind them):
 `get_status`, `list_audio_devices`, `start_audio`, `stop_audio`, `undo`, `redo`, `get_history`,
 `get_project`, `get_midi_notes`, `analyze_mix`, `export_audio`, `new_project`, `load_project`, `save_project`, `set_tempo`, `set_tempo_map`, `get_tempo_map`, `convert_time`,
 `set_master_volume`, `set_metronome`, `set_auto_input_monitoring`, `set_count_in`, `set_loop`,
-`add_track`, `add_bus`, `move_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `set_clip_gain`, `normalize_clip`, `set_clip_pitch_stretch`, `remove_clip`,
+`add_track`, `add_bus`, `move_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `set_clip_gain`, `normalize_clip`, `set_clip_pitch_stretch`, `set_clip_fades`, `crossfade_clips`, `merge_clips`, `remove_clip`,
 `play`, `stop`, `seek`, `record`,
 `scan_plugins`, `insert_plugin`, `remove_plugin`, `insert_master_plugin`, `remove_master_plugin`, `set_plugin_bypass`,
 `list_plugin_params`, `set_plugin_param` (`"eq"` inserts the built-in EQ; `master: true` addresses the master bus),
@@ -217,7 +228,7 @@ Recording: arm a track (`update_track` with `armed: true` and `input_channel`), 
 `.json` files from earlier versions still open).
 Supported: tempo/time signature and the tempo map (tempo envelope), sample rate, master volume, loop range (`LOOP`/`SELECTION`), track name/volume/pan/mute/solo/
 record-arm/input/monitoring, audio items (position, length, source offset, gain, mute,
-play rate / pitch, media file), FX chain references and buses (written as receives; folders and receives
+play rate / pitch, fades (`FADEIN`/`FADEOUT`, shapes mapped to the nearest), media file), FX chain references and buses (written as receives; folders and receives
 from tracks with the master send off import as buses), and volume/pan/mute envelopes
 (`VOLENV2`/`PANENV2`/`MUTEENV`). VST3 plugins in a Reaper project are matched by
 bundle file name and class id/name and loaded if installed; Audio Units by their
@@ -283,7 +294,9 @@ automation other than tempo, sends/returns and fades aren't imported.
   preserved, and stretch is limited to 0.25–4×. Each new setting renders the region first:
   long regions take about a second per minute, in the background in the GUI. A pitched or
   stretched region doesn't collect new cycle-recording takes.
-- Regions: no fades or crossfades, and one region is selected at a time.
+- Regions: automatic crossfades only cover partial overlaps (a region lying inside another just
+  adds to it), and merged regions bake their fades in. Fade curves are mapped to Reaper's
+  nearest shapes, and fades aren't imported from other DAWs.
 - Buses: no sends yet (each track feeds one bus or the master); stems export what reaches the
   master (a bus is one stem, its sources are inside it).
 - Automation: plug-in parameters change once per 64-sample block (fader, pan and mute ramp

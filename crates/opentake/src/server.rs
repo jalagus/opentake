@@ -39,6 +39,10 @@ insert_master_plugin puts effects on the master bus (address them with master: t
 creates a bus track; update_track output routes a track to a bus index or \"master\"; effects on the bus \
 (insert_plugin with its index) process the whole group. get_project shows each track's kind and output.
 
+Regions: set_clip_fades gives an audio region fade-in/out curves; overlapping regions on a track \
+crossfade automatically, and crossfade_clips makes a short crossfade between two neighbours. \
+merge_clips joins regions into one new audio file without clicks at the joins.
+
 Automation: list_automation_params shows what a track (or master: true) can automate — volume, \
 pan, mute and every plug-in parameter; add_automation_lane makes a lane, set_automation_points \
 draws it (times in seconds; values normalized 0..1, or db for volume and pan -1..1), \
@@ -446,6 +450,37 @@ pub struct ClipGainArgs {
     pub track: usize,
     pub clip: usize,
     pub gain_db: f32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ClipFadesArgs {
+    pub track: usize,
+    pub clip: usize,
+    /// Fade-in length in seconds (0 = none); omit to keep.
+    pub fade_in_secs: Option<f64>,
+    /// Fade-out length in seconds (0 = none); omit to keep.
+    pub fade_out_secs: Option<f64>,
+    /// Fade-in shape: "linear", "equal_power", "exponential", "logarithmic" or "s_curve"; omit to keep.
+    pub curve_in: Option<String>,
+    /// Fade-out shape (same names); omit to keep.
+    pub curve_out: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CrossfadeArgs {
+    pub track: usize,
+    /// The two regions (indices on the track) to crossfade, in either order.
+    pub clip_a: usize,
+    pub clip_b: usize,
+    /// Crossfade length in seconds (default 0.02).
+    pub length_secs: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MergeClipsArgs {
+    pub track: usize,
+    /// Indices of the audio regions on the track to merge (two or more).
+    pub clips: Vec<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1232,6 +1267,27 @@ impl DawServer {
         .map_err(|e| format!("pitch/stretch failed: {e}"))?;
         let clip = result.map_err(|e| format!("{e:#}"))?;
         serde_json::to_string_pretty(&clip).map_err(|e| e.to_string())
+    }
+
+    #[tool(description = "Set an audio region's fade-in and/or fade-out (lengths in timeline seconds) and their curves: linear, equal_power, exponential, logarithmic or s_curve. Overlapping regions crossfade automatically (equal power over the overlap) whether or not they have fades; a region's own longer fade wins. Undoable.")]
+    async fn set_clip_fades(&self, Parameters(a): Parameters<ClipFadesArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let curve = |c: Option<String>| c.map(|c| parse_name::<opentake_engine::project::FadeCurve>("fade curve", &c.replace(['-', ' '], "_"))).transpose();
+            let update = opentake_engine::FadeUpdate { fade_in_secs: a.fade_in_secs, fade_out_secs: a.fade_out_secs, curve_in: curve(a.curve_in)?, curve_out: curve(a.curve_out)? };
+            e.set_clip_fades(a.track, a.clip, update)
+        })
+        .await
+    }
+
+    #[tool(description = "Crossfade two neighbouring audio regions on a track: overlaps them by length_secs (default 0.02), centred on their boundary, by extending/trimming their facing edges as far as their source audio allows, and gives both matching equal-power fades. Regions without audio beyond their edges get a short fade-out/fade-in pair instead. Returns the (earlier, later) regions. Undoable.")]
+    async fn crossfade_clips(&self, Parameters(a): Parameters<CrossfadeArgs>) -> ToolResult {
+        self.with_engine(move |e| e.crossfade_clips(a.track, a.clip_a, a.clip_b, a.length_secs).map(|(x, y)| json!({ "earlier": x, "later": y })))
+            .await
+    }
+
+    #[tool(description = "Merge (join) two or more audio regions on one track into one region: renders what they play (gain, fades, crossfades, pitch/stretch, active takes) into a new WAV in the project's Audio folder, spanning all of them; gaps become silence and butted regions get a 5 ms crossfade at the join so it doesn't click. One undo step (undo brings the original regions back). Returns the new region's index and the region.")]
+    async fn merge_clips(&self, Parameters(a): Parameters<MergeClipsArgs>) -> ToolResult {
+        self.with_engine(move |e| e.merge_clips(a.track, &a.clips).map(|(i, c)| json!({ "clip": i, "region": c }))).await
     }
 
     #[tool(description = "Undo the last edit (made by the user or an agent). Returns what was undone.")]

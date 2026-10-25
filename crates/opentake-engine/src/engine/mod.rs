@@ -9,6 +9,7 @@ mod au;
 mod automation;
 mod calibration;
 mod export;
+mod fades;
 mod flex;
 mod gain;
 mod guitarpro;
@@ -28,14 +29,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use opentake_project::{Clip, Project, TempoChange, Track};
+use opentake_project::{Clip, Fade, Project, TempoChange, Track, effective_fades};
 use opentake_vst3::{Module, ScannedPlugin};
 use rtrb::{Consumer, Producer};
 use serde::Serialize;
 
 use crate::audio::{self, AudioConfig, AudioStreams};
 use crate::media::{self, AudioData};
-use crate::mixer::{ClipRt, Command, EnvTarget, Garbage, LATENCY_UNKNOWN, Mixer, SharedState, TrackParams, TrackRt};
+use crate::mixer::{ClipFades, ClipRt, Command, EnvTarget, Garbage, LATENCY_UNKNOWN, Mixer, SharedState, TrackParams, TrackRt};
 use crate::recorder::{RecordTarget, Recorder};
 
 pub use guitarpro::{GuitarProImport, GuitarProSummary, GuitarProTrackInfo, inspect as inspect_guitar_pro};
@@ -44,6 +45,7 @@ pub use au::AudioUnitInfo;
 pub use automation::{AutomationParam, LaneOwner};
 pub use calibration::LatencyReport;
 pub use export::{AudioFormat, ExportOptions, ExportReport, ExportedFile, SAMPLE_RATES};
+pub use fades::{CROSSFADE_SECS, FadeUpdate, JOIN_SECS};
 pub use flex::{FlexJob, FlexRender, MAX_SEMITONES, PitchStretch, STRETCH_RANGE};
 pub use gain::CLIP_GAIN_DB;
 pub use history::HistoryInfo;
@@ -482,12 +484,18 @@ impl Engine {
     }
 
     fn build_clip(&mut self, clip: &Clip, sr: u32) -> Result<ClipRt> {
+        self.build_clip_with(clip, (clip.fade_in, clip.fade_out), sr)
+    }
+
+    /// A clip with the given (effective) fades.
+    fn build_clip_with(&mut self, clip: &Clip, fades: (Fade, Fade), sr: u32) -> Result<ClipRt> {
         let data = self.clip_media(clip, sr)?;
         let secs = |s: f64| (s.max(0.0) * sr as f64).round() as u64;
         // The processed audio is already stretched, so the source offset scales with it. A
         // negative offset (a take that starts later than its folder) is silence first.
         let offset = clip.source_offset_secs * clip.stretch;
         let lead = (-offset).max(0.0).min(clip.length_secs);
+        let (start, end) = (secs(clip.position_secs), secs(clip.position_secs + clip.length_secs));
         Ok(ClipRt {
             start: secs(clip.position_secs + lead),
             len: secs(clip.length_secs - lead),
@@ -495,14 +503,18 @@ impl Engine {
             gain: clip.gain,
             mute: clip.mute,
             data,
+            fades: ClipFades::new(start, end.max(start), fades, sr as f64),
         })
     }
 
+    /// A track's audio clips, crossfaded where they overlap.
     fn build_clips(&mut self, index: usize, sr: u32) -> Vec<ClipRt> {
         let clips = self.project.tracks[index].clips.clone();
+        let fades = effective_fades(&clips);
         clips
             .iter()
-            .filter_map(|c| match self.build_clip(c, sr) {
+            .zip(fades)
+            .filter_map(|(c, f)| match self.build_clip_with(c, f, sr) {
                 Ok(rt) => Some(rt),
                 Err(e) => {
                     tracing::warn!("skipping clip '{}': {e:#}", c.name);
@@ -883,13 +895,13 @@ impl Engine {
             pitch_semitones: 0,
             pitch_cents: 0,
             stretch: 1.0,
+            fade_in: Fade::default(),
+            fade_out: Fade::default(),
         };
         self.record("Add Region", None, |e| {
             e.project.tracks[index].clips.push(clip.clone());
-            if e.audio.is_some() {
-                let rt = e.build_clip(&clip, sr)?;
-                e.send(Command::AddClip { track: e.track_id(index), clip: rt })?;
-            }
+            // The whole track: an overlap changes its neighbours' crossfades too.
+            e.resync_clips(index)?;
             Ok(clip)
         })
     }
@@ -904,11 +916,9 @@ impl Engine {
         let sr = self.sample_rate();
         let clip = Clip { position_secs: clip.position_secs.max(0.0), ..clip };
         // Validates that the media is loadable before touching the project.
-        let rt = self.build_clip(&clip, sr)?;
+        self.build_clip(&clip, sr)?;
         self.project.tracks[index].clips.push(clip);
-        if self.audio.is_some() {
-            self.send(Command::AddClip { track: self.track_id(index), clip: rt })?;
-        }
+        self.resync_clips(index)?;
         Ok(self.project.tracks[index].clips.len() - 1)
     }
 
@@ -998,12 +1008,13 @@ impl Engine {
         if end - start < Self::MIN_CLIP_SECS {
             bail!("trim would leave clip '{}' shorter than {} ms", c.name, Self::MIN_CLIP_SECS * 1000.0);
         }
-        let trimmed = Clip {
+        let mut trimmed = Clip {
             position_secs: start,
             length_secs: end - start,
             source_offset_secs: (start - source_start) / c.stretch,
             ..c
         };
+        trimmed.clamp_fades();
         self.record("Trim Region", None, |e| {
             e.project.tracks[index].clips[clip] = trimmed.clone();
             e.resync_clips(index)?;

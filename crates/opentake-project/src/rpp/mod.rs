@@ -2,7 +2,7 @@
 //!
 //! Supported: tempo/time signature, sample rate, tracks (name, volume, pan, mute,
 //! solo, record arm, input, monitoring), audio items (position, length, source
-//! offset, gain, mute, file), FX chain references (VST2/VST3/CLAP, bypass,
+//! offset, gain, mute, file, fades), FX chain references (VST2/VST3/CLAP, bypass,
 //! opaque state), buses (as receives; folders import as buses) and volume, pan and mute
 //! automation (`VOLENV2`/`PANENV2`/`MUTEENV`; volume envelopes in Reaper's fader scaling
 //! are skipped). Plug-in parameter envelopes (`PARMENV`) aren't carried over: Reaper
@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::automation::{AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, Curve, gain_to_pos, pos_to_gain};
+use crate::fade::{Fade, FadeCurve};
 use crate::model::{Clip, PluginFormat, PluginSlot, Project, Track};
 use tree::{Entry, Node};
 
@@ -274,7 +275,34 @@ fn import_item(node: &Node, base_dir: &Path) -> Option<Clip> {
         pitch_semitones: cents / 100,
         pitch_cents: cents % 100,
         stretch: 1.0 / rate,
+        fade_in: import_fade(node, "FADEIN"),
+        fade_out: import_fade(node, "FADEOUT"),
     })
+}
+
+/// `FADEIN shape length auto_length ...`. Reaper's automatic crossfade length isn't read:
+/// overlaps crossfade here anyway.
+fn import_fade(node: &Node, key: &str) -> Fade {
+    let curve = match node.value::<u8>(key, 0).unwrap_or(0) {
+        1 => FadeCurve::EqualPower,
+        2 | 4 => FadeCurve::Exponential,
+        3 => FadeCurve::Logarithmic,
+        5 | 6 => FadeCurve::SCurve,
+        _ => FadeCurve::Linear,
+    };
+    Fade::new(node.value(key, 1).filter(|l: &f64| *l > 0.0).unwrap_or(0.0), curve)
+}
+
+/// Reaper's nearest fade shape (0 linear, 1 fast start/equal power, 2 fast end, 3 steep
+/// fast start, 5 slow start and end).
+fn reaper_shape(curve: FadeCurve) -> &'static str {
+    match curve {
+        FadeCurve::Linear => "0",
+        FadeCurve::EqualPower => "1",
+        FadeCurve::Exponential => "2",
+        FadeCurve::Logarithmic => "3",
+        FadeCurve::SCurve => "5",
+    }
 }
 
 /// SECTION and other wrapper sources nest another `<SOURCE>`; dig until a FILE line.
@@ -380,6 +408,12 @@ fn export_track(track: &Track, base_dir: &Path, sources: &[usize]) -> Node {
         item.push_line(&["NAME", &clip.name]);
         item.push_line(&["VOLPAN", &fmt_f32(clip.gain), "0", "1", "-1"]);
         item.push_line(&["SOFFS", &fmt_f64(clip.source_offset_secs)]);
+        for (key, f) in [("FADEIN", clip.fade_in), ("FADEOUT", clip.fade_out)] {
+            if !f.is_none() {
+                let shape = reaper_shape(f.curve);
+                item.push_line(&[key, shape, &fmt_f64(f.secs), "0", shape, "0", "0", "0"]);
+            }
+        }
         if clip.is_flexed() {
             item.push_line(&["PLAYRATE", &fmt_f64(1.0 / clip.stretch), "1", &fmt_f64(clip.transpose()), "-1", "0", "0.0025"]);
         }
@@ -545,6 +579,18 @@ mod tests {
         let vari = text.replace("PLAYRATE 0.8 1 -3.2", "PLAYRATE 2 0 0");
         let c = &from_str(&vari, base).unwrap().tracks[0].clips[0];
         assert_eq!((c.stretch, c.pitch_semitones, c.pitch_cents), (0.5, 12, 0));
+    }
+
+    #[test]
+    fn fades_round_trip() {
+        let base = Path::new("/proj");
+        let mut p = from_str(SAMPLE, base).unwrap();
+        let c = &mut p.tracks[0].clips[0];
+        (c.fade_in, c.fade_out) = (Fade::new(0.25, FadeCurve::EqualPower), Fade::new(1.5, FadeCurve::SCurve));
+        let text = to_string(&p, base);
+        assert!(text.contains("FADEIN 1 0.25 0 1") && text.contains("FADEOUT 5 1.5 0 5"), "{text}");
+        assert_eq!(from_str(&text, base).unwrap(), p);
+        assert!(!to_string(&from_str(SAMPLE, base).unwrap(), base).contains("FADEIN"), "no fade, no line");
     }
 
     #[test]

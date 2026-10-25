@@ -3,10 +3,10 @@
 
 use std::sync::Arc;
 
-use opentake_engine::{AutomationParam, RegionData, TrackUpdate, Waveform};
+use opentake_engine::{AutomationParam, FadeUpdate, RegionData, TrackUpdate, Waveform};
 use opentake_engine::project::automation::{envelope_at, gain_to_pos, pos_to_gain};
 use opentake_engine::project::tempo::{bar_len_q, beat_len_q};
-use opentake_engine::project::{AutomationLane, AutomationMode, AutomationTarget, BarLine, Clip, Curve, Grid, MidiClip, Project, Take, TempoChange, TempoMap, Track};
+use opentake_engine::project::{AutomationLane, AutomationMode, AutomationTarget, BarLine, Clip, Curve, Fade, FadeCurve, Grid, MidiClip, Project, Take, TempoChange, TempoMap, Track, effective_fades};
 use eframe::egui;
 use egui::{Align, Align2, Color32, CursorIcon, FontId, Layout, Painter, Pos2, Rangef, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
 
@@ -27,6 +27,10 @@ const MIN_REGION_SECS: f64 = 0.01;
 /// Height of an automation lane, and how close (px) the pointer must be to grab a point.
 const LANE_H: f32 = 46.0;
 const POINT_GRAB: f32 = 6.0;
+/// Size (px) of the fade handles in an audio region's top corners.
+const FADE_HANDLE: f32 = 7.0;
+/// Fade length the context menu gives a region that has none (seconds).
+const DEFAULT_FADE_SECS: f64 = 0.05;
 
 /// Grid resolution used for snapping and grid lines (Logic's "Snap" menu).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +143,9 @@ enum DragMode {
     TrimEnd,
     /// ⌥-drag of an audio region's end: time-stretch it to the new length.
     StretchEnd,
+    /// Drag of an audio region's fade handle (top-left / top-right corner).
+    FadeIn,
+    FadeOut,
 }
 
 struct RegionDrag {
@@ -156,6 +163,8 @@ struct RegionDrag {
     /// Preview of the trimmed region.
     start: f64,
     end: f64,
+    /// Preview of the fade length while dragging a fade handle.
+    fade: f64,
 }
 
 /// Rubber-band selection in the lanes.
@@ -186,6 +195,7 @@ enum Edit {
     Move { delta_t: f64, delta_track: isize, copy: bool },
     Trim { region: RegionRef, start: Option<f64>, end: Option<f64> },
     Stretch { region: RegionRef, length: f64 },
+    Fade { region: RegionRef, update: FadeUpdate },
 }
 
 const MIN_PX_PER_SEC: f32 = 2.0;
@@ -538,8 +548,11 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
                         recording_region(&painter, rect, &app.view, start, playhead, project, ui);
                     }
                 }
+                // The fades each audio region plays with, crossfades over overlaps included.
+                let fades = effective_fades(&track.clips);
                 for view in regions_of(track, ti) {
-                    if let Some(e) = region(app, ui, &painter, rect, view, snap) {
+                    let f = if view.r.kind == RegionKind::Audio { fades.get(view.r.index).copied() } else { None };
+                    if let Some(e) = region(app, ui, &painter, rect, view, f, snap) {
                         edit = Some(e);
                     }
                 }
@@ -626,6 +639,7 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
             let ps = opentake_engine::PitchStretch { length_secs: Some(length), ..Default::default() };
             app.act(Action::PitchStretch { track: region.track, clip: region.index, ps });
         }
+        Some(Edit::Fade { region, update }) => app.act(Action::ClipFades { track: region.track, clip: region.index, update }),
         None => {}
     }
 
@@ -705,7 +719,9 @@ fn recording_region(painter: &Painter, row: Rect, view: &View, start: f64, playh
     ui.ctx().request_repaint();
 }
 
-fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, view: RegionView, snap: &Snapshot) -> Option<Edit> {
+/// One region: drawing and gestures. `fades` are an audio region's effective fades.
+#[allow(clippy::too_many_arguments)]
+fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, view: RegionView, fades: Option<(Fade, Fade)>, snap: &Snapshot) -> Option<Edit> {
     let project = &snap.project;
     let r = view.r;
     let wf = match view.content {
@@ -736,6 +752,31 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
     let trim_start_ok = r.kind == RegionKind::Audio;
 
     let hover_x = resp.hover_pos().map(|p| p.x);
+    // Fade handles (audio, pointer tool) take precedence over the edges they sit next to.
+    let audio = match view.content {
+        Content::Audio(c) => Some(c),
+        Content::Midi(_) => None,
+    };
+    let fade_drag = drag.filter(|d| matches!(d.mode, DragMode::FadeIn | DragMode::FadeOut));
+    let handles = audio.filter(|_| app.tool == Tool::Pointer).and_then(|c| {
+        let (fade_in, fade_out) = match fade_drag {
+            Some(d) if d.mode == DragMode::FadeIn => (d.fade, c.fade_out.secs),
+            Some(d) => (c.fade_in.secs, d.fade),
+            None => (c.fade_in.secs, c.fade_out.secs),
+        };
+        fade_handles(rect, &app.view, view.position, view.end(), fade_in, fade_out)
+    });
+    let near_fade = |p: Pos2| {
+        let [fi, fo] = handles?;
+        if fi.expand(3.0).contains(p) {
+            Some(DragMode::FadeIn)
+        } else if fo.expand(3.0).contains(p) {
+            Some(DragMode::FadeOut)
+        } else {
+            None
+        }
+    };
+    let hover_fade = resp.hover_pos().and_then(near_fade);
     let near_edge = |x: f32| {
         let edge = EDGE_GRAB.min(rect.width() / 4.0);
         if trim_start_ok && (x - rect.left()).abs() <= edge {
@@ -750,7 +791,7 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
         ui.ctx().set_cursor_icon(CursorIcon::Copy);
     } else if app.tool == Tool::Pointer {
         if let Some(x) = hover_x {
-            if near_edge(x).is_some() || drag.is_some_and(|d| d.mode != DragMode::Move) {
+            if hover_fade.is_some() || near_edge(x).is_some() || drag.is_some_and(|d| d.mode != DragMode::Move) {
                 ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
             }
         }
@@ -761,7 +802,15 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
     // Paint. While ⌘-dragging a copy, the original stays drawn in place.
     let color = if view.mute { Color32::from_gray(110) } else { theme::track_color(r.track) };
     let copying = drag.is_some_and(|d| d.mode == DragMode::Move && d.copy);
-    let painted = |start: f64, end: f64, mode: Option<DragMode>| Painted { view, start, end, mode, wf };
+    // A fade drag previews the new length.
+    let mut shown_fades = fades;
+    if let (Some(d), Some((fi, fo)), Some(c)) = (fade_drag, shown_fades.as_mut(), audio) {
+        match d.mode {
+            DragMode::FadeIn => *fi = Fade { secs: d.fade, curve: c.fade_in.curve },
+            _ => *fo = Fade { secs: d.fade, curve: c.fade_out.curve },
+        }
+    }
+    let painted = |start: f64, end: f64, mode: Option<DragMode>| Painted { view, start, end, mode, wf, fades: shown_fades };
     if copying {
         let orig = Rect::from_min_max(pos2(app.view.x_of(view.position), rect.top()), pos2(app.view.x_of(view.end()), rect.bottom()));
         paint_region(painter, row, orig, painted(view.position, view.end(), None), color, &app.view, RegionLook::default());
@@ -783,8 +832,16 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
         None => paint_region(painter, row, rect, shown, color, &app.view, look),
     }
     if app.tool == Tool::Pointer {
+        // Fade handles show on hover and while dragging one.
+        if let (Some(hs), true) = (handles, (resp.hovered() && drag.is_none()) || fade_drag.is_some()) {
+            for (h, mode) in hs.into_iter().zip([DragMode::FadeIn, DragMode::FadeOut]) {
+                let hot = hover_fade == Some(mode) || fade_drag.is_some_and(|d| d.mode == mode);
+                painter.rect_filled(h, 1.5, if hot { theme::ACCENT } else { Color32::WHITE });
+                painter.rect_stroke(h, 1.5, Stroke::new(1.0, Color32::from_rgb(16, 16, 18)), StrokeKind::Outside);
+            }
+        }
         // Trim handles on hover (accent: ⌥ stretches the end instead).
-        if let Some(mode) = hover_x.and_then(near_edge) {
+        if let Some(mode) = hover_x.and_then(near_edge).filter(|_| hover_fade.is_none()) {
             let x = if mode == DragMode::TrimStart { rect.left() + 1.5 } else { rect.right() - 1.5 };
             let stretch = mode == DragMode::TrimEnd && r.kind == RegionKind::Audio && ui.input(|i| i.modifiers.alt);
             painter.vline(x, Rangef::new(rect.top() + 3.0, rect.bottom() - 3.0), Stroke::new(3.0, if stretch { theme::ACCENT } else { Color32::WHITE }));
@@ -851,14 +908,20 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
                     app.selection = vec![r];
                 }
             }
-            let mut mode = near_edge(p.x).unwrap_or(DragMode::Move);
+            let mut mode = near_fade(p).or_else(|| near_edge(p.x)).unwrap_or(DragMode::Move);
             if mode == DragMode::TrimEnd && r.kind == RegionKind::Audio && ui.input(|i| i.modifiers.alt) {
                 mode = DragMode::StretchEnd;
             }
             if mode != DragMode::Move {
                 app.selection = vec![r]; // trims apply to the grabbed region only
             }
-            let edge = if matches!(mode, DragMode::TrimEnd | DragMode::StretchEnd) { view.end() } else { view.position };
+            let (fade_in, fade_out) = audio.map_or((0.0, 0.0), |c| (c.fade_in.secs, c.fade_out.secs));
+            let (edge, fade) = match mode {
+                DragMode::TrimEnd | DragMode::StretchEnd => (view.end(), 0.0),
+                DragMode::FadeIn => (view.position + fade_in, fade_in),
+                DragMode::FadeOut => (view.end() - fade_out, fade_out),
+                _ => (view.position, 0.0),
+            };
             app.view.drag = Some(RegionDrag {
                 grabbed: r,
                 mode,
@@ -868,6 +931,7 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
                 grab_offset: app.view.t_of(p.x) - edge,
                 start: view.position,
                 end: view.end(),
+                fade,
             });
         }
     }
@@ -918,6 +982,16 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
                     let e = snap_time(app, ui, t, project).clamp(orig_start + min_len.max(MIN_REGION_SECS), orig_start + max_len);
                     (orig_start, e)
                 }
+                // Fades stay within what the other fade leaves (unsnapped: they're often short).
+                DragMode::FadeIn | DragMode::FadeOut => {
+                    let (fade_in, fade_out) = audio.map_or((0.0, 0.0), |c| (c.fade_in.secs, c.fade_out.secs));
+                    let (len, other) = (orig_end - orig_start, if mode == DragMode::FadeIn { fade_out } else { fade_in });
+                    let fade = if mode == DragMode::FadeIn { t - orig_start } else { orig_end - t };
+                    if let Some(d) = app.view.drag.as_mut() {
+                        d.fade = fade.clamp(0.0, (len - other).max(0.0));
+                    }
+                    (orig_start, orig_end)
+                }
             };
             if let Some(d) = app.view.drag.as_mut() {
                 d.start = start;
@@ -937,6 +1011,12 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
                 DragMode::TrimStart if d.start != orig_start => Some(Edit::Trim { region: r, start: Some(d.start), end: None }),
                 DragMode::TrimEnd if d.end != orig_end => Some(Edit::Trim { region: r, start: None, end: Some(d.end) }),
                 DragMode::StretchEnd if d.end != orig_end => Some(Edit::Stretch { region: r, length: d.end - d.start }),
+                DragMode::FadeIn if audio.is_some_and(|c| c.fade_in.secs != d.fade) => {
+                    Some(Edit::Fade { region: r, update: FadeUpdate { fade_in_secs: Some(d.fade), ..Default::default() } })
+                }
+                DragMode::FadeOut if audio.is_some_and(|c| c.fade_out.secs != d.fade) => {
+                    Some(Edit::Fade { region: r, update: FadeUpdate { fade_out_secs: Some(d.fade), ..Default::default() } })
+                }
                 _ => None,
             };
         }
@@ -982,6 +1062,58 @@ fn region_context_menu(app: &mut DawApp, ui: &mut egui::Ui, view: RegionView, sn
         ui.close();
     }
     ui.separator();
+    let audio: Vec<RegionRef> = group.iter().copied().filter(|g| g.kind == RegionKind::Audio).collect();
+    if !audio.is_empty() {
+        // Picking a curve for a region without that fade gives it a short one to see.
+        for (label, fade_in) in [("Fade In", true), ("Fade Out", false)] {
+            ui.menu_button(label, |ui| {
+                for curve in FadeCurve::ALL {
+                    if ui.button(curve.label()).clicked() {
+                        for g in &audio {
+                            let Some(c) = snap.project.tracks.get(g.track).and_then(|t| t.clips.get(g.index)) else { continue };
+                            let current = if fade_in { c.fade_in.secs } else { c.fade_out.secs };
+                            let secs = Some(if current > 0.0 { current } else { (c.length_secs / 4.0).min(DEFAULT_FADE_SECS) });
+                            let update = if fade_in {
+                                FadeUpdate { fade_in_secs: secs, curve_in: Some(curve), ..Default::default() }
+                            } else {
+                                FadeUpdate { fade_out_secs: secs, curve_out: Some(curve), ..Default::default() }
+                            };
+                            app.act(Action::ClipFades { track: g.track, clip: g.index, update });
+                        }
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.button("No Fade").clicked() {
+                    for g in &audio {
+                        let update = if fade_in { FadeUpdate { fade_in_secs: Some(0.0), ..Default::default() } } else { FadeUpdate { fade_out_secs: Some(0.0), ..Default::default() } };
+                        app.act(Action::ClipFades { track: g.track, clip: g.index, update });
+                    }
+                    ui.close();
+                }
+            });
+        }
+        let pair = app.audio_selection().and_then(|(t, c)| Some((t, <[usize; 2]>::try_from(c).ok()?)));
+        ui.add_enabled_ui(pair.is_some(), |ui| {
+            ui.menu_button("Crossfade", |ui| {
+                for ms in [5.0, 10.0, 20.0, 50.0, 100.0, 250.0] {
+                    if let (true, Some((track, [a, b]))) = (ui.button(format!("{ms:.0} ms")).clicked(), pair) {
+                        app.act(Action::Crossfade { track, a, b, secs: ms / 1000.0 });
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_disabled_hover_text("Select two neighbouring audio regions on one track");
+        });
+        if ui.add_enabled(app.audio_selection().is_some(), egui::Button::new("Merge Regions").shortcut_text("⌘J")).clicked() {
+            if let Some((track, clips)) = app.audio_selection() {
+                app.act(Action::MergeRegions { track, clips });
+            }
+            ui.close();
+        }
+        ui.separator();
+    }
     if ui.add(egui::Button::new("Copy").shortcut_text("⌘C")).clicked() {
         app.copy_selection(&snap.project);
         ui.close();
@@ -1039,6 +1171,8 @@ struct Painted<'a> {
     end: f64,
     mode: Option<DragMode>,
     wf: Option<&'a Arc<Waveform>>,
+    /// An audio region's effective (fade-in, fade-out).
+    fades: Option<(Fade, Fade)>,
 }
 
 fn paint_region(painter: &Painter, row: Rect, rect: Rect, p: Painted, color: Color32, view: &View, look: RegionLook) {
@@ -1091,6 +1225,12 @@ fn paint_region(painter: &Painter, row: Rect, rect: Rect, p: Painted, color: Col
                 }
                 draw_waveform(painter, body, row, view, &shown, wf, ink);
             }
+            // A fade longer than the region's own comes from an overlap: draw it as an X.
+            if let Some((fi, fo)) = p.fades {
+                let clip = body.intersect(row);
+                draw_fade(painter, clip, body, view, (p.start, p.start + fi.secs), fi.curve, true, fi.secs > c.fade_in.secs);
+                draw_fade(painter, clip, body, view, (p.end - fo.secs, p.end), fo.curve, false, fo.secs > c.fade_out.secs);
+            }
         }
         Content::Midi(c) => draw_note_preview(painter, body, row, view, c, p.start, p.end - p.start, ink),
     }
@@ -1128,6 +1268,55 @@ fn draw_note_preview(painter: &Painter, rect: Rect, clip_to: Rect, view: &View, 
         let y = rect.bottom() - 2.0 - (n.pitch as f32 - base + 1.0) * row_h;
         painter.rect_filled(Rect::from_min_max(pos2(x0, y), pos2(x1, y + row_h.max(2.0))), 1.0, color);
     }
+}
+
+/// Fade handles: small squares at the top of an audio region's body, where the fade-in ends
+/// and the fade-out starts (the corners when there are none). `None` if it's too small.
+fn fade_handles(rect: Rect, view: &View, start: f64, end: f64, fade_in: f64, fade_out: f64) -> Option<[Rect; 2]> {
+    if rect.width() < 4.0 * FADE_HANDLE || rect.height() < 30.0 {
+        return None;
+    }
+    let half = FADE_HANDLE / 2.0;
+    let y = rect.top() + 17.0 + half;
+    let (lo, hi) = (rect.left() + half + 1.0, rect.right() - half - 1.0);
+    let at = |x: f32| Rect::from_center_size(pos2(x.clamp(lo, hi), y), vec2(FADE_HANDLE, FADE_HANDLE));
+    Some([at(view.x_of(start + fade_in)), at(view.x_of(end - fade_out))])
+}
+
+/// A fade over `span` (timeline seconds) in an audio region's `body`: the attenuated part
+/// shaded and the gain curve drawn; `cross` adds the other region's mirrored curve (an X).
+#[allow(clippy::too_many_arguments)]
+fn draw_fade(painter: &Painter, clip: Rect, body: Rect, view: &View, span: (f64, f64), curve: FadeCurve, rising: bool, cross: bool) {
+    let (x0, x1) = (view.x_of(span.0), view.x_of(span.1));
+    if x1 - x0 < 1.0 || clip.width() <= 0.0 {
+        return;
+    }
+    let painter = painter.with_clip_rect(clip.intersect(painter.clip_rect()));
+    let steps = ((x1 - x0) / 3.0).clamp(6.0, 48.0) as usize;
+    let gain_at = |k: usize, mirror: bool| {
+        let f = k as f32 / steps as f32;
+        curve.gain(if rising != mirror { f } else { 1.0 - f })
+    };
+    let point = |k: usize, g: f32| pos2(x0 + (x1 - x0) * k as f32 / steps as f32, body.bottom() - g * body.height());
+    let mut shade = egui::Mesh::default();
+    let mut line = Vec::with_capacity(steps + 1);
+    for k in 0..=steps {
+        let p = point(k, gain_at(k, false));
+        shade.colored_vertex(pos2(p.x, body.top()), Color32::from_black_alpha(80));
+        shade.colored_vertex(p, Color32::from_black_alpha(80));
+        if k > 0 {
+            let i = 2 * k as u32;
+            shade.add_triangle(i - 2, i - 1, i);
+            shade.add_triangle(i - 1, i, i + 1);
+        }
+        line.push(p);
+    }
+    painter.add(egui::Shape::mesh(shade));
+    if cross {
+        let mirrored = (0..=steps).map(|k| point(k, gain_at(k, true))).collect();
+        painter.add(egui::Shape::line(mirrored, Stroke::new(1.0, Color32::from_white_alpha(120))));
+    }
+    painter.add(egui::Shape::line(line, Stroke::new(1.5, Color32::from_white_alpha(210))));
 }
 
 fn draw_waveform(painter: &Painter, rect: Rect, clip_to: Rect, view: &View, clip: &Clip, wf: &Waveform, color: Color32) {
