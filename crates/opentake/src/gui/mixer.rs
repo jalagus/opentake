@@ -234,7 +234,14 @@ pub fn master_strip(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot, layout
     if released {
         app.act(Action::ReleaseControl { owner: None, target: AutomationTarget::Volume });
     }
-    ui.allocate_exact_size(vec2(w, 20.0), Sense::hover());
+    // In the row where track strips have M/S/R/I: show the master's automation lanes.
+    ui.horizontal(|ui| {
+        ui.add_space((w - 30.0) / 2.0);
+        let shown = snap.project.show_master_automation;
+        if widgets::chip(ui, shown, "A", theme::AUTOMATION, "Show Master Automation", vec2(30.0, 20.0)).clicked() {
+            app.act(Action::ShowMasterAutomation(!shown));
+        }
+    });
     name_plate(ui, "Stereo Out", Color32::from_gray(120), w);
 }
 

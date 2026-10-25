@@ -48,6 +48,9 @@ pub struct Project {
     /// Automation of the master fader and master plug-ins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub master_automation: Vec<AutomationLane>,
+    /// The master's automation lanes are shown (below the tracks).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub show_master_automation: bool,
     pub tracks: Vec<Track>,
 }
 
@@ -82,6 +85,7 @@ impl Default for Project {
             auto_input_monitoring: true,
             master_plugins: Vec::new(),
             master_automation: Vec::new(),
+            show_master_automation: false,
             tracks: Vec::new(),
         }
     }

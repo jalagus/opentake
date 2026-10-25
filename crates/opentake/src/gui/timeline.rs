@@ -11,7 +11,7 @@ use eframe::egui;
 use egui::{Align, Align2, Color32, CursorIcon, FontId, Layout, Painter, Pos2, Rangef, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
 
 use super::widgets::{self, Icon};
-use super::{Action, DawApp, Snapshot, theme};
+use super::{Action, DawApp, MASTER_UI, Snapshot, theme};
 
 const HEADER_W: f32 = 260.0;
 const ROW_H: f32 = 64.0;
@@ -238,10 +238,11 @@ pub struct View {
     auto_context: Option<usize>,
 }
 
-/// An automation point: track, lane (index into the track's lanes) and point.
+/// An automation point: whose lanes (a track, or `None` for the master), lane (index into
+/// those lanes) and point.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AutoSel {
-    pub track: usize,
+    pub owner: Option<usize>,
     pub lane: usize,
     pub point: usize,
 }
@@ -554,9 +555,15 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
             });
             let mut span = row.response.rect.y_range();
             if track.show_automation {
-                span.max = automation_rows(app, ui, ti, track, snap, &map, grid);
+                span.max = automation_rows(app, ui, LaneHost::track(ti, track), snap, &map, grid);
             }
             spans.push((ti, span));
+        }
+
+        // The master bus's automation, below the tracks.
+        if project.show_master_automation {
+            master_automation_header(app, ui, &map, grid);
+            automation_rows(app, ui, LaneHost::master(project), snap, &map, grid);
         }
 
         // Empty area below the tracks: drop target and quick "new track".
@@ -1763,21 +1770,76 @@ fn track_context_menu(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, track: &Tr
     }
 }
 
-/// The automation lanes under a track (or a row offering to add one). Returns the bottom of
-/// the last row.
-fn automation_rows(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, track: &Track, snap: &Snapshot, map: &TempoMap, grid: Option<Grid>) -> f32 {
-    let params = snap.auto_params.get(&ti).map_or(&[][..], |p| p.as_slice());
-    let lanes: Vec<(usize, &AutomationLane)> = track.automation.iter().enumerate().filter(|(_, l)| l.shown).collect();
+/// The row above the master's automation lanes: its name and a button to hide them.
+fn master_automation_header(app: &mut DawApp, ui: &mut egui::Ui, map: &TempoMap, grid: Option<Grid>) {
+    const H: f32 = 28.0;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        let w = (app.view.lanes().min - ui.cursor().left()).clamp(0.0, HEADER_W);
+        let (rect, _) = ui.allocate_exact_size(vec2(w, H), Sense::hover());
+        let rect = Rect::from_min_size(rect.min, vec2(HEADER_W, H));
+        let p = ui.painter();
+        p.rect_filled(rect, 0.0, theme::BG_HEADER);
+        p.rect_filled(Rect::from_min_size(rect.min, vec2(4.0, H)), 0.0, theme::TEXT_DIM);
+        p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+        p.vline(rect.right() - 0.5, rect.y_range(), Stroke::new(1.0, theme::BORDER));
+        p.text(pos2(rect.left() + 32.0, rect.center().y), Align2::LEFT_CENTER, "Stereo Out", FontId::proportional(12.5), theme::TEXT);
+        p.text(pos2(rect.left() + 108.0, rect.center().y), Align2::LEFT_CENTER, "MASTER", FontId::proportional(9.5), theme::TEXT_FAINT);
+        let chip = Rect::from_min_size(pos2(rect.right() - 40.0, rect.center().y - 9.0), vec2(22.0, 18.0));
+        let mut child = ui.new_child(UiBuilder::new().id_salt("master_auto_chip").max_rect(chip));
+        if widgets::chip(&mut child, true, "A", theme::AUTOMATION, "Hide Master Automation", vec2(22.0, 18.0)).clicked() {
+            app.act(Action::ShowMasterAutomation(false));
+        }
+        let (resp, painter) = ui.allocate_painter(vec2(ui.available_width(), H), Sense::hover());
+        painter.rect_filled(resp.rect, 0.0, theme::shade(theme::BG_LANE, 0.7));
+        draw_grid(&painter, resp.rect, &app.view, map, grid);
+        painter.hline(resp.rect.x_range(), resp.rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+    });
+}
+
+/// Whose automation lanes a set of rows shows: a track, or the master bus.
+#[derive(Clone, Copy)]
+pub(crate) struct LaneHost<'a> {
+    pub owner: Option<usize>,
+    /// Key for ids and `Snapshot::auto_params` (the track index, or `MASTER_UI`).
+    pub key: usize,
+    /// Stable id for undo merge keys.
+    pub id: u64,
+    pub name: &'a str,
+    pub color: Color32,
+    pub lanes: &'a [AutomationLane],
+    /// Current volume, pan and mute, drawn as a guide in empty lanes.
+    pub volume: f32,
+    pub pan: f32,
+    pub mute: bool,
+}
+
+impl<'a> LaneHost<'a> {
+    pub fn track(ti: usize, track: &'a Track) -> Self {
+        Self { owner: Some(ti), key: ti, id: track.id, name: &track.name, color: theme::color_of(track, ti), lanes: &track.automation, volume: track.volume, pan: track.pan, mute: track.mute }
+    }
+
+    pub fn master(project: &'a Project) -> Self {
+        let lanes = &project.master_automation;
+        Self { owner: None, key: MASTER_UI, id: u64::MAX, name: "Stereo Out", color: theme::TEXT_DIM, lanes, volume: project.master_volume, pan: 0.0, mute: false }
+    }
+}
+
+/// The automation lanes under a track or the master (or a row offering to add one). Returns
+/// the bottom of the last row.
+fn automation_rows(app: &mut DawApp, ui: &mut egui::Ui, host: LaneHost, snap: &Snapshot, map: &TempoMap, grid: Option<Grid>) -> f32 {
+    let params = snap.auto_params.get(&host.key).map_or(&[][..], |p| p.as_slice());
+    let lanes: Vec<(usize, &AutomationLane)> = host.lanes.iter().enumerate().filter(|(_, l)| l.shown).collect();
     let mut bottom = ui.cursor().top();
     if lanes.is_empty() {
         let r = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
             let rect = lane_header_rect(app, ui);
-            lane_header_frame(ui, rect, theme::color_of(track, ti));
+            lane_header_frame(ui, rect, host.color);
             let at = Rect::from_min_size(pos2(rect.left() + 32.0, rect.center().y - 11.0), vec2(150.0, 22.0));
-            let mut child = ui.new_child(UiBuilder::new().id_salt(("add_lane", ti)).max_rect(at));
+            let mut child = ui.new_child(UiBuilder::new().id_salt(("add_lane", host.key)).max_rect(at));
             if child.button(RichText::new("+ Add Automation Lane").size(11.0)).clicked() {
-                app.act(Action::AddLane { owner: Some(ti), target: None });
+                app.act(Action::AddLane { owner: host.owner, target: None });
             }
             let (resp, painter) = ui.allocate_painter(vec2(ui.available_width(), LANE_H), Sense::hover());
             painter.rect_filled(resp.rect, 0.0, theme::shade(theme::BG_LANE, 0.85));
@@ -1788,8 +1850,8 @@ fn automation_rows(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, track: &Track
     for (li, lane) in lanes {
         let r = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-            lane_header(app, ui, ti, li, lane, track, params, snap.status.position_secs);
-            lane_area(app, ui, ti, li, lane, track, snap, map, grid);
+            lane_header(app, ui, host, li, lane, params, snap.status.position_secs);
+            lane_area(app, ui, host, li, lane, snap, map, grid);
         });
         bottom = r.response.rect.bottom();
     }
@@ -1831,10 +1893,10 @@ fn mode_color(mode: AutomationMode) -> Color32 {
 
 /// Lane header: parameter picker, mode, the value at the playhead, add and remove.
 #[allow(clippy::too_many_arguments)]
-fn lane_header(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, li: usize, lane: &AutomationLane, track: &Track, params: &[AutomationParam], playhead: f64) {
+fn lane_header(app: &mut DawApp, ui: &mut egui::Ui, host: LaneHost, li: usize, lane: &AutomationLane, params: &[AutomationParam], playhead: f64) {
     let rect = lane_header_rect(app, ui);
-    lane_header_frame(ui, rect, theme::color_of(track, ti));
-    let owner = Some(ti);
+    lane_header_frame(ui, rect, host.color);
+    let (owner, ti) = (host.owner, host.key);
     let content = Rect::from_min_max(pos2(rect.left() + 32.0, rect.top() + 4.0), pos2(rect.right() - 10.0, rect.bottom() - 4.0));
     // A child Ui, so nothing in the header can push the lane area aside.
     let mut child = ui.new_child(UiBuilder::new().id_salt(("lane_header", ti, li)).max_rect(content).layout(Layout::top_down(Align::Min)));
@@ -1852,7 +1914,7 @@ fn lane_header(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, li: usize, lane: 
                         widgets::section(ui, &p.group);
                         group = &p.group;
                     }
-                    let taken = track.automation.iter().any(|l| l.target == p.target);
+                    let taken = host.lanes.iter().any(|l| l.target == p.target);
                     let b = ui.add_enabled(!taken || p.target == lane.target, egui::Button::selectable(p.target == lane.target, &p.name));
                     if b.clicked() && p.target != lane.target {
                         app.act(Action::SetLaneTarget { owner, lane: li, target: p.target });
@@ -1889,11 +1951,12 @@ fn lane_header(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, li: usize, lane: 
 /// The envelope over the timeline. Click to add a point (snapped), drag points (Shift: fine),
 /// double-click or ⌫ to delete, right-click for curves and more.
 #[allow(clippy::too_many_arguments)]
-fn lane_area(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, li: usize, lane: &AutomationLane, track: &Track, snap: &Snapshot, map: &TempoMap, grid: Option<Grid>) {
+fn lane_area(app: &mut DawApp, ui: &mut egui::Ui, host: LaneHost, li: usize, lane: &AutomationLane, snap: &Snapshot, map: &TempoMap, grid: Option<Grid>) {
     let project = &snap.project;
+    let owner = host.owner;
     let (resp, painter) = ui.allocate_painter(vec2(ui.available_width(), LANE_H), Sense::click_and_drag());
-    let name = lane_name(snap.auto_params.get(&ti).map_or(&[][..], |p| p.as_slice()), lane.target);
-    widgets::label(&resp, egui::Role::Group, &format!("Automation {} {name}", track.name));
+    let name = lane_name(snap.auto_params.get(&host.key).map_or(&[][..], |p| p.as_slice()), lane.target);
+    widgets::label(&resp, egui::Role::Group, &format!("Automation {} {name}", host.name));
     let rect = resp.rect;
     let painter = painter.with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, theme::shade(theme::BG_LANE, 0.85));
@@ -1906,17 +1969,17 @@ fn lane_area(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, li: usize, lane: &A
     let v_of = |y: f32| ((plot.bottom() - y) / plot.height()).clamp(0.0, 1.0);
     let pts: Vec<Pos2> = lane.points.iter().map(|p| pos2(app.view.x_of(p.time_secs), y_of(p.value))).collect();
     let at = |i: usize| pts[i];
-    let color = theme::color_of(track, ti);
+    let color = host.color;
     let ink = if lane.mode == AutomationMode::Off { theme::shade(color, 0.45) } else { color };
-    let sel = |i: usize| app.view.auto_sel == Some(AutoSel { track: ti, lane: li, point: i });
+    let sel = |i: usize| app.view.auto_sel == Some(AutoSel { owner, lane: li, point: i });
 
     // The curve (and a soft fill below it), sampled per pixel so every shape draws right.
     let hover = resp.hover_pos();
     if lane.points.is_empty() {
         let v = match lane.target {
-            AutomationTarget::Volume => gain_to_pos(track.volume),
-            AutomationTarget::Pan => (track.pan + 1.0) / 2.0,
-            AutomationTarget::Mute => track.mute as u8 as f32,
+            AutomationTarget::Volume => gain_to_pos(host.volume),
+            AutomationTarget::Pan => (host.pan + 1.0) / 2.0,
+            AutomationTarget::Mute => host.mute as u8 as f32,
             AutomationTarget::Param { .. } => 0.5,
         };
         painter.hline(rect.x_range(), y_of(v), Stroke::new(1.0, theme::with_alpha(ink, 90)));
@@ -1956,7 +2019,7 @@ fn lane_area(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, li: usize, lane: &A
     }
 
     // Value (and time) at the point being dragged or hovered.
-    let dragging = app.view.auto_drag.as_ref().filter(|d| d.sel.track == ti && d.sel.lane == li).map(|d| d.sel.point);
+    let dragging = app.view.auto_drag.as_ref().filter(|d| d.sel.owner == owner && d.sel.lane == li).map(|d| d.sel.point);
     if let Some(i) = dragging.or(hovered).filter(|&i| i < lane.points.len()) {
         let p = lane.points[i];
         let text = format!("{}  ·  {:.2}s", lane.target.format(p.value), p.time_secs);
@@ -1971,12 +2034,11 @@ fn lane_area(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, li: usize, lane: &A
     draw_playhead(&painter, rect, &app.view, snap.status.position_secs, false);
 
     // Interaction.
-    let owner = Some(ti);
     let press = ui.input(|i| i.pointer.press_origin());
     if resp.drag_started() {
         if let Some(i) = press.and_then(near) {
             let p = lane.points[i];
-            let sel = AutoSel { track: ti, lane: li, point: i };
+            let sel = AutoSel { owner, lane: li, point: i };
             app.view.auto_sel = Some(sel);
             app.selection.clear();
             app.view.auto_drag = Some(AutoDrag { sel, from: (p.time_secs, p.value), sent: (p.time_secs, p.value) });
@@ -1986,13 +2048,13 @@ fn lane_area(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, li: usize, lane: &A
         let total = ui.input(|i| i.pointer.press_origin().zip(i.pointer.latest_pos()).map(|(a, b)| b - a)).unwrap_or_default();
         let fine = ui.input(|i| i.modifiers.shift);
         let scale = if fine { 0.2 } else { 1.0 };
-        if let Some(d) = app.view.auto_drag.as_mut().filter(|d| d.sel.track == ti && d.sel.lane == li) {
+        if let Some(d) = app.view.auto_drag.as_mut().filter(|d| d.sel.owner == owner && d.sel.lane == li) {
             let t = d.from.0 + (total.x * scale / app.view.px_per_sec) as f64;
             let t = if fine { t.max(0.0) } else { snap_to(app.snap_mode, ui, t, project, app.view.px_per_sec) };
             let v = (d.from.1 - total.y * scale / plot.height()).clamp(0.0, 1.0);
             if (t, v) != d.sent {
                 d.sent = (t, v);
-                let merge = format!("autodrag:{}:{li}:{}", track.id, d.sel.point);
+                let merge = format!("autodrag:{}:{li}:{}", host.id, d.sel.point);
                 let (lane, index) = (d.sel.lane, d.sel.point);
                 app.act(Action::MovePoint { owner, lane, index, time: t, value: v, merge });
             }
@@ -2007,11 +2069,13 @@ fn lane_area(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, li: usize, lane: &A
             app.act(Action::DeletePoints { owner, lane: li, indices: vec![i] });
         }
     } else if resp.clicked() {
-        app.selected_track = Some(ti);
+        if owner.is_some() {
+            app.selected_track = owner;
+        }
         app.selection.clear();
         if let Some(p) = pointer {
             match near(p) {
-                Some(i) => app.view.auto_sel = Some(AutoSel { track: ti, lane: li, point: i }),
+                Some(i) => app.view.auto_sel = Some(AutoSel { owner, lane: li, point: i }),
                 None => {
                     let t = snap_time(app, ui, app.view.t_of(p.x), project);
                     // On (or near) the line, the point goes on the line; elsewhere where clicked.

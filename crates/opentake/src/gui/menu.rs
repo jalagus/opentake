@@ -45,6 +45,7 @@ pub enum MenuCommand {
     TogglePianoRoll,
     ToggleTab,
     ToggleAutomation,
+    ToggleMasterAutomation,
     ZoomIn,
     ZoomOut,
     ZoomToFit,
@@ -85,6 +86,7 @@ impl MenuCommand {
             Self::TogglePianoRoll => "toggle_piano_roll",
             Self::ToggleTab => "toggle_tab",
             Self::ToggleAutomation => "toggle_automation",
+            Self::ToggleMasterAutomation => "toggle_master_automation",
             Self::ZoomIn => "zoom_in",
             Self::ZoomOut => "zoom_out",
             Self::ZoomToFit => "zoom_to_fit",
@@ -137,6 +139,7 @@ impl MenuCommand {
             Self::TogglePianoRoll => "Piano Roll",
             Self::ToggleTab => "Tablature",
             Self::ToggleAutomation => "Show Automation",
+            Self::ToggleMasterAutomation => "Show Master Automation",
             Self::ZoomIn => "Zoom In",
             Self::ZoomOut => "Zoom Out",
             Self::ZoomToFit => "Zoom to Fit",
@@ -259,7 +262,7 @@ pub const MENUS: &[(&str, &[Option<MenuCommand>])] = {
         ),
         ("Track", &[Some(NewTrack), Some(NewInstrumentTrack), Some(NewBus), Some(NewBusFromSelection), None, Some(DeleteTrack)]),
         ("Transport", &[Some(PlayStop), Some(Record), Some(GoToStart), None, Some(ToggleCycle), Some(ToggleMetronome), Some(ToggleCountIn), Some(ToggleCountInOnPlay), Some(ToggleAutoMonitor)]),
-        ("View", &[Some(ToggleInspector), Some(ToggleMixer), Some(TogglePianoRoll), Some(ToggleTab), Some(ToggleAutomation), None, Some(ZoomIn), Some(ZoomOut), Some(ZoomToFit)]),
+        ("View", &[Some(ToggleInspector), Some(ToggleMixer), Some(TogglePianoRoll), Some(ToggleTab), Some(ToggleAutomation), Some(ToggleMasterAutomation), None, Some(ZoomIn), Some(ZoomOut), Some(ZoomToFit)]),
         ("Audio", &[Some(AudioSettings), None, Some(ToggleAudioEngine)]),
         ("Plug-ins", &[Some(PluginManager), None, Some(RescanPlugins)]),
     ]
@@ -278,6 +281,7 @@ pub struct MenuState {
     pub piano_roll_visible: bool,
     /// Some track shows its automation lanes.
     pub automation_visible: bool,
+    pub master_automation_visible: bool,
     /// Labels of the steps undo/redo would apply.
     pub undo: Option<String>,
     pub redo: Option<String>,
@@ -319,6 +323,7 @@ impl MenuState {
             MenuCommand::TogglePianoRoll => Some(self.piano_roll_visible),
             MenuCommand::ToggleTab => Some(self.tab_visible),
             MenuCommand::ToggleAutomation => Some(self.automation_visible),
+            MenuCommand::ToggleMasterAutomation => Some(self.master_automation_visible),
             _ => None,
         }
     }
@@ -465,6 +470,7 @@ mod native {
                                     | MenuCommand::TogglePianoRoll
                                     | MenuCommand::ToggleTab
                                     | MenuCommand::ToggleAutomation
+                                    | MenuCommand::ToggleMasterAutomation
                             ) {
                                 let item = CheckMenuItem::with_id(cmd.id(), cmd.label(), true, true, accel);
                                 sub.append(&item)?;

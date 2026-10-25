@@ -482,7 +482,7 @@ mod tests {
         // Looped clip: beats 4..12 at 120 bpm = 2..6 s; first pass starts one beat in.
         let c: Vec<(f64, f64, f64)> = drums.clips.iter().map(|c| (c.position_secs, c.length_secs, c.source_offset_secs)).collect();
         assert_eq!(c[..3], [(2.0, 1.5, 0.5), (3.5, 2.0, 0.0), (5.5, 0.5, 0.0)]);
-        assert_eq!((drums.clips[0].file.to_str(), drums.clips[0].gain), (Some("/proj/Samples/Imported/break.wav"), 0.8));
+        assert_eq!((drums.clips[0].file.as_path(), drums.clips[0].gain), (Path::new("/proj/Samples/Imported/break.wav"), 0.8));
         // Unwarped clip at beat 16 = 8 s (tempo drops to 60 there): 4 beats = 4 s, offset in seconds.
         let vox = &drums.clips[3];
         assert_eq!((vox.position_secs, vox.length_secs, vox.source_offset_secs, vox.mute), (8.0, 4.0, 0.5, true));

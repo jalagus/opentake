@@ -194,6 +194,8 @@ pub(crate) enum Action {
     SetParam(usize, SlotRef, u32, f64),
     /// Show or hide automation under a track (`None` = every track).
     ShowAutomation { track: Option<usize>, show: bool },
+    /// Show or hide the master bus's automation lanes.
+    ShowMasterAutomation(bool),
     /// New lane for `target` (`None` = the next thing without one).
     AddLane { owner: LaneOwner, target: Option<AutomationTarget> },
     RemoveLane { owner: LaneOwner, lane: usize },
@@ -410,15 +412,16 @@ impl DawApp {
         let project = e.project().clone();
         // The parameter lists are re-read when the plug-ins change, and every few seconds.
         let mut auto_params = HashMap::new();
-        for (i, t) in project.tracks.iter().enumerate().filter(|(_, t)| t.show_automation) {
-            let sig: Vec<u32> = t.slots().map(|s| s.id).collect();
-            if !cache.get(&t.id).is_some_and(|(s, at, _)| *s == sig && at.elapsed() < Duration::from_secs(3)) {
-                if let Ok(list) = e.automation_params(Some(i)) {
-                    cache.insert(t.id, (sig, Instant::now(), list));
+        let shown = project.tracks.iter().enumerate().filter(|(_, t)| t.show_automation).map(|(i, t)| (Some(i), t.id, t.slots().map(|s| s.id).collect::<Vec<u32>>()));
+        let master = project.show_master_automation.then(|| (None, u64::MAX, project.master_plugins.iter().map(|s| s.id).collect()));
+        for (owner, id, sig) in shown.chain(master) {
+            if !cache.get(&id).is_some_and(|(s, at, _)| *s == sig && at.elapsed() < Duration::from_secs(3)) {
+                if let Ok(list) = e.automation_params(owner) {
+                    cache.insert(id, (sig, Instant::now(), list));
                 }
             }
-            if let Some((_, _, list)) = cache.get(&t.id) {
-                auto_params.insert(i, list.clone());
+            if let Some((_, _, list)) = cache.get(&id) {
+                auto_params.insert(owner.unwrap_or(MASTER_UI), list.clone());
             }
         }
         let mut waveforms = HashMap::new();
@@ -763,6 +766,7 @@ impl DawApp {
                 }
             }
             Action::ShowAutomation { track, show } => e.set_automation_shown(track, show)?,
+            Action::ShowMasterAutomation(show) => e.set_master_automation_shown(show)?,
             Action::AddLane { owner, target } => {
                 let target = match target {
                     Some(t) => t,
@@ -783,9 +787,7 @@ impl DawApp {
             }
             Action::AddPoint { owner, lane, time, value } => {
                 let point = e.insert_point(owner, lane, opentake_engine::project::AutomationPoint::new(time, value))?;
-                if let Some(track) = owner {
-                    self.view.auto_sel = Some(timeline::AutoSel { track, lane, point });
-                }
+                self.view.auto_sel = Some(timeline::AutoSel { owner, lane, point });
             }
             Action::MovePoint { owner, lane, index, time, value, merge } => e.move_point(owner, lane, index, time, value, Some(merge))?,
             Action::DeletePoints { owner, lane, indices } => {
@@ -813,7 +815,11 @@ impl DawApp {
     /// After undo/redo, drop selections that no longer point at anything.
     fn validate_selection(&mut self, e: &Engine) {
         let p = e.project();
-        if self.view.auto_sel.is_some_and(|s| p.tracks.get(s.track).and_then(|t| t.automation.get(s.lane)).is_none_or(|l| s.point >= l.points.len())) {
+        let lanes = |owner: Option<usize>| match owner {
+            Some(t) => p.tracks.get(t).map(|t| &t.automation),
+            None => Some(&p.master_automation),
+        };
+        if self.view.auto_sel.is_some_and(|s| lanes(s.owner).and_then(|l| l.get(s.lane)).is_none_or(|l| s.point >= l.points.len())) {
             self.view.auto_sel = None;
         }
         if self.selected_track.is_some_and(|t| t >= p.tracks.len()) {
@@ -961,7 +967,7 @@ impl DawApp {
     /// priority over the selected region.
     fn delete_selection(&mut self, snap: &Snapshot) {
         if let Some(s) = self.view.auto_sel.take() {
-            self.act(Action::DeletePoints { owner: Some(s.track), lane: s.lane, indices: vec![s.point] });
+            self.act(Action::DeletePoints { owner: s.owner, lane: s.lane, indices: vec![s.point] });
             return;
         }
         if self.bottom == Some(BottomTab::PianoRoll) && !self.piano.selected.is_empty() {
@@ -1205,6 +1211,7 @@ impl DawApp {
             tab_visible: self.bottom == Some(BottomTab::Tab),
             piano_roll_visible: self.bottom == Some(BottomTab::PianoRoll),
             automation_visible: snap.project.tracks.iter().any(|t| t.show_automation),
+            master_automation_visible: snap.project.show_master_automation,
             snap_on: self.snap_mode != timeline::SnapMode::Off,
             metronome_on: snap.project.metronome_enabled,
             count_in_on: snap.project.count_in_bars > 0,
@@ -1445,6 +1452,7 @@ impl DawApp {
             MenuCommand::ToggleInspector => self.show_inspector = !self.show_inspector,
             MenuCommand::ToggleMixer => self.toggle_bottom(BottomTab::Mixer),
             MenuCommand::ToggleAutomation => self.toggle_automation(snap),
+            MenuCommand::ToggleMasterAutomation => self.act(Action::ShowMasterAutomation(!snap.project.show_master_automation)),
             MenuCommand::TogglePianoRoll => self.toggle_bottom(BottomTab::PianoRoll),
             MenuCommand::ToggleTab => self.toggle_bottom(BottomTab::Tab),
             MenuCommand::ZoomIn => self.view.zoom_by(timeline::ZOOM_STEP, snap.status.position_secs),
@@ -2595,6 +2603,41 @@ mod tests {
         harness.step();
         assert!(!engine.lock().unwrap().project().tracks[0].show_automation);
         assert!(harness.query_by_label("Automation Guitar Volume").is_none());
+    }
+
+    #[test]
+    fn master_automation_lanes_below_the_tracks() {
+        let (mut harness, engine) = harness_with_track();
+        // The master strip's A shows the master's lanes (starting with volume).
+        harness.state_mut().bottom = Some(BottomTab::Mixer);
+        harness.step();
+        harness.step();
+        harness.get_all_by_label("Show Master Automation").next().unwrap().click();
+        harness.step();
+        harness.step();
+        let master = |e: &SharedEngine| e.lock().unwrap().project().master_automation.clone();
+        assert!(engine.lock().unwrap().project().show_master_automation);
+        assert_eq!(master(&engine).len(), 1);
+        harness.state_mut().bottom = None;
+        harness.step();
+        harness.step();
+        let lane = harness.get_by_label("Automation Stereo Out Volume").rect();
+        assert!(lane.top() > harness.get_by_label("Lane Guitar").rect().bottom(), "below the tracks");
+        assert_eq!(harness.state().view.track_at(lane.center().y), None, "not part of a track");
+
+        let at = egui::pos2(harness.state().view.x(3.0), lane.center().y);
+        click_at(&mut harness, at);
+        let p = master(&engine)[0].points.clone();
+        assert_eq!(p.len(), 1);
+        assert!((p[0].time_secs - 3.0).abs() < 0.03, "{p:?}");
+        assert_eq!(harness.state().view.auto_sel.map(|s| s.owner), Some(None), "a master point is selected");
+        harness.key_press(egui::Key::Backspace);
+        harness.step();
+        harness.step();
+        assert!(master(&engine)[0].points.is_empty(), "⌫ deletes it");
+
+        click(&mut harness, "Hide Master Automation");
+        assert!(harness.query_by_label("Automation Stereo Out Volume").is_none());
     }
 
     #[test]

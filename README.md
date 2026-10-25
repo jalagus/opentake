@@ -121,7 +121,8 @@ agent.
 - **Buses**: Track → New Bus (or Create Bus from Selection), then pick a track's Output in
   the inspector or mixer; effects on the bus process the whole group.
 - **Automation**: the **A** button in a track header (or **A** for all tracks, View → Show
-  Automation, or the track's context menu) shows its automation lanes right under it. Pick what a
+  Automation, or the track's context menu) shows its automation lanes right under it; the **A**
+  on the Stereo Out strip (or View → Show Master Automation) shows the master's below the tracks. Pick what a
   lane moves (volume, pan, mute or any plug-in parameter) in its header, click to add points
   (snapped), drag them (Shift: fine), double-click or ⌫ to delete; right-click a point for its
   curve (linear, hold, smooth, fast start/end). In Read, faders and knobs follow the lane; moved
@@ -283,8 +284,8 @@ automation other than tempo, sends/returns and fades aren't imported.
 - Buses: no sends yet (each track feeds one bus or the master); stems export what reaches the
   master (a bus is one stem, its sources are inside it).
 - Automation: plug-in parameters change once per 64-sample block (fader, pan and mute ramp
-  within it), so changes land within ~1.3 ms of their point; master automation has no lanes in
-  the GUI yet (use MCP); plug-in editor windows don't follow automated values; no automation of
+  within it), so changes land within ~1.3 ms of their point; plug-in editor windows don't follow
+  automated values; no automation of
   sends (there are none) or of region gain, and Touch/Latch only record from the GUI.
 - No built-in reverb yet (EQ, compressor, multiband compressor, limiter and delay are built in; any VST3 reverb works).
 

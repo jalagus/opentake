@@ -749,7 +749,8 @@ mod tests {
         // Outer clip at beat 8 (4 s), playStart 2 beats into the inner timeline: the audio
         // (warped 8 beats -> 4 s, i.e. natural speed at 120) starts 1 s in.
         let c = &clips[0];
-        assert_eq!((c.file.to_str(), c.position_secs, c.length_secs, c.source_offset_secs), (Some("/media/audio/drums.wav"), 4.0, 2.0, 1.0));
+        // Compared as paths: joined paths use the platform's separator.
+        assert_eq!((c.file.as_path(), c.position_secs, c.length_secs, c.source_offset_secs), (Path::new("/media/audio/drums.wav"), 4.0, 2.0, 1.0));
         assert_eq!(c.name, "Drumfunk");
         assert!(clips[1].mute && clips[1].position_secs == 8.0 && clips[1].file == Path::new("/elsewhere/missing.wav"));
     }

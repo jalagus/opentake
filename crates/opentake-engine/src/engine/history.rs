@@ -166,6 +166,7 @@ impl Engine {
         target.count_in_bars = self.project.count_in_bars;
         target.count_in_on_play = self.project.count_in_on_play;
         target.auto_input_monitoring = self.project.auto_input_monitoring;
+        target.show_master_automation = self.project.show_master_automation;
         target.sample_rate = self.project.sample_rate;
         // Whether a track shows its automation is a view setting too.
         for t in &mut target.tracks {

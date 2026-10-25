@@ -319,6 +319,16 @@ impl Engine {
         Ok(())
     }
 
+    /// Show or hide the master bus's automation lanes (a view setting). Shown without lanes,
+    /// it gets a volume lane.
+    pub fn set_master_automation_shown(&mut self, show: bool) -> Result<()> {
+        self.project.show_master_automation = show;
+        if show && self.project.master_automation.is_empty() {
+            self.add_lane(None, AutomationTarget::Volume)?;
+        }
+        Ok(())
+    }
+
     // ---------------------------------------------------------------- audio thread
 
     /// The envelopes the audio thread plays for a track or the master: active lanes, minus
