@@ -5,6 +5,7 @@
 //! diff two project states and update only what changed on the audio thread.
 
 mod analysis;
+mod export;
 mod guitarpro;
 mod history;
 mod midi;
@@ -31,6 +32,7 @@ use crate::recorder::{RecordTarget, Recorder};
 
 pub use guitarpro::{GuitarProImport, GuitarProSummary, GuitarProTrackInfo, inspect as inspect_guitar_pro};
 pub use analysis::{LevelReport, MixJob, MixReport};
+pub use export::{AudioFormat, ExportOptions, ExportReport, ExportedFile, SAMPLE_RATES};
 pub use history::HistoryInfo;
 pub use midi::MidiClipUpdate;
 pub use plugins::SlotRef;

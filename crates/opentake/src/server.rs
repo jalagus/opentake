@@ -106,6 +106,28 @@ pub struct GetMidiNotesArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExportAudioArgs {
+    /// Where to write the full mix (the extension is added when missing). Omit to skip it.
+    pub mix_path: Option<String>,
+    /// Folder for one file per audible track ("01 Drums.wav", ...). Omit to skip stems.
+    pub stems_dir: Option<String>,
+    /// "wav" (default) or "flac".
+    pub format: Option<String>,
+    /// 16 (dithered), 24 (default) or 32 (float, WAV only).
+    pub bit_depth: Option<u16>,
+    /// 44100, 48000 (default), 88200, 96000, 176400 or 192000.
+    pub sample_rate: Option<u32>,
+    /// Start of the range (seconds); with to_secs. Omit both for the whole song.
+    pub from_secs: Option<f64>,
+    pub to_secs: Option<f64>,
+    /// Export the cycle range instead of the whole song.
+    #[serde(default)]
+    pub cycle: bool,
+    /// Extra seconds after the end for delay repeats and other tails (default 1).
+    pub tail_secs: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AnalyzeMixArgs {
     /// Start of the range to analyze (seconds); default the song start.
     pub from_secs: Option<f64>,
@@ -539,6 +561,48 @@ impl DawServer {
             Ok(json!({ "region": clip.name, "position_secs": clip.position_secs, "length_secs": clip.length_secs, "count": notes.len(), "notes": notes }))
         })
         .await
+    }
+
+    #[tool(description = "Export audio: the full mix and/or one stem per audible track, as WAV (16-bit dithered, 24-bit, 32-bit float) or FLAC (16/24-bit), at a chosen sample rate, for the whole song, the cycle or a time range, with a tail for delay repeats. Rendered offline (faster than real time) with all instruments, effects, faders and master processing. Returns the files with their peak, loudness and any clipped samples.")]
+    async fn export_audio(&self, Parameters(a): Parameters<ExportAudioArgs>) -> ToolResult {
+        let format = match a.format.as_deref().map(str::to_lowercase).as_deref() {
+            None | Some("wav") => opentake_engine::AudioFormat::Wav,
+            Some("flac") => opentake_engine::AudioFormat::Flac,
+            Some(other) => return Err(format!("unknown format '{other}' (use wav or flac)")),
+        };
+        let engine = self.engine.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let (job, options) = {
+                let mut e = engine.lock().map_err(|_| anyhow::anyhow!("engine lock poisoned"))?;
+                let p = e.project();
+                let range = if a.cycle {
+                    anyhow::ensure!(p.loop_end_secs > p.loop_start_secs, "there's no cycle range set");
+                    Some((p.loop_start_secs, p.loop_end_secs))
+                } else {
+                    match (a.from_secs, a.to_secs) {
+                        (Some(f), Some(t)) => Some((f, t)),
+                        (None, None) => None,
+                        _ => anyhow::bail!("give both from_secs and to_secs (or neither)"),
+                    }
+                };
+                let options = opentake_engine::ExportOptions {
+                    format,
+                    bit_depth: a.bit_depth.unwrap_or(24),
+                    sample_rate: a.sample_rate.unwrap_or(48_000),
+                    mix_path: a.mix_path.map(PathBuf::from),
+                    stems_dir: a.stems_dir.map(PathBuf::from),
+                    range,
+                    tail_secs: a.tail_secs.unwrap_or(1.0),
+                };
+                (e.export_job(&options)?, options)
+            };
+            // Render and write without holding the engine.
+            job.export(&options)
+        })
+        .await
+        .map_err(|e| format!("export failed: {e}"))?;
+        let report = result.map_err(|e| format!("{e:#}"))?;
+        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
     }
 
     #[tool(description = "Render the mix offline and measure it: per track and for the master — peak (dBFS), integrated loudness (LUFS, BS.1770), energy per frequency band, and loudness through a simulated phone speaker. Use it to balance levels/EQ by numbers: similar phone_drop across tracks means the balance holds on small speakers; keep the master peak below -1 dBFS (clipped_samples 0). Built-in instruments and EQs are rendered; VST3 plug-ins are listed in warnings.")]

@@ -7,6 +7,7 @@
 mod menu;
 mod mixer;
 mod eq_view;
+mod export_view;
 mod fx_view;
 mod piano_roll;
 mod tab_view;
@@ -195,6 +196,9 @@ pub(crate) struct DawApp {
     show_instrument_picker: bool,
     /// Open "Import Guitar Pro" dialog.
     pub gp_import: Option<GpImportDialog>,
+    /// Open "Export Audio" dialog, and the export running in the background.
+    pub export_dialog: Option<export_view::ExportDialog>,
+    export_task: Option<export_view::ExportTask>,
     /// Where settings are saved; `None` disables persistence (tests).
     settings_path: Option<PathBuf>,
     /// Recently opened/saved projects, newest first.
@@ -251,6 +255,8 @@ impl DawApp {
             show_plugin_manager: false,
             show_instrument_picker: false,
             gp_import: None,
+            export_dialog: None,
+            export_task: None,
             settings_path: None,
             recent: Vec::new(),
             seen_project_path: None,
@@ -1002,6 +1008,7 @@ impl DawApp {
             (Modifiers::COMMAND | Modifiers::SHIFT, Key::S, MenuCommand::SaveAs),
             (Modifiers::COMMAND, Key::S, MenuCommand::Save),
             (Modifiers::COMMAND | Modifiers::SHIFT, Key::I, MenuCommand::ImportAudio),
+            (Modifiers::COMMAND | Modifiers::SHIFT, Key::E, MenuCommand::ExportAudio),
             (Modifiers::COMMAND | Modifiers::ALT, Key::N, MenuCommand::NewTrack),
             (Modifiers::COMMAND, Key::Comma, MenuCommand::AudioSettings),
             (Modifiers::COMMAND, Key::T, MenuCommand::SplitAtPlayhead),
@@ -1098,6 +1105,15 @@ impl DawApp {
                     for file in files {
                         self.act(Action::AddClip { track: self.selected_track, file, position: snap.status.position_secs });
                     }
+                }
+            }
+            MenuCommand::ExportAudio => {
+                if self.export_dialog.is_none() {
+                    let rate = snap.status.sample_rate;
+                    self.export_dialog = Some(export_view::ExportDialog {
+                        sample_rate: if opentake_engine::SAMPLE_RATES.contains(&rate) { rate } else { 48_000 },
+                        ..Default::default()
+                    });
                 }
             }
             MenuCommand::ImportGuitarPro => {
@@ -1852,6 +1868,10 @@ impl eframe::App for DawApp {
         self.plugin_manager_window(ui.ctx(), &snap);
         self.instrument_picker_window(ui.ctx(), &snap);
         self.guitar_pro_window(ui.ctx(), &snap);
+        self.export_window(ui.ctx(), &snap);
+        if self.export_task.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
         self.apply_actions();
         // Keep meters, playhead and agent-made changes live.
         ui.request_repaint_after(Duration::from_millis(33));
@@ -2680,6 +2700,38 @@ mod tests {
     }
 
     #[test]
+    fn export_audio_dialog_and_background_export() {
+        let (mut harness, engine) = harness_with_track();
+        {
+            let mut e = engine.lock().unwrap();
+            let t = e.add_instrument_track("Keys", "synth").unwrap();
+            let c = e.add_midi_clip(t, 0.0, 1.0, None).unwrap();
+            e.set_midi_notes(t, c, vec![Note { start_secs: 0.0, length_secs: 0.8, pitch: 60, velocity: 100, tab: None }]).unwrap();
+        }
+        click(&mut harness, "File");
+        click(&mut harness, &menu_label(MenuCommand::ExportAudio));
+        assert!(harness.state().export_dialog.is_some());
+        harness.get_by_label("Full mix");
+        harness.get_by_label("FLAC");
+
+        let dir = std::env::temp_dir().join(format!("opentake-gui-export-{}", std::process::id()));
+        let options = opentake_engine::ExportOptions { mix_path: Some(dir.join("mix.wav")), stems_dir: Some(dir.join("stems")), tail_secs: 0.2, ..Default::default() };
+        harness.state_mut().start_export(options);
+        for _ in 0..600 {
+            harness.step();
+            if harness.state().export_task.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(harness.state().export_task.is_none(), "export finished");
+        assert!(dir.join("mix.wav").exists());
+        assert!(dir.join("stems").join("02 Keys.wav").exists(), "the empty audio track has no stem");
+        assert!(!dir.join("stems").join("01 Guitar.wav").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn tablature_size_and_paper_mode() {
         let (mut harness, engine) = harness_with_track();
         let fixture = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../opentake-project/tests/fixtures/simple.gp"));
@@ -2870,6 +2922,15 @@ mod tests {
             harness.step();
         }
         harness.render().expect("render").save(out.replace(".png", "-eq.png")).expect("save png");
+        if std::env::var("OPENTAKE_SCREENSHOT_EXPORT").is_ok() {
+            harness.state_mut().open_plugins.clear();
+            harness.state_mut().export_dialog = Some(export_view::ExportDialog { stems: true, ..Default::default() });
+            for _ in 0..4 {
+                harness.step();
+            }
+            harness.render().expect("render").save(out.replace(".png", "-export.png")).expect("save png");
+            harness.state_mut().export_dialog = None;
+        }
         if fx_shot {
             // Compressor, limiter and delay editors.
             {

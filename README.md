@@ -22,7 +22,8 @@ you watch the changes appear live — and undo anything you don't like.
 - ⏱️ Project tempo map (tempo and time-signature changes), metronome with count-in
 - ✂️ Region editing: select, move, copy, split, trim, snap, cycle/loop
 - 🎚️ Full mixer, metronome, undo/redo for everything
-- 🤖 MCP server (stdio or HTTP) with 56 tools — the agent and you share one session
+- 💾 Export the mix and stems to WAV or FLAC, faster than real time
+- 🤖 MCP server (stdio or HTTP) with 57 tools — the agent and you share one session
 - 📂 Its own `.otp` project files (double-click to open), and Reaper `.rpp` projects
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
 - 🦀 Real-time safe audio engine: no locks or allocation on the audio thread
@@ -162,6 +163,12 @@ recording) appears live in the window and vice versa.
   final loudness without clipping.
 - **Delay** (built-in **OpenTake Delay**): time in ms or synced to the tempo map (1/32 to 1/1,
   dotted and triplet), feedback, mix, low and high cuts on the repeats, ping-pong.
+- **Export Audio** (File → Export Audio…, ⇧⌘E): the full mix and/or one stem per audible track,
+  as WAV (16-bit with dither, 24-bit or 32-bit float) or FLAC (16/24-bit), at 44.1–192 kHz,
+  for the whole song or the cycle range, with a tail for delay repeats. It renders offline in
+  the background (a 4-minute song with stems takes a few seconds) with every instrument,
+  effect, fader and master setting, VST3s included. Stems go in a "<name> - Stems" folder next
+  to the mix file; the status bar reports when it's done and warns about clipping.
 - **Plug-in delay compensation**: plug-ins that delay audio (the limiter's look-ahead, VST3s
   that report latency) are compensated automatically — tracks and the master stay in time
   with each other and the playhead, also across cycle loops. The status bar shows the delay
@@ -241,7 +248,7 @@ of the tool calls behind them):
 ### Tools
 
 `get_status`, `list_audio_devices`, `start_audio`, `stop_audio`, `undo`, `redo`, `get_history`,
-`get_project`, `get_midi_notes`, `analyze_mix`, `new_project`, `load_project`, `save_project`, `set_tempo`, `set_tempo_map`, `get_tempo_map`, `convert_time`,
+`get_project`, `get_midi_notes`, `analyze_mix`, `export_audio`, `new_project`, `load_project`, `save_project`, `set_tempo`, `set_tempo_map`, `get_tempo_map`, `convert_time`,
 `set_master_volume`, `set_metronome`, `set_count_in`, `set_loop`,
 `add_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `remove_clip`,
 `play`, `stop`, `seek`, `record`,
@@ -294,7 +301,6 @@ back on export, but they aren't applied to the loaded plugin.
   (note events on the event bus) but has only been tested with the built-in synth.
 - GUI: no plugin editor windows (generic parameter sliders instead), no region fades,
   multi-selection or undo yet.
-- Offline bounce/render to file.
 - No built-in reverb yet (EQ, compressor, limiter and delay are built in; any VST3 reverb works).
 
 ## Development

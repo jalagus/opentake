@@ -16,6 +16,7 @@ pub enum MenuCommand {
     SaveAs,
     ImportAudio,
     ImportGuitarPro,
+    ExportAudio,
     Undo,
     Redo,
     SplitAtPlayhead,
@@ -66,6 +67,7 @@ impl MenuCommand {
             Self::SaveAs => "save_as",
             Self::ImportAudio => "import_audio",
             Self::ImportGuitarPro => "import_guitar_pro",
+            Self::ExportAudio => "export_audio",
             Self::Undo => "undo",
             Self::Redo => "redo",
             Self::NewInstrumentTrack => "new_instrument_track",
@@ -111,6 +113,7 @@ impl MenuCommand {
             Self::SaveAs => "Save As…",
             Self::ImportAudio => "Import Audio File…",
             Self::ImportGuitarPro => "Import Guitar Pro…",
+            Self::ExportAudio => "Export Audio…",
             Self::Undo => "Undo",
             Self::Redo => "Redo",
             Self::NewInstrumentTrack => "New Instrument Track…",
@@ -153,6 +156,7 @@ impl MenuCommand {
             Self::Save => Some("CmdOrCtrl+S"),
             Self::SaveAs => Some("CmdOrCtrl+Shift+S"),
             Self::ImportAudio => Some("CmdOrCtrl+Shift+I"),
+            Self::ExportAudio => Some("CmdOrCtrl+Shift+E"),
             // Text fields still get ⌘Z: the app forwards it to them when one has focus.
             Self::Undo => Some("CmdOrCtrl+Z"),
             Self::Redo => Some("CmdOrCtrl+Shift+Z"),
@@ -176,6 +180,7 @@ impl MenuCommand {
             Self::Save => if mac { "⌘S" } else { "Ctrl+S" },
             Self::SaveAs => if mac { "⇧⌘S" } else { "Ctrl+Shift+S" },
             Self::ImportAudio => if mac { "⇧⌘I" } else { "Ctrl+Shift+I" },
+            Self::ExportAudio => if mac { "⇧⌘E" } else { "Ctrl+Shift+E" },
             Self::Undo => if mac { "⌘Z" } else { "Ctrl+Z" },
             Self::Redo => if mac { "⇧⌘Z" } else { "Ctrl+Shift+Z" },
             Self::ToggleMixer => "X",
@@ -216,7 +221,7 @@ impl MenuCommand {
 pub const MENUS: &[(&str, &[Option<MenuCommand>])] = {
     use MenuCommand::*;
     &[
-        ("File", &[Some(NewProject), Some(Open), Some(RecentMenu), None, Some(Save), Some(SaveAs), None, Some(ImportAudio), Some(ImportGuitarPro)]),
+        ("File", &[Some(NewProject), Some(Open), Some(RecentMenu), None, Some(Save), Some(SaveAs), None, Some(ImportAudio), Some(ImportGuitarPro), None, Some(ExportAudio)]),
         (
             "Edit",
             &[

@@ -16,3 +16,4 @@ crossbeam-channel.workspace = true
 serde.workspace = true
 opentake-project.workspace = true
 serde_json.workspace = true
+flacenc.workspace = true

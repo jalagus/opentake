@@ -34,6 +34,7 @@ rfd = "0.17"
 dirs = "7"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 roxmltree = "0.21"
+flacenc = "0.5"
 
 [profile.release]
 lto = "thin"

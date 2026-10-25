@@ -1,28 +1,24 @@
-//! Offline mix analysis: renders the project (MIDI through the built-in instruments, audio
-//! regions, built-in EQs, faders, pans, master) and measures each track and the master:
-//! peak, integrated loudness (ITU BS.1770, gated), energy per frequency band, and how much
-//! loudness survives a phone speaker. Lets an agent (or a person) balance a mix by numbers.
-//!
-//! [`Engine::mix_job`] takes a snapshot under the engine lock; [`MixJob::analyze`] does the
-//! heavy work without it, so the GUI keeps running.
+//! Offline rendering and mix analysis. [`Engine::mix_job`] snapshots the project under the
+//! engine lock — media at the render rate and a separate processor for every instrument
+//! and effect (built-ins created fresh, VST3s as new instances), so the live audio thread is
+//! never touched. [`MixJob::render`] then renders without the lock: MIDI through the
+//! instruments, audio regions, effect chains (with plug-in delay compensation), faders,
+//! pans and the master. Analysis measures the result (peak, BS.1770 loudness, energy per
+//! band, phone-speaker translation); export writes it to files (see `export.rs`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use opentake_project::{PluginFormat, PluginSlot, Project, TempoMap, Track};
+use opentake_project::{Project, TempoMap};
 use serde::Serialize;
 
 use super::Engine;
-use crate::delay::{self, Delay};
-use crate::drums::{self, DrumSynth};
-use crate::dynamics::{Compressor, Limiter, comp, limiter};
-use crate::eq::{self, Eq};
 use crate::media::AudioData;
 use crate::mixer::{MidiEvent, Processor, Transport};
-use crate::synth::{self, Synth};
 
-const SR: f64 = 48_000.0;
+/// Analysis render rate.
+const ANALYSIS_RATE: f64 = 48_000.0;
 const BLOCK: usize = 512;
 
 /// Frequency bands reported (label, low Hz, high Hz).
@@ -59,33 +55,87 @@ pub struct MixReport {
     pub master: LevelReport,
     /// Master samples above 0 dBFS (clipping).
     pub clipped_samples: usize,
-    /// What couldn't be rendered offline (e.g. VST3 plug-ins), so the numbers exclude it.
+    /// What couldn't be rendered (e.g. a missing plug-in), so the numbers exclude it.
     pub warnings: Vec<String>,
+}
+
+/// A track's offline processors.
+struct TrackProcessors {
+    instrument: Option<Box<dyn Processor>>,
+    effects: Vec<Box<dyn Processor>>,
 }
 
 /// Everything needed to render the mix, taken from the engine.
 pub struct MixJob {
     project: Project,
+    sample_rate: f64,
     media: Vec<(PathBuf, Arc<AudioData>)>,
+    tracks: Vec<TrackProcessors>,
+    master: Vec<Box<dyn Processor>>,
     warnings: Vec<String>,
 }
 
+/// The rendered audio: each track after its fader and pan, and the master.
+pub struct Rendered {
+    pub sample_rate: f64,
+    pub from_secs: f64,
+    /// (track name, [left, right], audible in the mix).
+    pub tracks: Vec<(String, [Vec<f32>; 2], bool)>,
+    pub master: [Vec<f32>; 2],
+    pub warnings: Vec<String>,
+}
+
 impl Engine {
-    /// Snapshot the project (and load its media) for [`MixJob::analyze`].
-    pub fn mix_job(&mut self) -> MixJob {
-        let mut media = Vec::new();
+    /// Snapshot the project for offline rendering at `sample_rate`.
+    pub fn mix_job_at(&mut self, sample_rate: f64) -> MixJob {
+        let sr = sample_rate.clamp(8_000.0, 384_000.0);
         let mut warnings = Vec::new();
+        let mut media = Vec::new();
         let files: Vec<PathBuf> = self.project.tracks.iter().flat_map(|t| &t.clips).map(|c| c.file.clone()).collect();
         for file in files {
             if media.iter().any(|(f, _)| *f == file) {
                 continue;
             }
-            match self.load_media(&file, SR as u32) {
+            match self.load_media(&file, sr as u32) {
                 Ok(d) => media.push((file, d)),
                 Err(e) => warnings.push(format!("{}: {e:#}", file.display())),
             }
         }
-        MixJob { project: self.project.clone(), media, warnings }
+        let project = self.project.clone();
+        let mut tracks = Vec::new();
+        for t in &project.tracks {
+            let instrument = match t.instrument.as_ref().filter(|s| !s.bypass) {
+                Some(slot) => match self.offline_processor(slot, sr) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        warnings.push(format!("track '{}': instrument '{}' not rendered: {e:#}", t.name, slot.name));
+                        None
+                    }
+                },
+                None => None,
+            };
+            let mut effects = Vec::new();
+            for slot in t.plugins.iter().filter(|s| !s.bypass) {
+                match self.offline_processor(slot, sr) {
+                    Ok(p) => effects.push(p),
+                    Err(e) => warnings.push(format!("track '{}': '{}' not rendered: {e:#}", t.name, slot.name)),
+                }
+            }
+            tracks.push(TrackProcessors { instrument, effects });
+        }
+        let mut master = Vec::new();
+        for slot in project.master_plugins.iter().filter(|s| !s.bypass) {
+            match self.offline_processor(slot, sr) {
+                Ok(p) => master.push(p),
+                Err(e) => warnings.push(format!("master: '{}' not rendered: {e:#}", slot.name)),
+            }
+        }
+        MixJob { project, sample_rate: sr, media, tracks, master, warnings }
+    }
+
+    /// Snapshot for analysis (48 kHz).
+    pub fn mix_job(&mut self) -> MixJob {
+        self.mix_job_at(ANALYSIS_RATE)
     }
 
     /// Analyze the mix (convenience for callers that don't mind holding the engine).
@@ -96,49 +146,71 @@ impl Engine {
 
 impl MixJob {
     /// Render `from..to` seconds (default: the whole project) and measure it.
-    pub fn analyze(mut self, from: Option<f64>, to: Option<f64>) -> Result<MixReport> {
+    pub fn analyze(self, from: Option<f64>, to: Option<f64>) -> Result<MixReport> {
+        let r = self.render(from, to, 0.0);
+        let sr = r.sample_rate;
+        let tracks = r.tracks.iter().map(|(name, [l, rr], _)| measure(name, l, rr, sr)).collect();
+        let clipped_samples = r.master.iter().flatten().filter(|v| v.abs() > 1.0).count();
+        let master = measure("Master", &r.master[0], &r.master[1], sr);
+        let len = r.master[0].len() as f64 / sr;
+        Ok(MixReport { from_secs: r.from_secs, to_secs: r.from_secs + len, tracks, master, clipped_samples, warnings: r.warnings })
+    }
+
+    /// The project's end (seconds).
+    pub fn length_secs(&self) -> f64 {
+        self.project.length_secs()
+    }
+
+    /// The cycle range, if one is set.
+    pub fn cycle(&self) -> Option<(f64, f64)> {
+        let p = &self.project;
+        (p.loop_end_secs > p.loop_start_secs).then_some((p.loop_start_secs, p.loop_end_secs))
+    }
+
+    pub fn project_name(&self) -> &str {
+        &self.project.name
+    }
+
+    /// Render `from..to` seconds (default: the whole project) plus `tail` seconds.
+    pub fn render(mut self, from: Option<f64>, to: Option<f64>, tail: f64) -> Rendered {
+        let sr = self.sample_rate;
         let end = self.project.length_secs();
-        let from = from.unwrap_or(0.0).clamp(0.0, end);
-        let to = to.unwrap_or(end + 1.0).max(from + 0.5);
-        let (start, len) = ((from * SR) as usize, ((to - from) * SR) as usize);
+        let from = from.unwrap_or(0.0).clamp(0.0, end.max(0.0));
+        let to = to.unwrap_or(end).max(from + 0.1) + tail.max(0.0);
+        let (start, len) = ((from * sr) as usize, ((to - from) * sr) as usize);
         let any_solo = self.project.tracks.iter().any(|t| t.solo);
         let map = self.project.tempo_map();
         let mut mix = [vec![0.0f32; len], vec![0.0f32; len]];
         let mut tracks = Vec::new();
-        for track in &self.project.tracks {
-            let mono = render_track(track, start, len, &self.media, &mut self.warnings, &map);
+        let procs = std::mem::take(&mut self.tracks);
+        for (track, mut p) in self.project.tracks.iter().zip(procs) {
+            let [mut l, mut r] = [vec![0.0f32; len], vec![0.0f32; len]];
+            render_audio_regions(track, start, sr, &self.media, &mut l, &mut r);
+            if let Some(inst) = p.instrument.as_mut() {
+                render_midi(track, inst.as_mut(), start, sr, &map, &mut l, &mut r);
+            }
+            for fx in &mut p.effects {
+                process_stereo(fx.as_mut(), &mut l, &mut r, &map, start, sr);
+            }
             let (gl, gr) = pan_gains(track.volume, track.pan);
-            let l: Vec<f32> = mono.iter().map(|v| v * gl).collect();
-            let r: Vec<f32> = mono.iter().map(|v| v * gr).collect();
-            if !track.mute && (!any_solo || track.solo) {
+            l.iter_mut().for_each(|v| *v *= gl);
+            r.iter_mut().for_each(|v| *v *= gr);
+            let audible = !track.mute && (!any_solo || track.solo);
+            if audible {
                 for i in 0..len {
                     mix[0][i] += l[i];
                     mix[1][i] += r[i];
                 }
             }
-            tracks.push(measure(&track.name, &l, &r));
+            tracks.push((track.name.clone(), [l, r], audible));
         }
-        for slot in &self.project.master_plugins {
-            if slot.bypass {
-                continue;
-            }
-            match builtin_effect(slot) {
-                Some(mut fx) => {
-                    let [l, r] = &mut mix;
-                    process_stereo(fx.as_mut(), l, r, &map, start);
-                }
-                None => self.warnings.push(format!("master: '{}' isn't rendered offline (only built-in effects are)", slot.name)),
-            }
+        for fx in &mut self.master {
+            let [l, r] = &mut mix;
+            process_stereo(fx.as_mut(), l, r, &map, start, sr);
         }
         let g = self.project.master_volume;
-        for ch in &mut mix {
-            for s in ch.iter_mut() {
-                *s *= g;
-            }
-        }
-        let clipped_samples = mix.iter().flatten().filter(|v| v.abs() > 1.0).count();
-        let master = measure("Master", &mix[0], &mix[1]);
-        Ok(MixReport { from_secs: from, to_secs: to, tracks, master, clipped_samples, warnings: self.warnings })
+        mix.iter_mut().flatten().for_each(|v| *v *= g);
+        Rendered { sample_rate: sr, from_secs: from, tracks, master: mix, warnings: self.warnings }
     }
 }
 
@@ -148,46 +220,14 @@ fn pan_gains(volume: f32, pan: f32) -> (f32, f32) {
     (volume * (1.0 - pan).min(1.0), volume * (1.0 + pan).min(1.0))
 }
 
-fn builtin_instrument(slot: &PluginSlot) -> Option<Box<dyn Processor>> {
-    if slot.format != PluginFormat::Builtin {
-        return None;
-    }
-    let mut p: Box<dyn Processor> = match slot.path.as_str() {
-        synth::PATH => Box::new(Synth::new(SR)),
-        drums::PATH => Box::new(DrumSynth::new(SR)),
-        _ => return None,
-    };
-    for &(id, v) in &slot.params {
-        p.set_param(id, v);
-    }
-    Some(p)
-}
-
-fn builtin_effect(slot: &PluginSlot) -> Option<Box<dyn Processor>> {
-    if slot.format != PluginFormat::Builtin {
-        return None;
-    }
-    let mut p: Box<dyn Processor> = match slot.path.as_str() {
-        eq::PATH => Box::new(Eq::new(SR)),
-        comp::PATH => Box::new(Compressor::new(SR, None)),
-        limiter::PATH => Box::new(Limiter::new(SR, None)),
-        delay::PATH => Box::new(Delay::new(SR)),
-        _ => return None,
-    };
-    for &(id, v) in &slot.params {
-        p.set_param(id, v);
-    }
-    Some(p)
-}
-
 /// Run an effect over a whole stereo buffer (starting `offset` samples into the song, for
 /// the tempo), then shift the result back by the effect's latency, as the mixer's
 /// delay compensation does.
-fn process_stereo(p: &mut dyn Processor, l: &mut [f32], r: &mut [f32], map: &TempoMap, offset: usize) {
+fn process_stereo(p: &mut dyn Processor, l: &mut [f32], r: &mut [f32], map: &TempoMap, offset: usize, sr: f64) {
     let (mut ol, mut or) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
     for start in (0..l.len()).step_by(BLOCK) {
         let n = BLOCK.min(l.len() - start);
-        let t = Transport { tempo_bpm: map.tempo_at((offset + start) as f64 / SR), ..Transport::default() };
+        let t = Transport { tempo_bpm: map.tempo_at((offset + start) as f64 / sr), playing: true, position_samples: (offset + start) as i64, ..Transport::default() };
         {
             let inputs: [&[f32]; 2] = [&l[start..start + n], &r[start..start + n]];
             let mut outputs: [&mut [f32]; 2] = [&mut ol[..n], &mut or[..n]];
@@ -206,15 +246,13 @@ fn process_stereo(p: &mut dyn Processor, l: &mut [f32], r: &mut [f32], map: &Tem
     }
 }
 
-/// One track before fader/pan (mono sum of its stereo output).
-fn render_track(track: &Track, start: usize, len: usize, media: &[(PathBuf, Arc<AudioData>)], warnings: &mut Vec<String>, map: &TempoMap) -> Vec<f32> {
-    let (mut l, mut r) = (vec![0.0f32; len], vec![0.0f32; len]);
-    // Audio regions.
+fn render_audio_regions(track: &opentake_project::Track, start: usize, sr: f64, media: &[(PathBuf, Arc<AudioData>)], l: &mut [f32], r: &mut [f32]) {
+    let len = l.len();
     for clip in track.clips.iter().filter(|c| !c.mute) {
         let Some((_, data)) = media.iter().find(|(f, _)| *f == clip.file) else { continue };
-        let clip_start = (clip.position_secs * SR) as i64;
-        let offset = (clip.source_offset_secs * SR) as i64;
-        let clip_len = (clip.length_secs * SR) as i64;
+        let clip_start = (clip.position_secs * sr) as i64;
+        let offset = (clip.source_offset_secs * sr) as i64;
+        let clip_len = (clip.length_secs * sr) as i64;
         let src_l = &data.channels[0];
         let src_r = data.channels.get(1).unwrap_or(src_l);
         for i in 0..len as i64 {
@@ -230,59 +268,51 @@ fn render_track(track: &Track, start: usize, len: usize, media: &[(PathBuf, Arc<
             r[i as usize] += src_r[src] * clip.gain;
         }
     }
-    // MIDI through the instrument (rendered from the song start so voices are in the
-    // right state at `start`, then trimmed).
-    if let Some(slot) = &track.instrument {
-        match builtin_instrument(slot) {
-            Some(mut inst) if !slot.bypass => {
-                let total = start + len;
-                let mut events: Vec<(usize, u8, u8)> = Vec::new();
-                for c in track.midi_clips.iter().filter(|c| !c.mute) {
-                    for n in c.notes.iter().filter(|n| n.start_secs < c.length_secs) {
-                        let on = ((c.position_secs + n.start_secs) * SR) as usize;
-                        let off = ((c.position_secs + (n.start_secs + n.length_secs).min(c.length_secs)) * SR) as usize;
-                        events.push((on, n.pitch, n.velocity.max(1)));
-                        events.push((off, n.pitch, 0));
-                    }
-                }
-                events.sort_by_key(|e| (e.0, e.2 != 0));
-                let silence = vec![0.0f32; BLOCK];
-                let (mut ol, mut or) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
-                let t = Transport::default();
-                let mut ei = 0;
-                let mut pos = 0;
-                while pos < total {
-                    let n = BLOCK.min(total - pos);
-                    let mut block = Vec::new();
-                    while ei < events.len() && events[ei].0 < pos + n {
-                        block.push(MidiEvent { offset: (events[ei].0.saturating_sub(pos)) as u32, pitch: events[ei].1, velocity: events[ei].2 });
-                        ei += 1;
-                    }
-                    {
-                        let inputs: [&[f32]; 2] = [&silence[..n], &silence[..n]];
-                        let mut outputs: [&mut [f32]; 2] = [&mut ol[..n], &mut or[..n]];
-                        inst.process(&inputs, &mut outputs, n, &t, &block);
-                    }
-                    for k in 0..n {
-                        if pos + k >= start {
-                            l[pos + k - start] += ol[k];
-                            r[pos + k - start] += or[k];
-                        }
-                    }
-                    pos += n;
-                }
+}
+
+/// MIDI through the instrument, rendered from the song start (so voices are in the right
+/// state at `start`) and trimmed; adds into `l`/`r`.
+fn render_midi(track: &opentake_project::Track, inst: &mut dyn Processor, start: usize, sr: f64, map: &TempoMap, l: &mut [f32], r: &mut [f32]) {
+    let len = l.len();
+    let total = start + len;
+    let mut events: Vec<(usize, u8, u8)> = Vec::new();
+    for c in track.midi_clips.iter().filter(|c| !c.mute) {
+        for n in c.notes.iter().filter(|n| n.start_secs < c.length_secs) {
+            let on = ((c.position_secs + n.start_secs) * sr) as usize;
+            let off = ((c.position_secs + (n.start_secs + n.length_secs).min(c.length_secs)) * sr) as usize;
+            events.push((on, n.pitch, n.velocity.max(1)));
+            events.push((off, n.pitch, 0));
+        }
+    }
+    events.sort_by_key(|e| (e.0, e.2 != 0));
+    let silence = vec![0.0f32; BLOCK];
+    let (mut ol, mut or) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
+    let latency = inst.latency();
+    let mut ei = 0;
+    let mut pos = 0;
+    while pos < total + latency {
+        let n = BLOCK.min(total + latency - pos);
+        let mut block = Vec::new();
+        while ei < events.len() && events[ei].0 < pos + n {
+            block.push(MidiEvent { offset: (events[ei].0.saturating_sub(pos)) as u32, pitch: events[ei].1, velocity: events[ei].2 });
+            ei += 1;
+        }
+        let t = Transport { tempo_bpm: map.tempo_at(pos as f64 / sr), playing: true, position_samples: pos as i64, ..Transport::default() };
+        {
+            let inputs: [&[f32]; 2] = [&silence[..n], &silence[..n]];
+            let mut outputs: [&mut [f32]; 2] = [&mut ol[..n], &mut or[..n]];
+            inst.process(&inputs, &mut outputs, n, &t, &block);
+        }
+        for k in 0..n {
+            // Shift back by the instrument's latency (delay compensation).
+            let at = (pos + k) as isize - latency as isize - start as isize;
+            if at >= 0 && (at as usize) < len {
+                l[at as usize] += ol[k];
+                r[at as usize] += or[k];
             }
-            Some(_) => {}
-            None => warnings.push(format!("track '{}': instrument '{}' isn't rendered offline (only built-in instruments are)", track.name, slot.name)),
         }
+        pos += n;
     }
-    for slot in track.plugins.iter().filter(|s| !s.bypass) {
-        match builtin_effect(slot) {
-            Some(mut fx) => process_stereo(fx.as_mut(), &mut l, &mut r, map, start),
-            None => warnings.push(format!("track '{}': '{}' isn't rendered offline (only built-in effects are)", track.name, slot.name)),
-        }
-    }
-    l.iter().zip(&r).map(|(a, b)| (a + b) * 0.5).collect()
 }
 
 struct Biquad {
@@ -303,8 +333,8 @@ impl Biquad {
         y
     }
 
-    fn pass(freq: f64, high: bool) -> Self {
-        let w = std::f64::consts::TAU * freq / SR;
+    fn pass(freq: f64, high: bool, sr: f64) -> Self {
+        let w = std::f64::consts::TAU * freq.min(sr * 0.45) / sr;
         let (c, s) = (w.cos(), w.sin());
         let alpha = s / (2.0 * std::f64::consts::FRAC_1_SQRT_2);
         let a0 = 1.0 + alpha;
@@ -312,24 +342,34 @@ impl Biquad {
         Self::new([b[0] / a0, b[1] / a0, b[2] / a0], [1.0, -2.0 * c / a0, (1.0 - alpha) / a0])
     }
 
-    /// The two BS.1770 K-weighting stages at 48 kHz.
-    fn k_weighting() -> [Self; 2] {
-        [
-            Self::new([1.53512485958697, -2.69169618940638, 1.19839281085285], [1.0, -1.69065929318241, 0.73248077421585]),
-            Self::new([1.0, -2.0, 1.0], [1.0, -1.99004745483398, 0.99007225036621]),
-        ]
+    /// The two BS.1770 K-weighting stages (high shelf, then high pass) at any sample rate.
+    fn k_weighting(sr: f64) -> [Self; 2] {
+        let (f0, gain, q) = (1681.974450955533, 3.999843853973347, 0.7071752369554196);
+        let k = (std::f64::consts::PI * f0 / sr).tan();
+        let vh = 10f64.powf(gain / 20.0);
+        let vb = vh.powf(0.4996667741545416);
+        let a0 = 1.0 + k / q + k * k;
+        let shelf = Self::new(
+            [(vh + vb * k / q + k * k) / a0, 2.0 * (k * k - vh) / a0, (vh - vb * k / q + k * k) / a0],
+            [1.0, 2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0],
+        );
+        let (f0, q) = (38.13547087602444, 0.5003270373238773);
+        let k = (std::f64::consts::PI * f0 / sr).tan();
+        let a0 = 1.0 + k / q + k * k;
+        let high_pass = Self::new([1.0, -2.0, 1.0], [1.0, 2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0]);
+        [shelf, high_pass]
     }
 }
 
 /// Integrated loudness (BS.1770-4: 400 ms blocks, 75 % overlap, absolute and relative gates).
-fn lufs(l: &[f32], r: &[f32]) -> f64 {
+pub(crate) fn lufs(l: &[f32], r: &[f32], sr: f64) -> f64 {
     let weigh = |x: &[f32]| {
-        let [mut a, mut b] = Biquad::k_weighting();
+        let [mut a, mut b] = Biquad::k_weighting(sr);
         x.iter().map(|&v| b.run(a.run(v as f64))).collect::<Vec<f64>>()
     };
     let (kl, kr) = (weigh(l), weigh(r));
-    let win = (0.4 * SR) as usize;
-    let hop = win / 4;
+    let win = (0.4 * sr) as usize;
+    let hop = (win / 4).max(1);
     let mut blocks = Vec::new();
     let mut i = 0;
     while i + win <= kl.len() {
@@ -384,7 +424,7 @@ fn fft(re: &mut [f64], im: &mut [f64]) {
 }
 
 /// Average power per band in dB (Hann-windowed FFTs over windows spread through the signal).
-fn band_powers(x: &[f32]) -> Vec<f64> {
+fn band_powers(x: &[f32], sr: f64) -> Vec<f64> {
     let n = 4096;
     let mut acc = vec![0.0; BANDS.len()];
     let mut count = 0;
@@ -394,7 +434,7 @@ fn band_powers(x: &[f32]) -> Vec<f64> {
         let mut im = vec![0.0; n];
         fft(&mut re, &mut im);
         for k in 1..n / 2 {
-            let f = k as f64 * SR / n as f64;
+            let f = k as f64 * sr / n as f64;
             if let Some(b) = BANDS.iter().position(|b| f >= b.1 && f < b.2) {
                 acc[b] += re[k] * re[k] + im[k] * im[k];
             }
@@ -405,26 +445,30 @@ fn band_powers(x: &[f32]) -> Vec<f64> {
     acc.iter().map(|&p| 10.0 * (p / count.max(1) as f64).max(1e-20).log10()).collect()
 }
 
-fn measure(name: &str, l: &[f32], r: &[f32]) -> LevelReport {
+pub(crate) fn peak_db(l: &[f32], r: &[f32]) -> f64 {
     let peak = l.iter().chain(r).fold(0.0f32, |m, v| m.max(v.abs()));
+    round1(20.0 * (peak as f64).max(1e-9).log10())
+}
+
+fn measure(name: &str, l: &[f32], r: &[f32], sr: f64) -> LevelReport {
     let mono: Vec<f32> = l.iter().zip(r).map(|(a, b)| (a + b) * 0.5).collect();
-    let bands = band_powers(&mono).into_iter().zip(BANDS).map(|(db, b)| (b.0.to_string(), round1(db))).collect();
+    let bands = band_powers(&mono, sr).into_iter().zip(BANDS).map(|(db, b)| (b.0.to_string(), round1(db))).collect();
     // Phone speaker: little below ~300 Hz, rolled off above 12 kHz (mono).
-    let (mut h1, mut h2, mut lp) = (Biquad::pass(300.0, true), Biquad::pass(300.0, true), Biquad::pass(12_000.0, false));
+    let (mut h1, mut h2, mut lp) = (Biquad::pass(300.0, true, sr), Biquad::pass(300.0, true, sr), Biquad::pass(12_000.0, false, sr));
     let phone: Vec<f32> = mono.iter().map(|&v| lp.run(h2.run(h1.run(v as f64))) as f32).collect();
-    let full_mono = lufs(&mono, &mono);
-    let phone_lufs = lufs(&phone, &phone);
+    let full_mono = lufs(&mono, &mono, sr);
+    let phone_lufs = lufs(&phone, &phone, sr);
     LevelReport {
         name: name.to_string(),
-        peak_db: round1(20.0 * (peak as f64).max(1e-9).log10()),
-        lufs: round1(lufs(l, r)),
+        peak_db: peak_db(l, r),
+        lufs: round1(lufs(l, r, sr)),
         bands,
         phone_lufs: round1(phone_lufs),
         phone_drop: round1(phone_lufs - full_mono),
     }
 }
 
-fn round1(v: f64) -> f64 {
+pub(crate) fn round1(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
 
@@ -433,6 +477,15 @@ mod tests {
     use super::super::Engine;
     use crate::eq::{Field, norm_freq, param_id};
     use opentake_project::Note;
+
+    #[test]
+    fn k_weighting_matches_the_standard_48k_coefficients() {
+        let [shelf, hp] = super::Biquad::k_weighting(48_000.0);
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(close(shelf.b[0], 1.53512485958697) && close(shelf.b[1], -2.69169618940638) && close(shelf.b[2], 1.19839281085285));
+        assert!(close(shelf.a[1], -1.69065929318241) && close(shelf.a[2], 0.73248077421585));
+        assert!(close(hp.a[1], -1.99004745483398) && close(hp.a[2], 0.99007225036621));
+    }
 
     #[test]
     fn measures_tracks_and_master_and_follows_faders_and_eq() {

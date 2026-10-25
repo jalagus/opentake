@@ -39,6 +39,13 @@ Type these as they are, or adapt them. The agent picks the tools.
 - "Compare the verse and the chorus: which one is louder, and is the low end consistent?"
 - "Put a gentle low cut on everything except kick and bass, then re-check the master."
 
+**Exporting**
+- "Export the mix as 24-bit WAV and the stems as FLAC to `~/Music/Song exports`."
+- "Bounce just the cycle range at 44.1 kHz, 16-bit, with two seconds of tail for the delay."
+- "Master it for streaming: limiter on the master, about -14 LUFS, peaks under -1 dBFS, then
+  export the mix." (The agent adds the limiter, checks with `analyze_mix`, then calls
+  `export_audio`.)
+
 **Housekeeping**
 - "Save this as `~/Music/song-v2.otp` and also export a Reaper project next to it."
 - "What did you change in the last ten steps? Undo the EQ changes but keep the levels."

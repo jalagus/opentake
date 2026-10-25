@@ -295,6 +295,12 @@ impl Engine {
             PluginFormat::Vst3 => {}
             _ => bail!("unsupported plugin format"),
         }
+        let plugin = self.instantiate_vst3_slot(slot)?;
+        Ok(self.add_to_pool(Loaded::Vst3(plugin)))
+    }
+
+    /// A new VST3 instance for a slot, with its saved parameter values.
+    fn instantiate_vst3_slot(&mut self, slot: &PluginSlot) -> Result<Vst3Plugin> {
         let bundle = if Path::new(&slot.path).exists() {
             PathBuf::from(&slot.path)
         } else {
@@ -311,7 +317,33 @@ impl Engine {
         for &(id, value) in &slot.params {
             plugin.set_param_on_controller(id, value);
         }
-        Ok(self.add_to_pool(Loaded::Vst3(plugin)))
+        Ok(plugin)
+    }
+
+    /// A separate processor for offline rendering (analysis, export): built-ins are created
+    /// fresh, VST3s get a new instance, so the live audio thread is never touched. Saved
+    /// parameter values are applied; VST3 state beyond parameters isn't saved yet.
+    pub(super) fn offline_processor(&mut self, slot: &PluginSlot, sample_rate: f64) -> Result<Box<dyn Processor>> {
+        let sr = sample_rate;
+        let p: Box<dyn Processor> = match (slot.format.clone(), slot.path.as_str()) {
+            (PluginFormat::Builtin, synth::PATH) => Box::new(Synth::new(sr)),
+            (PluginFormat::Builtin, drums::PATH) => Box::new(DrumSynth::new(sr)),
+            (PluginFormat::Builtin, eq::PATH) => Box::new(Eq::new(sr)),
+            (PluginFormat::Builtin, comp::PATH) => Box::new(Compressor::new(sr, None)),
+            (PluginFormat::Builtin, limiter::PATH) => Box::new(Limiter::new(sr, None)),
+            (PluginFormat::Builtin, delay::PATH) => Box::new(Delay::new(sr)),
+            (PluginFormat::Vst3, _) => {
+                let plugin = self.instantiate_vst3_slot(slot)?;
+                let mut p = plugin.create_processor(sr, MAX_BLOCK, 2)?;
+                for &(id, value) in &slot.params {
+                    p.queue_param(id, value);
+                }
+                let latency = p.latency_samples() as usize;
+                return Ok(Box::new(Vst3Insert { processor: p, notes: Vec::with_capacity(1024), latency }));
+            }
+            _ => bail!("'{}' can't be rendered offline", slot.name),
+        };
+        Ok(with_params(p, &slot.params))
     }
 
     fn is_loaded(&self, slot: &PluginSlot) -> bool {
