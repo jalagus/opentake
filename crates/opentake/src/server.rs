@@ -21,7 +21,7 @@ monitor_input) -> record -> stop (recordings become clips) -> save_project.
 
 Tracks, clips and plugin slots are addressed by zero-based index as shown by get_project. \
 Plugin parameters are normalized 0..1; list_plugin_params shows ids, current values and display strings. \
-Projects can be saved/loaded as Reaper .rpp or native .json files.
+Projects can be saved/loaded as native .otp or Reaper .rpp files.
 
 MIDI: add_instrument_track (\"synth\" = built-in synth, or a VST3 instrument from list_instruments) -> \
 add_midi_clip -> set_midi_notes / add_midi_notes (times in seconds relative to the region start, \

@@ -213,6 +213,19 @@ Or let the agent launch a headless instance over stdio:
 claude mcp add opentake -- /absolute/path/to/target/release/opentake serve
 ```
 
+### What to ask
+
+A few ideas (more in **[docs/mcp-examples.md](docs/mcp-examples.md)**, with worked examples
+of the tool calls behind them):
+
+- "Import `~/Songs/riff.gp` with the drum kit for drums and use the song's tempo map."
+- "Loop bars 17–24 with a two-bar count-in so I can practise the solo."
+- "Arm the Guitar track on input 1 and record from bar 9."
+- "Write a root-note bass line for an A–F–C–G progression over bars 1–8."
+- "Do a balanced mix that works on phones and studio monitors." The agent measures with
+  `analyze_mix`, adjusts levels, pans and EQs, and re-checks until it's right.
+- "What did you change in the last ten steps? Undo the EQ changes but keep the levels."
+
 ### Tools
 
 `get_status`, `list_audio_devices`, `start_audio`, `stop_audio`, `undo`, `redo`, `get_history`,
