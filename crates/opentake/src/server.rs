@@ -31,7 +31,11 @@ get_history lists the steps.
 Tempo: set_tempo sets the opening tempo/signature; set_tempo_map adds tempo and time-signature changes. \
 Region and note times are always seconds; get_tempo_map and convert_time translate between seconds and \
 bars/beats. Effects: insert_plugin with \"eq\" adds the built-in 6-band EQ to a track; \
-insert_master_plugin puts effects on the master bus (address them with master: true).";
+insert_master_plugin puts effects on the master bus (address them with master: true).
+
+Mixing: analyze_mix renders the mix offline and reports peak, LUFS, band energy and phone-speaker \
+translation per track and for the master — balance with update_track (volume_db, pan) and EQs, \
+re-analyze, repeat; keep the master peak below -1 dBFS.";
 
 pub type SharedEngine = Arc<Mutex<Engine>>;
 
@@ -79,6 +83,63 @@ pub struct StartAudioArgs {
     /// Open output only (no monitoring or recording).
     #[serde(default)]
     pub disable_input: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetProjectArgs {
+    /// Include every MIDI note (can be very large); otherwise regions show note counts.
+    /// Use get_midi_notes for one region's notes.
+    #[serde(default)]
+    pub include_notes: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetMidiNotesArgs {
+    pub track: usize,
+    /// Zero-based MIDI region index on the track.
+    pub clip: usize,
+    /// Only notes starting at or after this time (seconds, relative to the region start).
+    pub from_secs: Option<f64>,
+    /// Only notes starting before this time (seconds, relative to the region start).
+    pub to_secs: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AnalyzeMixArgs {
+    /// Start of the range to analyze (seconds); default the song start.
+    pub from_secs: Option<f64>,
+    /// End of the range (seconds); default the end of the last region.
+    pub to_secs: Option<f64>,
+}
+
+/// The project as JSON for agents: MIDI notes replaced by counts (unless asked for) and
+/// tablature bars summarized, so the answer stays small.
+fn project_json(project: &opentake_engine::project::Project, include_notes: bool) -> serde_json::Value {
+    let mut v = serde_json::to_value(project).unwrap_or_default();
+    if let Some(tracks) = v.get_mut("tracks").and_then(|t| t.as_array_mut()) {
+        for (i, t) in tracks.iter_mut().enumerate() {
+            compact_track(t, include_notes);
+            t["index"] = json!(i);
+        }
+    }
+    v
+}
+
+fn compact_track(t: &mut serde_json::Value, include_notes: bool) {
+    if let Some(clips) = t.get_mut("midi_clips").and_then(|c| c.as_array_mut()) {
+        for c in clips {
+            if !include_notes {
+                let count = c.get("notes").and_then(|n| n.as_array()).map_or(0, |n| n.len());
+                c.as_object_mut().map(|o| o.remove("notes"));
+                c["note_count"] = json!(count);
+            }
+            if let Some(tab) = c.get_mut("tab").filter(|t| t.is_object()) {
+                let bars = tab.get("bars").and_then(|b| b.as_array()).map_or(0, |b| b.len());
+                tab.as_object_mut().map(|o| o.remove("bars"));
+                tab["bar_count"] = json!(bars);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -459,10 +520,38 @@ impl DawServer {
         self.with_engine(|e| e.stop_audio().map(|_| "audio stopped")).await
     }
 
-    #[tool(description = "Full project: tempo, tracks (with index), clips and plugin chains.")]
-    async fn get_project(&self) -> ToolResult {
-        self.with_engine(|e| Ok(json!({ "path": e.project_path(), "media_dir": e.media_dir(), "project": e.project() })))
-            .await
+    #[tool(description = "The project: tempo map, tracks (with index), regions and plugin chains. MIDI regions show note counts; pass include_notes for every note, or use get_midi_notes for one region.")]
+    async fn get_project(&self, Parameters(a): Parameters<GetProjectArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            Ok(json!({ "path": e.project_path(), "media_dir": e.media_dir(), "project": project_json(e.project(), a.include_notes) }))
+        })
+        .await
+    }
+
+    #[tool(description = "The notes of one MIDI region (times in seconds relative to the region start), optionally only a time range.")]
+    async fn get_midi_notes(&self, Parameters(a): Parameters<GetMidiNotesArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let track = e.project().tracks.get(a.track).ok_or_else(|| anyhow::anyhow!("no track {}", a.track))?;
+            let clip = track.midi_clips.get(a.clip).ok_or_else(|| anyhow::anyhow!("track {} has no MIDI region {}", a.track, a.clip))?;
+            let (from, to) = (a.from_secs.unwrap_or(f64::NEG_INFINITY), a.to_secs.unwrap_or(f64::INFINITY));
+            let notes: Vec<_> = clip.notes.iter().filter(|n| n.start_secs >= from && n.start_secs < to).collect();
+            Ok(json!({ "region": clip.name, "position_secs": clip.position_secs, "length_secs": clip.length_secs, "count": notes.len(), "notes": notes }))
+        })
+        .await
+    }
+
+    #[tool(description = "Render the mix offline and measure it: per track and for the master — peak (dBFS), integrated loudness (LUFS, BS.1770), energy per frequency band, and loudness through a simulated phone speaker. Use it to balance levels/EQ by numbers: similar phone_drop across tracks means the balance holds on small speakers; keep the master peak below -1 dBFS (clipped_samples 0). Built-in instruments and EQs are rendered; VST3 plug-ins are listed in warnings.")]
+    async fn analyze_mix(&self, Parameters(a): Parameters<AnalyzeMixArgs>) -> ToolResult {
+        // Snapshot under the engine lock, then render without holding it.
+        let engine = self.engine.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let job = engine.lock().map_err(|_| anyhow::anyhow!("engine lock poisoned"))?.mix_job();
+            job.analyze(a.from_secs, a.to_secs)
+        })
+        .await
+        .map_err(|e| format!("analysis failed: {e}"))?;
+        let report = result.map_err(|e| format!("{e:#}"))?;
+        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
     }
 
     #[tool(description = "Start a new project with one empty audio track.")]
@@ -619,7 +708,22 @@ impl DawServer {
             monitor_input: a.monitor_input,
             input_channel: a.input_channel,
         };
-        self.with_engine(move |e| e.update_track(a.track, update)).await
+        self.with_engine(move |e| {
+            let track = e.update_track(a.track, update)?;
+            // The settings, not every region and note.
+            Ok(json!({
+                "track": a.track,
+                "name": track.name,
+                "volume_db": 20.0 * track.volume.max(1e-6).log10(),
+                "pan": track.pan,
+                "mute": track.mute,
+                "solo": track.solo,
+                "armed": track.armed,
+                "monitor_input": track.monitor_input,
+                "input_channel": track.input_channel,
+            }))
+        })
+        .await
     }
 
     #[tool(description = "Place a WAV file on a track at a position (seconds).")]
@@ -838,5 +942,34 @@ impl ServerHandler for DawServer {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("opentake", env!("CARGO_PKG_VERSION")).with_title("OpenTake"))
             .with_instructions(INSTRUCTIONS)
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    use opentake_engine::project::{MidiClip, Project, Track};
+
+    #[test]
+    fn project_json_replaces_notes_with_counts_unless_asked() {
+        let mut p = Project::default();
+        let mut t = Track::new("Keys");
+        t.midi_clips.push(MidiClip {
+            name: "r".into(),
+            position_secs: 0.0,
+            length_secs: 1.0,
+            mute: false,
+            notes: vec![Note { start_secs: 0.0, length_secs: 0.5, pitch: 60, velocity: 100, tab: None }; 3],
+            tab: None,
+            tempos: Vec::new(),
+        });
+        p.tracks.push(t);
+        let compact = project_json(&p, false);
+        let clip = &compact["tracks"][0]["midi_clips"][0];
+        assert!(clip.get("notes").is_none());
+        assert_eq!(clip["note_count"], 3);
+        assert_eq!(compact["tracks"][0]["index"], 0);
+        let full = project_json(&p, true);
+        assert_eq!(full["tracks"][0]["midi_clips"][0]["notes"].as_array().map(|n| n.len()), Some(3));
     }
 }

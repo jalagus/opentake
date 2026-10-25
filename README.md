@@ -22,7 +22,7 @@ you watch the changes appear live — and undo anything you don't like.
 - ⏱️ Project tempo map (tempo and time-signature changes), metronome with count-in
 - ✂️ Region editing: select, move, copy, split, trim, snap, cycle/loop
 - 🎚️ Full mixer, metronome, undo/redo for everything
-- 🤖 MCP server (stdio or HTTP) with 53 tools — the agent and you share one session
+- 🤖 MCP server (stdio or HTTP) with 56 tools — the agent and you share one session
 - 📂 Its own `.otp` project files (double-click to open), and Reaper `.rpp` projects
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
 - 🦀 Real-time safe audio engine: no locks or allocation on the audio thread
@@ -216,7 +216,7 @@ claude mcp add opentake -- /absolute/path/to/target/release/opentake serve
 ### Tools
 
 `get_status`, `list_audio_devices`, `start_audio`, `stop_audio`, `undo`, `redo`, `get_history`,
-`get_project`, `new_project`, `load_project`, `save_project`, `set_tempo`, `set_tempo_map`, `get_tempo_map`, `convert_time`,
+`get_project`, `get_midi_notes`, `analyze_mix`, `new_project`, `load_project`, `save_project`, `set_tempo`, `set_tempo_map`, `get_tempo_map`, `convert_time`,
 `set_master_volume`, `set_metronome`, `set_count_in`, `set_loop`,
 `add_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `remove_clip`,
 `play`, `stop`, `seek`, `record`,
@@ -225,6 +225,12 @@ claude mcp add opentake -- /absolute/path/to/target/release/opentake serve
 `list_instruments`, `add_instrument_track`, `set_instrument`, `list_instrument_params`, `set_instrument_param`,
 `add_midi_clip`, `set_midi_notes`, `add_midi_notes`, `update_midi_clip`, `copy_midi_clip`, `remove_midi_clip`,
 `inspect_guitar_pro`, `import_guitar_pro`.
+
+Mixing: `analyze_mix` renders the mix offline (built-in instruments and EQs, audio regions,
+faders, pans, master) and reports, per track and for the master, the peak, integrated loudness
+(LUFS, ITU BS.1770), energy per frequency band, and how much loudness survives a phone speaker.
+An agent can balance a mix by numbers — adjust `update_track` / EQs, re-analyze, repeat —
+keeping the master peak under -1 dBFS and the phone drop similar across tracks.
 
 Recording: arm a track (`update_track` with `armed: true` and `input_channel`), call
 `record`, then `stop`. Each armed track gets a mono 32-bit float WAV in

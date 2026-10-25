@@ -4,6 +4,7 @@
 //! undone (see `history.rs`). Tracks and plugin instances carry stable ids, so undo can
 //! diff two project states and update only what changed on the audio thread.
 
+mod analysis;
 mod guitarpro;
 mod history;
 mod midi;
@@ -29,6 +30,7 @@ use crate::mixer::{ClipRt, Command, Garbage, Mixer, SharedState, TrackParams, Tr
 use crate::recorder::{RecordTarget, Recorder};
 
 pub use guitarpro::{GuitarProImport, GuitarProSummary, GuitarProTrackInfo, inspect as inspect_guitar_pro};
+pub use analysis::{LevelReport, MixJob, MixReport};
 pub use history::HistoryInfo;
 pub use midi::MidiClipUpdate;
 pub use plugins::SlotRef;
