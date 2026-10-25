@@ -185,16 +185,13 @@ fn draw_bar_header(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout
             }
         }
         // Tempo markings on a second line, the one at the playhead highlighted.
+        let marks: Vec<(f32, f64)> = clip.tempos.iter().filter(|m| m.start_secs < clip.length_secs).map(|m| (ctx.x(clip.position_secs + m.start_secs), m.bpm)).collect();
         let current = clip.tempos.iter().rposition(|m| clip.position_secs + m.start_secs <= ctx.playhead + 1e-9);
-        let mut last_right = f32::NEG_INFINITY;
-        for (i, m) in clip.tempos.iter().enumerate().filter(|(_, m)| m.start_secs < clip.length_secs) {
-            let x = ctx.x(clip.position_secs + m.start_secs).max(rect.left()) + 3.0;
-            if x > rect.right() || (x < last_right + 4.0 && Some(i) != current) {
-                continue;
-            }
-            let color = if Some(i) == current { theme::TEMPO } else { theme::with_alpha(theme::TEMPO, 150) };
-            let r = p.text(pos2(x, rect.top() + HEADER_H - 2.0), Align2::LEFT_TOP, theme::tempo_label(m.bpm), FontId::proportional(10.0), color);
-            last_right = r.right();
+        // Within this region only, so the sticky label doesn't leak past its edges.
+        let span = Rangef::new(ctx.x(clip.position_secs).max(rect.left()), ctx.x(clip.position_secs + clip.length_secs).min(rect.right()));
+        if span.span() > 0.0 {
+            let row = p.with_clip_rect(Rect::from_x_y_ranges(span, rect.y_range()));
+            timeline::draw_tempo_labels(&row, span, rect.top() + HEADER_H + 4.0, &marks, current, theme::BG_DEEP);
         }
     }
 }

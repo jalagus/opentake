@@ -1133,25 +1133,78 @@ pub(crate) fn tempo_marks(project: &Project) -> Vec<(f64, f64)> {
 
 fn draw_tempo_row(painter: &Painter, rect: Rect, view: &View, marks: &[(f64, f64)], playhead: f64) {
     let p = painter.with_clip_rect(rect);
-    p.rect_filled(rect, 0.0, theme::shade(theme::BG_HEADER, 0.9));
+    let bg = theme::shade(theme::BG_HEADER, 0.9);
+    p.rect_filled(rect, 0.0, bg);
+    let screen: Vec<(f32, f64)> = marks.iter().map(|&(t, bpm)| (view.x_of(t), bpm)).collect();
     let current = marks.iter().rposition(|m| m.0 <= playhead + 1e-9);
-    let mut last_right = f32::NEG_INFINITY;
-    for (i, &(t, bpm)) in marks.iter().enumerate() {
-        let x = view.x_of(t);
-        if x > rect.right() {
-            break;
-        }
-        // The marking in effect at the playhead is highlighted.
+    for (i, &(x, _)) in screen.iter().enumerate().filter(|(_, m)| rect.x_range().contains(m.0)) {
         let color = if Some(i) == current { theme::TEMPO } else { theme::with_alpha(theme::TEMPO, 150) };
         p.vline(x, Rangef::new(rect.top() + 2.0, rect.bottom()), Stroke::new(1.0, color));
-        let label_x = x.max(rect.left() + 2.0) + 3.0;
-        // Skip labels that would overlap the previous one (zoomed far out).
-        if label_x > last_right + 4.0 || Some(i) == current {
-            let r = p.text(pos2(label_x, rect.center().y), Align2::LEFT_CENTER, theme::tempo_label(bpm), FontId::proportional(10.0), color);
-            last_right = r.right();
+    }
+    draw_tempo_labels(&p, rect.x_range(), rect.center().y, &screen, current, bg);
+    p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+}
+
+/// Where tempo labels go along a row spanning `span`: (mark index, label left x).
+/// The marking in effect at the left edge sticks there until the next one pushes it out,
+/// earlier ones aren't shown, and where labels would overlap the one at the playhead wins,
+/// then later ones.
+pub(crate) fn place_tempo_labels(span: Rangef, marks: &[(f32, f32)], current: Option<usize>) -> Vec<(usize, f32)> {
+    const PAD: f32 = 3.0;
+    let first_visible = marks.iter().position(|m| m.0 >= span.min).unwrap_or(marks.len());
+    let sticky = first_visible.checked_sub(1);
+    let mut candidates: Vec<(usize, f32, f32)> = Vec::new(); // (index, left, width)
+    for (i, &(x, w)) in marks.iter().enumerate() {
+        if x > span.max {
+            break;
+        }
+        if i + 1 < first_visible {
+            continue; // superseded before the left edge
+        }
+        let left = if Some(i) == sticky {
+            // Pushed out to the left by the next marking as it arrives.
+            let next = marks.get(first_visible).map_or(f32::INFINITY, |m| m.0 + PAD);
+            (span.min + PAD).min(next - w - 2.0 * PAD)
+        } else {
+            x + PAD
+        };
+        candidates.push((i, left, w));
+    }
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by_key(|&k| (Some(candidates[k].0) != current, std::cmp::Reverse(candidates[k].0)));
+    let mut taken: Vec<Rangef> = Vec::new();
+    let mut placed = Vec::new();
+    for k in order {
+        let (i, left, w) = candidates[k];
+        let r = Rangef::new(left - 2.0, left + w + 2.0);
+        if taken.iter().all(|t| !t.intersects(r)) {
+            taken.push(r);
+            placed.push((i, left));
         }
     }
-    p.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+    placed.sort_by_key(|p| p.0);
+    placed
+}
+
+/// Draw tempo labels (screen x, bpm) centred on `y`, each on a `bg` backing so lines behind
+/// them don't strike through. The painter should clip to the row.
+pub(crate) fn draw_tempo_labels(p: &Painter, span: Rangef, y: f32, marks: &[(f32, f64)], current: Option<usize>, bg: Color32) {
+    let font = FontId::proportional(10.0);
+    let galleys: Vec<_> = marks
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let color = if Some(i) == current { theme::TEMPO } else { theme::with_alpha(theme::TEMPO, 150) };
+            p.layout_no_wrap(theme::tempo_label(m.1), font.clone(), color)
+        })
+        .collect();
+    let widths: Vec<(f32, f32)> = marks.iter().zip(&galleys).map(|(m, g)| (m.0, g.size().x)).collect();
+    for (i, left) in place_tempo_labels(span, &widths, current) {
+        let g = galleys[i].clone();
+        let r = Rect::from_min_size(pos2(left, y - g.size().y / 2.0), g.size());
+        p.rect_filled(r.expand2(vec2(2.0, 0.0)), 2.0, bg);
+        p.galley(r.min, g, theme::TEMPO);
+    }
 }
 
 fn draw_playhead(painter: &Painter, rect: Rect, view: &View, t: f64, head: bool) {
@@ -1283,6 +1336,26 @@ pub fn pan_label(v: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tempo_labels_stick_at_the_left_and_never_overlap() {
+        let span = Rangef::new(100.0, 1000.0);
+        // Three markings scrolled off to the left, then two visible ones; labels 50 px wide.
+        let marks = [(-300.0, 50.0), (-100.0, 50.0), (40.0, 50.0), (400.0, 50.0), (430.0, 50.0)];
+        let placed = place_tempo_labels(span, &marks, Some(3));
+        // Only the marking in effect at the edge (index 2) sticks; the earlier ones are gone.
+        assert_eq!(placed.first(), Some(&(2, 103.0)));
+        assert!(placed.iter().all(|p| p.0 >= 2));
+        // 3 and 4 overlap: the one at the playhead (3) wins.
+        assert!(placed.contains(&(3, 403.0)) && !placed.iter().any(|p| p.0 == 4));
+
+        // As the next marking reaches the edge it pushes the sticky label out.
+        let marks = [(40.0, 50.0), (130.0, 50.0)];
+        let placed = place_tempo_labels(span, &marks, Some(1));
+        let sticky = placed.iter().find(|p| p.0 == 0).map(|p| p.1);
+        assert!(sticky.is_none_or(|x| x + 50.0 <= 130.0), "{placed:?}");
+        assert!(placed.contains(&(1, 133.0)));
+    }
 
     #[test]
     fn grid_sizes_follow_tempo_and_signature() {

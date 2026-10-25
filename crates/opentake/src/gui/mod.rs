@@ -2523,6 +2523,7 @@ mod tests {
         harness.state_mut().selected_track = created.get(pick).or(created.first()).copied();
         harness.state_mut().bottom = Some(BottomTab::Tab);
         harness.state_mut().view.px_per_sec = 90.0;
+        harness.state_mut().view.start = std::env::var("OPENTAKE_SCREENSHOT_VIEW_START").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
         for _ in 0..4 {
             harness.step();
         }
