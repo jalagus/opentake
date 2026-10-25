@@ -2,3 +2,4 @@
 .DS_Store
 # Recordings from unsaved test sessions
 /Untitled/
+/.claude/worktrees/
