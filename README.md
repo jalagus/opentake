@@ -97,7 +97,7 @@ elsewhere); set `OPENTAKE_CONFIG_DIR` to keep them somewhere else.
 
 ### GUI
 
-![OpenTake: arrangement with tracks, a take folder, a bus, a volume automation lane, the cycle range and the mixer](assets/screenshots/arrange.png)
+![OpenTake: arrangement with tracks, fades and a crossfade, a take folder, buses and reverb sends, a volume automation lane and the mixer](assets/screenshots/arrange.png)
 
 <p>
   <img src="assets/screenshots/tablature.png" alt="Guitar Pro import shown as notation and tablature under the arrangement" width="32.5%">

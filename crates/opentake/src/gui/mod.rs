@@ -3687,7 +3687,7 @@ mod tests {
 
         let app_engine = engine.clone();
         let mut harness = Harness::builder()
-            .with_size([1360.0, 1020.0])
+            .with_size([1360.0, 1080.0])
             .with_pixels_per_point(2.0)
             .with_step_dt(1.0 / 60.0)
             .wgpu()

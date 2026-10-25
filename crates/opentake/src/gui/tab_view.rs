@@ -5,7 +5,7 @@
 
 use opentake_engine::project::{MidiClip, Note, Project, TabBar, TabLayout};
 use eframe::egui;
-use egui::{Align, Align2, Color32, FontId, Layout, Painter, Rangef, Rect, RichText, Sense, Shape, Stroke, StrokeKind, pos2, vec2};
+use egui::{Align, Align2, Color32, FontId, Layout, Painter, Pos2, Rangef, Rect, RichText, Sense, Shape, Stroke, StrokeKind, pos2, vec2};
 
 use super::{Action, DawApp, Snapshot, theme, timeline, widgets};
 
@@ -286,7 +286,7 @@ fn draw_tab(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], rec
     let system_x = gutter.min + SYSTEM_X;
     if let Some((_, layout)) = clips.first() {
         for (s, &open) in layout.tuning.iter().enumerate() {
-            painter.text(pos2(system_x - 6.0, y_of(s)), Align2::RIGHT_CENTER, NOTE_NAMES[(open % 12) as usize], FontId::monospace(11.0 * ctx.scale.sqrt()), ctx.pal.dim);
+            painter.text(pos2(system_x - 6.0, y_of(s)), Align2::RIGHT_CENTER, NOTE_NAMES[(open % 12) as usize], FontId::monospace((spacing * 0.7).max(11.0)), ctx.pal.dim);
         }
     }
     painter.vline(system_x, Rangef::new(y_top, y_bottom), Stroke::new(1.5, ctx.pal.faint));
@@ -305,7 +305,9 @@ fn draw_tab(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], rec
         p.hline(content.x_range(), y_of(s), Stroke::new(1.0, ctx.pal.line));
     }
 
-    let mono = FontId::monospace(11.5 * ctx.scale);
+    // Fret numbers fill most of the gap between strings (as printed tab does), so they're
+    // readable at the normal size and grow with the spacing rather than separately from it.
+    let mono = FontId::monospace((spacing * 1.05).max(11.5 * ctx.scale));
     for (clip, layout) in clips {
         let (start, end) = (clip.position_secs, clip.position_secs + clip.length_secs);
         let (x0, x1) = (ctx.x(start), ctx.x(end));
@@ -331,8 +333,21 @@ fn draw_tab(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], rec
             let y = y_of(pos.string as usize);
             let sounding = ctx.sounding(t, note_end);
             let (bg, fg) = if sounding { (ctx.color, Color32::from_rgb(16, 16, 18)) } else { (ctx.pal.bg, ctx.pal.ink) };
-            let galley = p.layout_no_wrap(pos.fret.to_string(), mono.clone(), fg);
-            let box_rect = Rect::from_center_size(pos2(nx + galley.size().x / 2.0 + 1.0, y), galley.size() + vec2(4.0, 1.0));
+            // Shrink a number only when a neighbouring note on its string is too close for it;
+            // both sides count, so a fast run shrinks evenly.
+            let gap = clip
+                .notes
+                .iter()
+                .filter(|m| (m.start_secs - n.start_secs).abs() > 1e-9 && layout.position(m).is_some_and(|q| q.string == pos.string))
+                .map(|m| (ctx.x(start + m.start_secs) - nx).abs())
+                .fold(f32::INFINITY, f32::min);
+            let room = gap - 3.0;
+            let digits = pos.fret.to_string().len() as f32;
+            let font = if room.is_finite() { FontId::monospace(mono.size.min(room / (0.62 * digits)).max(8.0)) } else { mono.clone() };
+            let galley = p.layout_no_wrap(pos.fret.to_string(), font, fg);
+            // The box is a string gap tall (not the font's line height), so the numbers of a
+            // chord on neighbouring strings don't cover each other.
+            let box_rect = Rect::from_center_size(pos2(nx + galley.size().x / 2.0 + 1.0, y), vec2(galley.size().x + 4.0, spacing - 1.0));
             if nx_end > box_rect.right() + 2.0 {
                 p.hline(Rangef::new(box_rect.right(), nx_end), y, Stroke::new(2.0, theme::with_alpha(ctx.color, 70)));
             }
@@ -343,6 +358,49 @@ fn draw_tab(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], rec
             p.galley(box_rect.center() - galley.size() / 2.0, galley, fg);
         }
     }
+}
+
+/// An engraved note head `h` (half a staff space) tall around `c`. Filled heads are ovals
+/// tilted up to the right; a half note's hole is narrower and tilted more steeply, so its
+/// outline is thick on two opposite sides and thin between; a whole note is upright with a
+/// steeply tilted hole. Open heads are a ring (not a filled shape with a background-coloured
+/// hole), so staff lines still show through.
+fn note_head(p: &Painter, c: Pos2, h: f32, value: Value, ink: Color32) {
+    // (half-axes and tilt in radians; negative tilts rise to the right on screen)
+    let ellipse = |a: f32, b: f32, tilt: f32| move |phi: f32| {
+        // Distance from the centre to the ellipse along direction `phi`.
+        let (s, c) = (phi - tilt).sin_cos();
+        1.0 / ((c / a).powi(2) + (s / b).powi(2)).sqrt()
+    };
+    const N: usize = 48;
+    let at = |phi: f32, r: f32| c + vec2(phi.cos(), phi.sin()) * r;
+    let (outer, inner) = match value {
+        Value::Whole => (ellipse(h * 1.42, h * 0.9, 0.0), Some(ellipse(h * 0.82, h * 0.46, -1.0))),
+        Value::Half => (ellipse(h * 1.33, h * 0.82, -0.38), Some(ellipse(h * 1.02, h * 0.4, -0.62))),
+        _ => (ellipse(h * 1.33, h * 0.82, -0.38), None),
+    };
+    let mut mesh = egui::Mesh::default();
+    match inner {
+        None => {
+            mesh.colored_vertex(c, ink);
+            for k in 0..N {
+                let phi = k as f32 / N as f32 * std::f32::consts::TAU;
+                mesh.colored_vertex(at(phi, outer(phi)), ink);
+                mesh.add_triangle(0, 1 + k as u32, 1 + ((k + 1) % N) as u32);
+            }
+        }
+        Some(inner) => {
+            for k in 0..N {
+                let phi = k as f32 / N as f32 * std::f32::consts::TAU;
+                mesh.colored_vertex(at(phi, outer(phi)), ink);
+                mesh.colored_vertex(at(phi, inner(phi)), ink);
+                let (o, i, o2, i2) = (2 * k as u32, 2 * k as u32 + 1, 2 * ((k + 1) % N) as u32, 2 * ((k + 1) % N) as u32 + 1);
+                mesh.add_triangle(o, i, o2);
+                mesh.add_triangle(i, i2, o2);
+            }
+        }
+    }
+    p.add(Shape::mesh(mesh));
 }
 
 /// Diatonic step (C-1 = 0) and whether the note needs a sharp.
@@ -456,7 +514,6 @@ impl Staff<'_> {
     fn heads(&self, c: &Chord, stem_up: bool) -> f32 {
         let (h, rx) = (self.h, self.rx());
         let cx = c.x + rx + 1.0;
-        let hollow = matches!(c.written.value, Value::Whole | Value::Half);
         let mut prev: Option<(i32, bool)> = None; // (step, shifted)
         for &(step, sharp) in &c.heads {
             let y = self.y(step);
@@ -475,12 +532,7 @@ impl Staff<'_> {
             for s in (self.bottom_step + 10..=step).filter(|s| (s - self.bottom_step) % 2 == 0) {
                 ledger(s);
             }
-            let radius = vec2(rx, h * 0.92);
-            if hollow {
-                self.p.add(Shape::ellipse_stroke(pos2(hx, y), radius - vec2(0.6, 0.6), Stroke::new(1.4, c.ink)));
-            } else {
-                self.p.add(Shape::ellipse_filled(pos2(hx, y), radius, c.ink));
-            }
+            note_head(self.p, pos2(hx, y), h, c.written.value, c.ink);
             if sharp {
                 draw_sharp(self.p, pos2(cx - rx - h * 1.6, y), h, c.ink);
             }
