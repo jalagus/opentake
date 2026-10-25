@@ -1,6 +1,7 @@
-//! Editors for the built-in compressor, multiband compressor, limiter and delay: knobs for
-//! every parameter, plus a transfer curve and gain-reduction meter (compressor), the bands
-//! with draggable crossovers (multiband), meters (limiter) and tempo-synced note values (delay).
+//! Editors for the built-in compressor, multiband compressor, limiter, delay and reverb: knobs
+//! for every parameter, plus a transfer curve and gain-reduction meter (compressor), the bands
+//! with draggable crossovers (multiband), meters (limiter), tempo-synced note values (delay)
+//! and the decay tail (reverb).
 
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use eframe::egui;
 use egui::{Align2, Color32, FontId, Rect, RichText, Sense, Shape, Stroke, pos2, vec2};
 use opentake_engine::delay;
 use opentake_engine::multiband::{self, MultibandMeter};
+use opentake_engine::reverb;
 use opentake_engine::dynamics::{self, CompSettings, GainMeter, comp, limiter};
 use opentake_engine::{ParamView, SlotRef};
 
@@ -20,6 +22,7 @@ pub enum Kind {
     Multiband,
     Limiter,
     Delay,
+    Reverb,
 }
 
 impl Kind {
@@ -29,6 +32,7 @@ impl Kind {
             multiband::PATH => Some(Kind::Multiband),
             limiter::PATH => Some(Kind::Limiter),
             delay::PATH => Some(Kind::Delay),
+            reverb::PATH => Some(Kind::Reverb),
             _ => None,
         }
     }
@@ -39,6 +43,7 @@ impl Kind {
             Kind::Multiband => [760.0, 470.0],
             Kind::Limiter => [420.0, 400.0],
             Kind::Delay => [560.0, 250.0],
+            Kind::Reverb => [770.0, 360.0],
         }
     }
 }
@@ -50,6 +55,7 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, kind: Kin
         Kind::Multiband => multiband_view(app, ui, t, s, params, bands),
         Kind::Limiter => limiter_view(app, ui, t, s, params, meter),
         Kind::Delay => delay_view(app, ui, t, s, params, bpm),
+        Kind::Reverb => reverb_view(app, ui, t, s, params, meter),
     }
 }
 
@@ -359,4 +365,107 @@ fn delay_view(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params:
         ids.insert(0, delay::TIME);
     }
     knob_row(app, ui, t, s, params, &ids);
+}
+
+fn reverb_view(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params: &[ParamView], meter: Option<&Arc<GainMeter>>) {
+    let values: Vec<(u32, f64)> = params.iter().map(|p| (p.id, p.value)).collect();
+    let settings = reverb::Settings::from_params(&values);
+    let levels = smoothed(ui, ui.make_persistent_id(("reverb_meter", t, s)), meter.map_or((0.0, -120.0, -120.0), |m| m.take()));
+    ui.horizontal_top(|ui| {
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 84.0, 190.0), Sense::hover());
+        widgets::label(&resp, egui::Role::Image, "Reverb Decay");
+        decay_graph(ui, rect, &settings);
+        ui.add_space(8.0);
+        bar(ui, "IN", levels.1, false);
+        bar(ui, "OUT", levels.2, false);
+    });
+    ui.add_space(8.0);
+    ui.horizontal_top(|ui| {
+        let groups: [(&str, &[u32]); 4] = [
+            ("Time", &[reverb::PRE_DELAY, reverb::SIZE, reverb::DECAY]),
+            ("Tone", &[reverb::DAMPING, reverb::LOW_CUT]),
+            ("Character", &[reverb::DIFFUSION, reverb::MODULATION, reverb::WIDTH]),
+            ("Output", &[reverb::MIX, reverb::LEVEL]),
+        ];
+        for (i, (name, ids)) in groups.into_iter().enumerate() {
+            if i > 0 {
+                ui.separator();
+            }
+            ui.vertical(|ui| {
+                widgets::section(ui, name);
+                knob_row(app, ui, t, s, params, ids);
+            });
+        }
+    });
+}
+
+/// The reverb's level over time (dB): the dry hit, the pre-delay gap, a short build-up and
+/// the RT60 slope, with the damped highs (8 kHz) fading out sooner on top.
+fn decay_graph(ui: &egui::Ui, rect: Rect, s: &reverb::Settings) {
+    const FLOOR: f64 = -66.0;
+    const HIGH: Color32 = Color32::from_rgb(170, 120, 255);
+    let p = ui.painter().with_clip_rect(rect);
+    p.rect_filled(rect, 6.0, theme::BG_DEEP);
+    let pre = s.pre_delay_ms * 0.001;
+    let high = s.decay_at(8000.0, 48_000.0);
+    // Round time spans, so the axis only jumps between a few scales as Decay moves.
+    let span = [0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 16.0, 25.0].into_iter().find(|&d| d >= pre + s.decay_secs * 1.1).unwrap_or(25.0);
+    let plot = Rect::from_min_max(pos2(rect.left() + 10.0, rect.top() + 24.0), pos2(rect.right() - 10.0, rect.bottom() - 16.0));
+    let x_of = |secs: f64| plot.left() + (secs / span) as f32 * plot.width();
+    let y_of = |db: f64| plot.top() + (db / FLOOR).clamp(0.0, 1.0) as f32 * plot.height();
+    for db in [-12.0, -24.0, -36.0, -48.0, -60.0] {
+        p.hline(rect.x_range(), y_of(db), Stroke::new(1.0, theme::HAIRLINE));
+        p.text(pos2(rect.right() - 4.0, y_of(db) - 1.0), Align2::RIGHT_BOTTOM, format!("{db:.0}"), FontId::proportional(9.0), theme::TEXT_FAINT);
+    }
+    let step = [0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0].into_iter().find(|&d| span / d <= 8.0).unwrap_or(5.0);
+    for k in 1..(span / step).round() as usize {
+        let secs = k as f64 * step;
+        p.vline(x_of(secs), plot.y_range(), Stroke::new(1.0, theme::GRID_SUB));
+        let label = if secs < 1.0 { format!("{:.0} ms", secs * 1000.0) } else { format!("{secs} s") };
+        p.text(pos2(x_of(secs), rect.bottom() - 3.0), Align2::CENTER_BOTTOM, label, FontId::proportional(9.0), theme::TEXT_FAINT);
+    }
+    // Levels relative to the input: the wet part follows Mix and Level.
+    let wet_db = 20.0 * (s.mix * 10f64.powf(s.level_db / 20.0)).max(1e-6).log10();
+    let dry_db = 20.0 * (1.0 - s.mix).max(1e-6).log10();
+    // Size and diffusion stretch the build-up from the first reflections to the full tail.
+    let build = 0.004 + 0.03 * s.size + 0.02 * s.diffusion;
+    let envelope = |secs: f64, rt: f64, offset: f64| {
+        let t = secs - pre;
+        let onset = if t < build { -15.0 * (1.0 - t / build) } else { 0.0 };
+        (t >= 0.0).then(|| wet_db + offset + onset - 60.0 * t / rt).filter(|db| *db > FLOOR)
+    };
+    let columns = (plot.width() / 2.0) as usize;
+    for (rt, offset, color) in [(s.decay_secs, 0.0, theme::ACCENT), (high, -2.0, HIGH)] {
+        let mut line = Vec::with_capacity(columns + 1);
+        for c in 0..=columns {
+            let secs = c as f64 / columns as f64 * span;
+            let Some(db) = envelope(secs, rt, offset) else { continue };
+            let top = pos2(x_of(secs), y_of(db));
+            p.line_segment([pos2(top.x, plot.bottom()), top], Stroke::new(2.0, theme::with_alpha(color, 40)));
+            line.push(top);
+        }
+        p.add(Shape::line(line, Stroke::new(1.5, color)));
+    }
+    if dry_db > FLOOR {
+        let x = x_of(0.0) + 1.0;
+        p.line_segment([pos2(x, plot.bottom()), pos2(x, y_of(dry_db))], Stroke::new(2.0, theme::TEXT));
+    }
+    if pre > 0.0005 {
+        let x = x_of(pre);
+        for k in 0..(plot.height() / 6.0) as usize {
+            let y = plot.top() + k as f32 * 6.0;
+            p.line_segment([pos2(x, y), pos2(x, y + 3.0)], Stroke::new(1.0, theme::TEXT_DIM));
+        }
+        p.text(pos2(x + 4.0, plot.bottom() - 2.0), Align2::LEFT_BOTTOM, format!("PRE {:.0} ms", s.pre_delay_ms), FontId::proportional(9.0), theme::TEXT_DIM);
+    }
+    // Where the tail has fallen 60 dB.
+    let end = x_of(pre + s.decay_secs);
+    if end < plot.right() {
+        p.circle_filled(pos2(end, y_of(wet_db - 60.0)), 3.0, theme::ACCENT);
+    }
+    let fmt = |secs: f64| if secs < 10.0 { format!("{secs:.2} s") } else { format!("{secs:.1} s") };
+    p.text(rect.left_top() + vec2(8.0, 5.0), Align2::LEFT_TOP, format!("RT60 {}", fmt(s.decay_secs)), FontId::proportional(11.0), theme::ACCENT);
+    p.text(rect.left_top() + vec2(92.0, 6.0), Align2::LEFT_TOP, format!("8 kHz {}", fmt(high)), FontId::proportional(10.0), HIGH);
+    let mix = format!("{:.0}% wet", s.mix * 100.0);
+    p.text(rect.right_top() + vec2(-8.0, 6.0), Align2::RIGHT_TOP, mix, FontId::proportional(10.0), theme::TEXT_DIM);
 }

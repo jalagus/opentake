@@ -339,6 +339,7 @@ fn add_fx_button(app: &mut DawApp, ui: &mut egui::Ui, t: usize, w: f32, snap: &S
             (opentake_engine::multiband::NAME, opentake_engine::multiband::PATH),
             (opentake_engine::dynamics::limiter::NAME, opentake_engine::dynamics::limiter::PATH),
             (opentake_engine::delay::NAME, opentake_engine::delay::PATH),
+            (opentake_engine::reverb::NAME, opentake_engine::reverb::PATH),
         ];
         for (name, path) in builtins {
             if ui.button(name).clicked() {

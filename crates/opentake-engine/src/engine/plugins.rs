@@ -17,6 +17,7 @@ use crate::delay::{self, Delay};
 use crate::dynamics::{self, Compressor, GainMeter, Limiter, comp, limiter};
 use crate::eq::{self, Eq};
 use crate::multiband::{self, Multiband, MultibandMeter};
+use crate::reverb::{self, Reverb};
 use crate::synth::{self, Synth};
 
 pub(super) enum Loaded {
@@ -31,6 +32,7 @@ pub(super) enum Loaded {
     Limiter(std::sync::Arc<GainMeter>),
     Multiband(std::sync::Arc<MultibandMeter>),
     Delay,
+    Reverb(std::sync::Arc<GainMeter>),
 }
 
 impl Loaded {
@@ -56,9 +58,10 @@ fn builtin_effect_for(query: &str) -> Option<(&'static str, &'static str)> {
         "limiter" | "brickwall" | "brickwall limiter" => Some((limiter::NAME, limiter::PATH)),
         "delay" | "echo" => Some((delay::NAME, delay::PATH)),
         "multiband" | "multiband compressor" | "multiband comp" | "mbc" => Some((multiband::NAME, multiband::PATH)),
-        _ => [eq::NAME, comp::NAME, limiter::NAME, delay::NAME, multiband::NAME]
+        "reverb" | "verb" | "reverb send" | "hall" | "room" => Some((reverb::NAME, reverb::PATH)),
+        _ => [eq::NAME, comp::NAME, limiter::NAME, delay::NAME, multiband::NAME, reverb::NAME]
             .into_iter()
-            .zip([eq::PATH, comp::PATH, limiter::PATH, delay::PATH, multiband::PATH])
+            .zip([eq::PATH, comp::PATH, limiter::PATH, delay::PATH, multiband::PATH, reverb::PATH])
             .find(|(n, _)| n.to_lowercase() == q),
     }
 }
@@ -71,6 +74,7 @@ fn builtin_effect_instance(path: &str) -> Option<Loaded> {
         limiter::PATH => Loaded::Limiter(GainMeter::new()),
         multiband::PATH => Loaded::Multiband(MultibandMeter::new()),
         delay::PATH => Loaded::Delay,
+        reverb::PATH => Loaded::Reverb(GainMeter::new()),
         _ => return None,
     })
 }
@@ -84,6 +88,7 @@ fn builtin_effect_params(loaded: &Loaded) -> Option<(ParamList, fn(u32, f64) -> 
         Loaded::Limiter(_) => (dynamics::limiter_params(), dynamics::limiter_display),
         Loaded::Multiband(_) => (multiband::params(), multiband::display),
         Loaded::Delay => (delay::params(), delay::display),
+        Loaded::Reverb(_) => (reverb::params(), reverb::display),
         _ => return None,
     })
 }
@@ -363,6 +368,7 @@ impl Engine {
             (PluginFormat::Builtin, limiter::PATH) => Box::new(Limiter::new(sr, None)),
             (PluginFormat::Builtin, multiband::PATH) => Box::new(Multiband::new(sr, None)),
             (PluginFormat::Builtin, delay::PATH) => Box::new(Delay::new(sr)),
+            (PluginFormat::Builtin, reverb::PATH) => Box::new(Reverb::new(sr, None)),
             (PluginFormat::Vst3, _) => {
                 let plugin = self.instantiate_vst3_slot(slot)?;
                 let mut p = plugin.create_processor(sr, MAX_BLOCK, 2)?;
@@ -414,6 +420,7 @@ impl Engine {
             Some(Loaded::Limiter(meter)) => with_params(Box::new(Limiter::new(sr as f64, Some(meter.clone()))), &slot.params),
             Some(Loaded::Multiband(meter)) => with_params(Box::new(Multiband::new(sr as f64, Some(meter.clone()))), &slot.params),
             Some(Loaded::Delay) => with_params(Box::new(Delay::new(sr as f64)), &slot.params),
+            Some(Loaded::Reverb(meter)) => with_params(Box::new(Reverb::new(sr as f64, Some(meter.clone()))), &slot.params),
             None => return Ok(None),
         };
         Ok(Some(Box::new(PluginRt { instance: slot.instance, processor, bypass: slot.bypass })))
@@ -553,7 +560,7 @@ impl Engine {
     pub fn fx_meter(&self, track: usize, which: SlotRef) -> Option<std::sync::Arc<GainMeter>> {
         let slot = self.slot_ref(track, which).ok()?;
         match self.pool.get(&slot.instance) {
-            Some(Loaded::Compressor(m) | Loaded::Limiter(m)) => Some(m.clone()),
+            Some(Loaded::Compressor(m) | Loaded::Limiter(m) | Loaded::Reverb(m)) => Some(m.clone()),
             _ => None,
         }
     }
@@ -579,7 +586,7 @@ impl Engine {
     /// Effects available to insert: the built-ins plus scanned VST3 and AU effects.
     pub fn available_effects(&self) -> Vec<(String, String)> {
         let mut list: Vec<(String, String)> =
-            [(eq::NAME, eq::PATH), (comp::NAME, comp::PATH), (multiband::NAME, multiband::PATH), (limiter::NAME, limiter::PATH), (delay::NAME, delay::PATH)].iter().map(|(n, p)| (n.to_string(), p.to_string())).collect();
+            [(eq::NAME, eq::PATH), (comp::NAME, comp::PATH), (multiband::NAME, multiband::PATH), (limiter::NAME, limiter::PATH), (delay::NAME, delay::PATH), (reverb::NAME, reverb::PATH)].iter().map(|(n, p)| (n.to_string(), p.to_string())).collect();
         for p in self.scanned.iter().filter(|p| !p.class.is_instrument()) {
             list.push((format!("{} — {}", p.class.name, p.class.vendor), p.bundle.to_string_lossy().into_owned()));
         }
@@ -709,7 +716,7 @@ impl Engine {
                     }
                 })
                 .collect()),
-            Some(builtin @ (Loaded::Eq(_) | Loaded::Compressor(_) | Loaded::Limiter(_) | Loaded::Multiband(_) | Loaded::Delay)) => {
+            Some(builtin @ (Loaded::Eq(_) | Loaded::Compressor(_) | Loaded::Limiter(_) | Loaded::Multiband(_) | Loaded::Delay | Loaded::Reverb(_))) => {
                 let (list, display) = builtin_effect_params(builtin).expect("checked");
                 Ok(list
                     .into_iter()
@@ -839,5 +846,23 @@ mod tests {
         assert!(!e.project().tracks[t].is_instrument(), "undo removes the instrument");
         e.redo().unwrap();
         assert!(e.project().tracks[t].is_instrument());
+    }
+
+    #[test]
+    fn builtin_reverb_by_name_with_params() {
+        let mut e = Engine::new();
+        let t = e.add_track("Reverb").unwrap();
+        let slot = e.insert_plugin(t, "reverb", None).unwrap();
+        let p = &e.project().tracks[t].plugins[slot];
+        assert_eq!((p.name.as_str(), p.path.as_str(), p.format), (reverb::NAME, reverb::PATH, PluginFormat::Builtin));
+        let params = e.slot_params(t, SlotRef::Effect(slot)).unwrap();
+        let titles: Vec<&str> = params.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, ["Pre-Delay", "Size", "Decay", "Damping", "Low Cut", "Width", "Diffusion", "Modulation", "Mix", "Level"]);
+        let display = e.set_plugin_param(t, slot, reverb::DECAY, reverb::norm_decay(4.0)).unwrap();
+        assert_eq!(display.as_deref(), Some("4.00"));
+        assert!(e.fx_meter(t, SlotRef::Effect(slot)).is_some(), "the editor gets in/out meters");
+        assert!(e.available_effects().iter().any(|(n, _)| n == reverb::NAME));
+        let m = e.insert_master_plugin("OpenTake Reverb", None).unwrap();
+        assert_eq!(e.project().master_plugins[m].path, reverb::PATH);
     }
 }

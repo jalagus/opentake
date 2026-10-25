@@ -18,7 +18,7 @@ you watch the changes appear live — and undo anything you don't like.
 
 - 🎙️ Multitrack recording from any audio interface (CoreAudio, WASAPI, ALSA/JACK via cpal), latency-compensated with a built-in loopback measurement
 - 🎹 Instrument tracks, piano roll, a built-in synth and GM drum kit; VST3 instruments and effects, plus Audio Units on macOS
-- 🎛️ Built-in EQ, compressor, multiband compressor, limiter and delay on any track or the master bus; plug-in delay compensation
+- 🎛️ Built-in EQ, compressor, multiband compressor, limiter, delay and reverb on any track or the master bus; plug-in delay compensation
 - 🔀 Buses: route tracks into a bus and process the group with its own effects and fader
 - 📈 Automation of volume, pan, mute and any plug-in parameter, in lanes under each track, with Read, Touch and Latch modes
 - ⏱️ Project tempo map (tempo and time-signature changes), metronome with count-in
@@ -116,8 +116,11 @@ agent.
 - **MIDI files**: drop a `.mid` file (or File → Import MIDI File…) to pick its parts; each
   becomes an instrument track (channel 10 on the drum kit). File → Export MIDI File… writes
   the MIDI regions back out.
-- **Mix**: an inspector and a mixer (**I**, **X**), plus built-in EQ, compressor, multiband compressor, limiter and
-  delay alongside VST3 and Audio Unit effects. Plug-in latency is compensated automatically.
+- **Mix**: an inspector and a mixer (**I**, **X**), plus built-in EQ, compressor, multiband compressor, limiter,
+  delay and reverb alongside VST3 and Audio Unit effects. The reverb (pre-delay, size, decay,
+  damping, low cut, width, diffusion, modulation) shows its decay tail as you turn the knobs;
+  it starts 100% wet for a reverb bus, so turn Mix down when using it as an insert.
+  Plug-in latency is compensated automatically.
 - **Buses**: Track → New Bus (or Create Bus from Selection), then pick a track's Output in
   the inspector or mixer; effects on the bus process the whole group.
 - **Automation**: the **A** button in a track header (or **A** for all tracks, View → Show
@@ -287,7 +290,6 @@ automation other than tempo, sends/returns and fades aren't imported.
   within it), so changes land within ~1.3 ms of their point; plug-in editor windows don't follow
   automated values; no automation of
   sends (there are none) or of region gain, and Touch/Latch only record from the GUI.
-- No built-in reverb yet (EQ, compressor, multiband compressor, limiter and delay are built in; any VST3 reverb works).
 
 ## Development
 

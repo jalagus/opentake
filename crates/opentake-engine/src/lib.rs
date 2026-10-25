@@ -11,6 +11,7 @@ pub mod delay;
 pub mod drums;
 pub mod dynamics;
 pub mod multiband;
+pub mod reverb;
 pub mod eq;
 pub mod synth;
 

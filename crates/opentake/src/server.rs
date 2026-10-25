@@ -33,7 +33,7 @@ instrument tracks; export_midi_file writes the MIDI regions back out.
 
 Tempo: set_tempo sets the opening tempo/signature; set_tempo_map adds tempo and time-signature changes. \
 Region and note times are always seconds; get_tempo_map and convert_time translate between seconds and \
-bars/beats. Effects: insert_plugin with \"eq\", \"comp\", \"multiband\", \"limiter\" or \"delay\" adds a built-in effect to a track; \
+bars/beats. Effects: insert_plugin with \"eq\", \"comp\", \"multiband\", \"limiter\", \"delay\" or \"reverb\" adds a built-in effect to a track (a reverb usually goes on a bus at 100% wet); \
 insert_master_plugin puts effects on the master bus (address them with master: true); VST3 and, on macOS, Audio Unit plug-ins work too (scan_plugins lists them). Plug-in delay \
 (e.g. the limiter's look-ahead) is compensated automatically. Buses: add_bus (with tracks to group them) \
 creates a bus track; update_track output routes a track to a bus index or \"master\"; effects on the bus \
@@ -1361,12 +1361,12 @@ impl DawServer {
         .await
     }
 
-    #[tool(description = "Insert an effect into a track's chain. Built-ins: \"eq\" (6-band parametric EQ), \"comp\" (compressor: threshold, ratio, attack, release, knee, makeup, mix), \"multiband\" (3-band compressor: two crossovers, then threshold, ratio, attack, release, gain, bypass and solo per band, and output), \"limiter\" (look-ahead brickwall: gain, ceiling, release), \"delay\" (ms or tempo-synced note values, feedback, mix, repeat filters, ping-pong); or a VST3 / AU effect. list_plugin_params shows ids and values. Plug-in latency is compensated automatically. Returns the slot index.")]
+    #[tool(description = "Insert an effect into a track's chain. Built-ins: \"eq\" (6-band parametric EQ), \"comp\" (compressor: threshold, ratio, attack, release, knee, makeup, mix), \"multiband\" (3-band compressor: two crossovers, then threshold, ratio, attack, release, gain, bypass and solo per band, and output), \"limiter\" (look-ahead brickwall: gain, ceiling, release), \"delay\" (ms or tempo-synced note values, feedback, mix, repeat filters, ping-pong), \"reverb\" (algorithmic stereo reverb: pre-delay, size, decay RT60, damping, low cut, width, diffusion, modulation, mix (default 100% wet, for a bus), level); or a VST3 / AU effect. list_plugin_params shows ids and values. Plug-in latency is compensated automatically. Returns the slot index.")]
     async fn insert_plugin(&self, Parameters(a): Parameters<InsertPluginArgs>) -> ToolResult {
         self.with_engine(move |e| e.insert_plugin(a.track, &a.plugin, a.position).map(|s| json!({ "slot": s }))).await
     }
 
-    #[tool(description = "Insert an effect on the master bus (\"eq\", \"comp\", \"multiband\", \"limiter\", \"delay\" or a VST3 / AU effect; a limiter last in the chain sets the final peak ceiling and loudness). Returns the slot index; use master: true with list_plugin_params / set_plugin_param / set_plugin_bypass.")]
+    #[tool(description = "Insert an effect on the master bus (\"eq\", \"comp\", \"multiband\", \"limiter\", \"delay\", \"reverb\" or a VST3 / AU effect; a limiter last in the chain sets the final peak ceiling and loudness). Returns the slot index; use master: true with list_plugin_params / set_plugin_param / set_plugin_bypass.")]
     async fn insert_master_plugin(&self, Parameters(a): Parameters<InsertMasterPluginArgs>) -> ToolResult {
         self.with_engine(move |e| e.insert_master_plugin(&a.plugin, a.position).map(|s| json!({ "slot": s }))).await
     }

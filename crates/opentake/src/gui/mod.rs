@@ -2771,6 +2771,24 @@ mod tests {
     }
 
     #[test]
+    fn reverb_editor_shows_the_tail_and_turns_knobs() {
+        let (mut harness, engine) = harness_with_track();
+        let slot = engine.lock().unwrap().insert_plugin(0, "reverb", None).unwrap();
+        harness.state_mut().open_plugins.push((0, SlotRef::Effect(slot)));
+        harness.step();
+        harness.step();
+        harness.get_by_label("Reverb Decay");
+        let value = |e: &SharedEngine, id: u32| e.lock().unwrap().slot_params(0, SlotRef::Effect(slot)).unwrap().iter().find(|p| p.id == id).unwrap().value;
+        let before = value(&engine, opentake_engine::reverb::DECAY);
+        let knob = harness.get_by_label("Decay").rect().center();
+        drag(&mut harness, knob, knob - egui::vec2(0.0, 40.0));
+        assert!(value(&engine, opentake_engine::reverb::DECAY) > before + 0.05, "dragging up lengthens the decay");
+        for title in ["Pre-Delay", "Size", "Damping", "Low Cut", "Diffusion", "Modulation", "Width", "Mix", "Level"] {
+            harness.get_by_label(title);
+        }
+    }
+
+    #[test]
     fn take_folder_badge_picks_the_take() {
         let (mut harness, engine, dir) = harness_with_region();
         {
@@ -3630,7 +3648,7 @@ mod tests {
             harness.state_mut().export_dialog = None;
         }
         if fx_shot {
-            // Compressor, limiter and delay editors.
+            // Compressor, limiter, delay and reverb editors.
             {
                 use opentake_engine::dynamics::{self, comp};
                 let mut e = engine.lock().unwrap();
@@ -3638,9 +3656,10 @@ mod tests {
                 e.set_plugin_param(1, c, comp::THRESHOLD, dynamics::norm_threshold(-24.0)).unwrap();
                 e.set_plugin_param(1, c, comp::MAKEUP, 4.0 / 24.0).unwrap();
                 let d = e.insert_plugin(1, "delay", None).unwrap();
+                let r = e.insert_plugin(1, "reverb", None).unwrap();
                 let l = e.insert_master_plugin("limiter", None).unwrap();
                 drop(e);
-                for (name, slot) in [("comp", (1, SlotRef::Effect(c))), ("delay", (1, SlotRef::Effect(d))), ("limiter", (MASTER_UI, SlotRef::Master(l)))] {
+                for (name, slot) in [("comp", (1, SlotRef::Effect(c))), ("delay", (1, SlotRef::Effect(d))), ("reverb", (1, SlotRef::Effect(r))), ("limiter", (MASTER_UI, SlotRef::Master(l)))] {
                     harness.state_mut().open_plugins = vec![slot];
                     for _ in 0..6 {
                         harness.step();
