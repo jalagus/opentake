@@ -110,8 +110,10 @@ pub struct Transport {
 /// What the render and host callbacks read. They only run inside `AudioUnitRender`, on the
 /// thread that called it, so the processor writes it just before rendering.
 struct RenderContext {
-    /// Effect input channels (the processor's own buffers), `input_frames` long.
+    /// Effect input channels (the processor's own buffers), `input_frames` long, and the
+    /// side chain's (input element 1).
     input: [*mut f32; 2],
+    key: [*mut f32; 2],
     input_frames: usize,
     transport: Transport,
     sample_rate: f64,
@@ -142,6 +144,8 @@ struct Instance {
     effect: bool,
     /// Takes MIDI (instruments and music effects).
     midi: bool,
+    /// An effect with a second input element, fed the side chain.
+    side_chain: bool,
     /// Boxed so the address handed to the callbacks stays put.
     ctx: Box<UnsafeCell<RenderContext>>,
     /// The format the unit is initialized with, if it is.
@@ -188,6 +192,10 @@ impl Instance {
                     set(kAudioUnitScope_Output) && (!self.effect || set(kAudioUnitScope_Input))
                 })
                 .ok_or(Error::Other("the audio unit supports neither stereo nor mono 32-bit float"))?;
+            if self.side_chain {
+                // The key in the same format; a unit that wants another keeps its own.
+                let _ = set_prop(self.unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &stream_format(sample_rate, channels as u32), "StreamFormat");
+            }
             check(AudioUnitInitialize(self.unit), "AudioUnitInitialize")?;
             (*self.ctx.get()).sample_rate = sample_rate;
             *setup = Some(Setup { sample_rate, max_block, channels });
@@ -220,11 +228,12 @@ impl AuPlugin {
         let comp = find_component(&info.id).ok_or_else(|| Error::NotFound(info.display_name()))?;
         let unit = unsafe { instantiate(comp)? };
         let ty = crate::parse_id(&info.id).map_or(0, |c| c[0]);
-        let ctx = RenderContext { input: [std::ptr::null_mut(); 2], input_frames: 0, transport: Transport::default(), sample_rate, transport_changed: true };
+        let ctx = RenderContext { input: [std::ptr::null_mut(); 2], key: [std::ptr::null_mut(); 2], input_frames: 0, transport: Transport::default(), sample_rate, transport_changed: true };
         let mut inst = Instance {
             unit,
             effect: ty != kAudioUnitType_MusicDevice,
             midi: ty != kAudioUnitType_Effect,
+            side_chain: false,
             ctx: Box::new(UnsafeCell::new(ctx)),
             setup: Mutex::new(None),
             params: Vec::new(),
@@ -243,6 +252,9 @@ impl AuPlugin {
             if inst.effect {
                 let input = AURenderCallbackStruct { inputProc: Some(render_input), inputProcRefCon: user };
                 set_prop(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &input, "SetRenderCallback")?;
+                // A second input element is the side chain (e.g. Logic-style keyed dynamics).
+                let elements: u32 = get_prop(unit, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0, "ElementCount").unwrap_or(1);
+                inst.side_chain = elements >= 2 && set_prop(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 1, &input, "SetRenderCallback").is_ok();
             }
         }
         inst.configure(sample_rate, max_block)?;
@@ -318,6 +330,12 @@ impl AuPlugin {
         }
     }
 
+    /// Whether the unit takes a side chain (an effect with a second input element), which
+    /// [`AuProcessor::process_keyed`] feeds.
+    pub fn has_side_chain(&self) -> bool {
+        self.inst.side_chain
+    }
+
     /// Prepare the unit for processing and return the audio-thread half.
     pub fn create_processor(&self, sample_rate: f64, max_block: usize) -> Result<AuProcessor> {
         let channels = self.inst.configure(sample_rate, max_block)?;
@@ -331,6 +349,7 @@ impl AuPlugin {
             channels,
             max_block,
             input: (0..2).map(|_| vec![0.0; max_block]).collect(),
+            key: (0..2).map(|_| vec![0.0; max_block]).collect(),
             output: (0..channels).map(|_| vec![0.0; max_block]).collect(),
             list: BufferList { count: 0, buffers: [empty; 2] },
             sample_time: 0.0,
@@ -353,6 +372,8 @@ pub struct AuProcessor {
     channels: usize,
     max_block: usize,
     input: Vec<Vec<f32>>,
+    /// The side chain (silence when not keyed).
+    key: Vec<Vec<f32>>,
     output: Vec<Vec<f32>>,
     list: BufferList,
     sample_time: f64,
@@ -376,18 +397,30 @@ impl AuProcessor {
     /// Process `frames` samples (up to the max block). `inputs` feed an effect's input;
     /// the unit's output is written to every channel of `outputs`.
     pub fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, transport: &Transport, notes: &[NoteEvent]) {
+        self.process_keyed(inputs, None, outputs, frames, transport, notes);
+    }
+
+    /// [`process`](Self::process) with a side chain for the unit's second input element (if
+    /// it has one; silence there when `key` is `None`).
+    pub fn process_keyed(&mut self, inputs: &[&[f32]], key: Option<&[&[f32]]>, outputs: &mut [&mut [f32]], frames: usize, transport: &Transport, notes: &[NoteEvent]) {
         let frames = frames.min(self.max_block);
         if frames == 0 {
             return;
         }
         let unit = self.inst.unit;
-        if self.inst.effect {
-            for (ch, buf) in self.input.iter_mut().enumerate() {
-                match inputs.get(ch).or(inputs.first()) {
+        let copy = |bufs: &mut Vec<Vec<f32>>, from: &[&[f32]]| {
+            for (ch, buf) in bufs.iter_mut().enumerate() {
+                match from.get(ch).or(from.first()) {
                     Some(src) => buf[..frames].copy_from_slice(&src[..frames]),
                     None => buf[..frames].fill(0.0),
                 }
             }
+        };
+        if self.inst.effect {
+            copy(&mut self.input, inputs);
+        }
+        if self.inst.side_chain {
+            copy(&mut self.key, key.unwrap_or(&[]));
         }
         let changed = self.last.is_none_or(|(playing, next)| playing != transport.playing || (playing && next != transport.position_samples));
         self.last = Some((transport.playing, transport.position_samples + frames as i64));
@@ -395,6 +428,7 @@ impl AuProcessor {
         unsafe {
             let ctx = &mut *self.inst.ctx.get();
             ctx.input = [self.input[0].as_mut_ptr(), self.input[1].as_mut_ptr()];
+            ctx.key = [self.key[0].as_mut_ptr(), self.key[1].as_mut_ptr()];
             ctx.input_frames = frames;
             ctx.transport = *transport;
             ctx.transport_changed = changed;
@@ -432,12 +466,13 @@ impl AuProcessor {
 
 // ---------------------------------------------------------------- callbacks
 
-/// Supplies an effect's input from the processor's buffers.
+/// Supplies an effect's input (element 0) and side chain (element 1) from the processor's
+/// buffers.
 unsafe extern "C-unwind" fn render_input(
     ref_con: NonNull<c_void>,
     _flags: NonNull<AudioUnitRenderActionFlags>,
     _stamp: NonNull<AudioTimeStamp>,
-    _bus: u32,
+    bus: u32,
     frames: u32,
     io: *mut AudioBufferList,
 ) -> i32 {
@@ -451,7 +486,7 @@ unsafe extern "C-unwind" fn render_input(
         let frames = (frames as usize).min(ctx.input_frames);
         for i in 0..n {
             let b = &mut *buffers.add(i);
-            let src = ctx.input[i.min(1)];
+            let src = if bus == 1 { ctx.key[i.min(1)] } else { ctx.input[i.min(1)] };
             if src.is_null() {
                 continue;
             }

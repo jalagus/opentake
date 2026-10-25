@@ -82,6 +82,8 @@ pub struct DeEsser {
     /// Per channel the crossover's low and high halves (4th-order: two sections each).
     low: [[Biquad; 2]; 2],
     band: [[Biquad; 2]; 2],
+    /// The same high band of the side chain, the detector when keyed.
+    key_band: [[Biquad; 2]; 2],
     reduction_db: f64,
     meter: Option<Arc<GainMeter>>,
 }
@@ -101,6 +103,7 @@ impl DeEsser {
             listen: false,
             low: [[Biquad::default(); 2]; 2],
             band: [[Biquad::default(); 2]; 2],
+            key_band: [[Biquad::default(); 2]; 2],
             reduction_db: 0.0,
             meter,
         };
@@ -118,10 +121,11 @@ impl DeEsser {
         self.wideband = v(MODE) >= 0.5;
         self.listen = v(LISTEN) >= 0.5;
         let hz = frequency_of(v(FREQUENCY));
-        for (low, band) in self.low.iter_mut().zip(&mut self.band) {
-            for (l, h) in low.iter_mut().zip(band.iter_mut()) {
+        for ((low, band), key) in self.low.iter_mut().zip(&mut self.band).zip(&mut self.key_band) {
+            for ((l, h), k) in low.iter_mut().zip(band.iter_mut()).zip(key.iter_mut()) {
                 l.pass(hz, 0.707, sr, false);
                 h.pass(hz, 0.707, sr, true);
+                k.pass(hz, 0.707, sr, true);
             }
         }
         self.dirty = false;
@@ -129,7 +133,13 @@ impl DeEsser {
 }
 
 impl Processor for DeEsser {
-    fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, _t: &Transport, _e: &[MidiEvent]) {
+    fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, t: &Transport, e: &[MidiEvent]) {
+        self.process_keyed(inputs, None, outputs, frames, t, e);
+    }
+
+    /// Keyed, the side chain's high band is the detector (e.g. a dry vocal de-essing its
+    /// reverb bus); the input's own band is still what Split mode reduces.
+    fn process_keyed(&mut self, inputs: &[&[f32]], key: Option<&[&[f32]]>, outputs: &mut [&mut [f32]], frames: usize, _t: &Transport, _e: &[MidiEvent]) {
         if self.dirty {
             self.update();
         }
@@ -138,7 +148,11 @@ impl Processor for DeEsser {
         for i in 0..frames {
             let (l, r) = (il[i] as f64, ir[i] as f64);
             let (hl, hr) = (chain(&mut self.band[0], l), chain(&mut self.band[1], r));
-            let over = db(hl.abs().max(hr.abs())) - self.threshold_db;
+            let detect = match key {
+                Some([kl, kr, ..]) => chain(&mut self.key_band[0], kl[i] as f64).abs().max(chain(&mut self.key_band[1], kr[i] as f64).abs()),
+                _ => hl.abs().max(hr.abs()),
+            };
+            let over = db(detect) - self.threshold_db;
             let target = (over * (1.0 - 1.0 / RATIO)).clamp(0.0, self.range_db);
             let coef = if target > self.reduction_db { self.attack } else { self.release };
             self.reduction_db = coef * self.reduction_db + (1.0 - coef) * target;

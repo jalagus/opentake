@@ -73,9 +73,10 @@ impl Project {
         false
     }
 
-    /// Whether track `index` may send to `bus`: a bus that isn't the track itself or fed by it.
+    /// Whether track `index` may send to `bus`: a bus that isn't the track itself or mixed
+    /// before it (fed by it, or keying it).
     pub fn can_send(&self, index: usize, bus: usize) -> bool {
-        bus != index && self.tracks.get(bus).is_some_and(|t| t.bus) && !self.feeds(bus, index)
+        bus != index && self.tracks.get(bus).is_some_and(|t| t.bus) && !self.precedes(bus, index)
     }
 
     /// Tracks with a send to bus `index`.

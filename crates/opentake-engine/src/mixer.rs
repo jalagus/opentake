@@ -58,6 +58,12 @@ pub trait Processor: Send {
     /// Process a stereo block. `inputs` and `outputs` each hold two channels; `events`
     /// (sorted by offset) are only non-empty for instruments.
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, transport: &Transport, events: &[MidiEvent]);
+    /// `process` with a side-chain (key) signal for the detector when the slot is keyed: two
+    /// channels lined up with `inputs` on the timeline. Processors without a key input ignore it.
+    fn process_keyed(&mut self, inputs: &[&[f32]], key: Option<&[&[f32]]>, outputs: &mut [&mut [f32]], frames: usize, transport: &Transport, events: &[MidiEvent]) {
+        let _ = key;
+        self.process(inputs, outputs, frames, transport, events)
+    }
     fn set_param(&mut self, id: u32, normalized: f64);
     /// Processing delay in samples (look-ahead etc.); the mixer compensates for it.
     fn latency(&self) -> usize {
@@ -70,6 +76,27 @@ pub struct PluginRt {
     pub instance: u64,
     pub processor: Box<dyn Processor>,
     pub bypass: bool,
+    /// Side-chain input, if the slot is keyed.
+    pub key: Option<KeyRt>,
+}
+
+/// A slot's side chain: another track's signal for the detector.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyRt {
+    /// The key track (id).
+    pub source: u64,
+    /// Tapped before the source's fader, pan and mute.
+    pub pre_fader: bool,
+    /// Resolved on the audio thread: the source's index, and how far back its delay line is
+    /// read so the key lines up with the slot's input.
+    src: Option<usize>,
+    delay: usize,
+}
+
+impl KeyRt {
+    pub fn new(source: u64, pre_fader: bool) -> Self {
+        Self { source, pre_fader, src: None, delay: 0 }
+    }
 }
 
 /// A note in absolute timeline samples (end already clamped to its region).
@@ -224,7 +251,8 @@ pub struct TrackRt {
     /// This track's plug-in delay (samples), refreshed every callback.
     latency: usize,
     /// Plug-in delay of everything before this track's output (a bus: its slowest input plus
-    /// its own chain), and the slowest arrival among a bus's inputs.
+    /// its own chain), and how late its chain's input is: for a bus the slowest arrival among
+    /// its inputs, and for any track enough that side chains reach their slots in time.
     arrival: usize,
     in_latency: usize,
     /// Delay line that lines the track up with the slowest one reaching the same bus or the
@@ -315,6 +343,8 @@ pub enum Command {
     SetInstrument { track: u64, plugin: Option<Box<PluginRt>> },
     SetPluginBypass { track: u64, instance: u64, bypass: bool },
     SetPluginParam { track: u64, instance: u64, id: u32, value: f64 },
+    /// Key a slot from another track, or with `None` stop keying it.
+    SetSideChain { track: u64, instance: u64, key: Option<KeyRt> },
     /// Put tracks in this id order (mixer order = meter order = project order).
     ReorderTracks(Box<Vec<u64>>),
     /// The order to process tracks in (ids): every track before the buses it feeds. Tracks
@@ -457,6 +487,8 @@ pub struct Mixer {
     input: Vec<Vec<f32>>,
     master: [Vec<f32>; 2],
     scratch: [Vec<f32>; 2],
+    /// The side chain of the slot being processed.
+    key: [Vec<f32>; 2],
 }
 
 impl Mixer {
@@ -504,6 +536,7 @@ impl Mixer {
             input: (0..MAX_INPUT_CHANNELS).map(|_| vec![0.0; MAX_BLOCK]).collect(),
             master: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
             scratch: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
+            key: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
         }
     }
 
@@ -548,6 +581,10 @@ impl Mixer {
     /// master (outputs and sends alike) is delayed to match the slowest arrival there, so
     /// every path ends up as long as the slowest one; tracks read the timeline that far ahead
     /// (plus the master chain) and the output lines up with the playhead.
+    ///
+    /// A side chain must reach its slot no later than the slot's own input: a keyed track
+    /// takes its input late enough for that (raising `in_latency`, so it renders the timeline
+    /// that much later), and each key reads its source's delay line at the difference.
     fn update_latency(&mut self) {
         if self.routing_dirty {
             self.rebuild_routing();
@@ -561,8 +598,10 @@ impl Mixer {
         // In processing order, so a bus has heard from all its inputs before its own turn.
         let mut master = 0;
         for &ti in &self.order {
+            let need = key_need(&self.tracks, ti);
             let t = &mut self.tracks[ti];
-            t.arrival = if t.bus { t.in_latency } else { 0 } + t.latency;
+            t.in_latency = t.in_latency.max(need);
+            t.arrival = t.in_latency + t.latency;
             let arrival = t.arrival;
             match t.dest {
                 Some(d) => self.tracks[d].in_latency = self.tracks[d].in_latency.max(arrival),
@@ -583,8 +622,16 @@ impl Mixer {
                 let delay = target.saturating_sub(self.tracks[ti].arrival).min(MAX_DELAY);
                 self.tracks[ti].sends[k].delay = delay;
             }
+            key_delays(&mut self.tracks, ti);
         }
         self.master_arrival = master;
+        let mut pre = master;
+        for p in self.master_plugins.iter_mut().filter(|p| !p.bypass) {
+            if let Some(k) = p.key.as_mut() {
+                k.delay = k.src.map_or(0, |s| pre.saturating_sub(self.tracks[s].arrival).min(MAX_DELAY));
+            }
+            pre += p.processor.latency();
+        }
         self.lookahead = (master + chain(&self.master_plugins)) as u64;
         self.shared.latency.store(self.lookahead as u32, Ordering::Relaxed);
     }
@@ -618,6 +665,20 @@ impl Mixer {
             for k in 0..self.tracks[i].sends.len() {
                 let bus = self.tracks[i].sends[k].bus;
                 self.tracks[i].sends[k].dest = self.tracks.iter().position(|t| t.id == bus && t.bus).filter(|&d| d != i);
+            }
+            for k in 0..self.tracks[i].plugins.len() {
+                let Some(source) = self.tracks[i].plugins[k].key.map(|k| k.source) else { continue };
+                let src = self.tracks.iter().position(|t| t.id == source).filter(|&s| s != i);
+                if let Some(key) = &mut self.tracks[i].plugins[k].key {
+                    key.src = src;
+                }
+            }
+        }
+        for k in 0..self.master_plugins.len() {
+            let Some(source) = self.master_plugins[k].key.map(|k| k.source) else { continue };
+            let src = self.tracks.iter().position(|t| t.id == source);
+            if let Some(key) = &mut self.master_plugins[k].key {
+                key.src = src;
             }
         }
         // Solo: a soloed track keeps the buses it feeds (through outputs and sends) audible,
@@ -857,6 +918,12 @@ impl Mixer {
                         e.last = f32::NAN;
                     }
                 }
+                Command::SetSideChain { track, instance, key } => {
+                    self.routing_dirty = true;
+                    if let Some(p) = self.plugin_mut(track, instance) {
+                        p.key = key;
+                    }
+                }
                 Command::ReorderTracks(order) => {
                     self.routing_dirty = true;
                     self.tracks.sort_unstable_by_key(|t| order.iter().position(|&id| id == t.id).unwrap_or(usize::MAX));
@@ -935,6 +1002,13 @@ impl Mixer {
                 let ahead = (self.transport.position_samples + self.lookahead as i64).max(0) as u64;
                 if ahead < end {
                     n = n.min((end - ahead) as usize).max(1);
+                }
+                // Keyed tracks read the timeline later; they wrap exactly as well.
+                for t in self.tracks.iter().filter(|t| !t.bus && t.in_latency > 0) {
+                    let at = (ahead as i64 - t.in_latency as i64).max(0) as u64;
+                    if at < end {
+                        n = n.min((end - at) as usize).max(1);
+                    }
                 }
             }
             let in_chunk = if done < in_frames {
@@ -1025,9 +1099,17 @@ impl Mixer {
         // Auto input monitoring: armed tracks hear their input except during plain playback,
         // where they play what was recorded.
         let auto_monitor = self.auto_monitor && (!self.transport.playing || self.transport.recording || self.counting.is_some());
+        let cycle = self.active_loop();
         for k in 0..self.order.len() {
             let ti = self.order[k];
-            let track = &mut *self.tracks[ti];
+            // The track, and the others (side chains read the key tracks' delay lines).
+            let (head, rest) = self.tracks.split_at_mut(ti);
+            let (track, tail) = rest.split_first_mut().expect("order holds valid indices");
+            let track = &mut **track;
+            let other = |s: usize| if s < ti { &*head[s] } else { &*tail[s - ti - 1] };
+            // A keyed track reads the timeline later by its input delay (see `update_latency`).
+            let pos = if track.bus || track.in_latency == 0 { pos } else { timeline_at(self.transport.position_samples, self.lookahead.saturating_sub(track.in_latency as u64), cycle) };
+            let transport = Transport { position_samples: pos as i64, ..block_transport };
             let [l, r] = &mut track.buf;
             if !track.bus {
                 l[..n].fill(0.0);
@@ -1071,7 +1153,7 @@ impl Mixer {
 
             // Plug-in parameters follow their envelopes at the timeline position each plug-in
             // is processing: behind the read-ahead by the plug-in delay before it.
-            let mut back = if track.bus { track.in_latency } else { 0 };
+            let mut back = track.in_latency;
             if let Some(inst) = track.instrument.as_mut() {
                 apply_params(&mut track.automation, inst, clock.at(clock.start, back));
                 back += if inst.bypass { 0 } else { inst.processor.latency() };
@@ -1082,7 +1164,7 @@ impl Mixer {
                 if !inst.bypass {
                     let inputs: [&[f32]; 2] = [&l[..n], &r[..n]];
                     let mut outputs: [&mut [f32]; 2] = [&mut sl[..n], &mut sr[..n]];
-                    inst.processor.process(&inputs, &mut outputs, n, &block_transport, &track.events);
+                    inst.processor.process(&inputs, &mut outputs, n, &transport, &track.events);
                 }
                 for i in 0..n {
                     l[i] += sl[i];
@@ -1096,11 +1178,13 @@ impl Mixer {
                     continue;
                 }
                 back += plugin.processor.latency();
+                let keyed = plugin.key.and_then(|k| Some(fill_key(&k, other(k.src?), &mut self.key, n, &clock))).is_some();
                 let [sl, sr] = &mut self.scratch;
                 {
                     let inputs: [&[f32]; 2] = [&l[..n], &r[..n]];
+                    let key: [&[f32]; 2] = [&self.key[0][..n], &self.key[1][..n]];
                     let mut outputs: [&mut [f32]; 2] = [&mut sl[..n], &mut sr[..n]];
-                    plugin.processor.process(&inputs, &mut outputs, n, &block_transport, &[]);
+                    plugin.processor.process_keyed(&inputs, keyed.then_some(&key[..]), &mut outputs, n, &transport, &[]);
                 }
                 l[..n].copy_from_slice(&sl[..n]);
                 r[..n].copy_from_slice(&sr[..n]);
@@ -1184,12 +1268,14 @@ impl Mixer {
                 continue;
             }
             back += plugin.processor.latency();
+            let keyed = plugin.key.and_then(|k| Some(fill_key(&k, &self.tracks[k.src?], &mut self.key, n, &clock))).is_some();
             let [sl, sr] = &mut self.scratch;
             {
                 let [ml, mr] = &self.master;
                 let inputs: [&[f32]; 2] = [&ml[..n], &mr[..n]];
+                let key: [&[f32]; 2] = [&self.key[0][..n], &self.key[1][..n]];
                 let mut outputs: [&mut [f32]; 2] = [&mut sl[..n], &mut sr[..n]];
-                plugin.processor.process(&inputs, &mut outputs, n, &block_transport, &[]);
+                plugin.processor.process_keyed(&inputs, keyed.then_some(&key[..]), &mut outputs, n, &block_transport, &[]);
             }
             self.master[0][..n].copy_from_slice(&sl[..n]);
             self.master[1][..n].copy_from_slice(&sr[..n]);
@@ -1359,6 +1445,59 @@ fn send_gains(p: &TrackParams, envs: &[EnvelopeRt], send: &SendRt, secs: f64) ->
         [1.0; 2]
     };
     tap.map(|g| g * level)
+}
+
+/// How late track `ti` must take its input so every side chain on it (from tracks mixed
+/// earlier, whose arrivals are known) reaches its slot no later than the slot's input.
+fn key_need(tracks: &[Box<TrackRt>], ti: usize) -> usize {
+    let t = &tracks[ti];
+    let mut pre = t.instrument.as_ref().filter(|p| !p.bypass).map_or(0, |p| p.processor.latency());
+    let mut need = 0;
+    for p in t.plugins.iter().filter(|p| !p.bypass) {
+        if let Some(s) = p.key.and_then(|k| k.src) {
+            need = need.max(tracks[s].arrival.saturating_sub(pre));
+        }
+        pre += p.processor.latency();
+    }
+    need.min(MAX_DELAY)
+}
+
+/// Each side chain on track `ti` reads its source's delay line this far back: the slot's
+/// stage (input delay plus the plug-ins before it) less the source's arrival.
+fn key_delays(tracks: &mut [Box<TrackRt>], ti: usize) {
+    let t = &tracks[ti];
+    let mut pre = t.in_latency + t.instrument.as_ref().filter(|p| !p.bypass).map_or(0, |p| p.processor.latency());
+    for j in 0..tracks[ti].plugins.len() {
+        let p = &tracks[ti].plugins[j];
+        if p.bypass {
+            continue;
+        }
+        let (latency, src) = (p.processor.latency(), p.key.and_then(|k| k.src));
+        if let Some(s) = src {
+            let delay = pre.saturating_sub(tracks[s].arrival).min(MAX_DELAY);
+            if let Some(k) = &mut tracks[ti].plugins[j].key {
+                k.delay = delay;
+            }
+        }
+        pre += latency;
+    }
+}
+
+/// Fill `out` with a slot's side chain for this block: the key track's signal off its delay
+/// line (already written this block, since key tracks are mixed first), `delay` back so it
+/// lines up with the slot's input; post-fader through the source's fader, pan and mute.
+fn fill_key(key: &KeyRt, src: &TrackRt, out: &mut [Vec<f32>; 2], n: usize, clock: &Clock) {
+    let g = match (key.pre_fader, src.params.mute) {
+        (true, _) => [1.0; 2],
+        (false, true) => [0.0; 2],
+        (false, false) => fader_gains(&src.params, &src.automation, clock.at(clock.end, src.arrival + key.delay)),
+    };
+    let start = src.comp_write + MAX_COMP - n - key.delay;
+    for ch in 0..2 {
+        for (i, o) in out[ch][..n].iter_mut().enumerate() {
+            *o = src.comp[ch][(start + i) & (MAX_COMP - 1)] * g[ch];
+        }
+    }
 }
 
 /// Track `a` to read from and track `b` to add into (`a != b`).
@@ -1764,9 +1903,9 @@ mod tests {
             tx.push(Command::AddClip { track: id, clip: ClipRt { start: 1000, len: 4, offset: 0, gain: 1.0, mute: false, data: data.clone(), fades: ClipFades::NONE } }).ok();
         }
         // Track 1 has a 300-sample plug-in, the master a 200-sample one.
-        let slow = Box::new(PluginRt { instance: 9, processor: Box::new(Latent::new(300)), bypass: false });
+        let slow = Box::new(PluginRt { instance: 9, processor: Box::new(Latent::new(300)), bypass: false, key: None });
         tx.push(Command::SetPluginChain { track: 1, order: Box::new(vec![(9, false)]), new: Box::new(vec![slow]), target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)) }).ok();
-        let master = Box::new(PluginRt { instance: 10, processor: Box::new(Latent::new(200)), bypass: false });
+        let master = Box::new(PluginRt { instance: 10, processor: Box::new(Latent::new(200)), bypass: false, key: None });
         tx.push(Command::SetPluginChain { track: MASTER, order: Box::new(vec![(10, false)]), new: Box::new(vec![master]), target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)) }).ok();
         tx.push(Command::Play).ok();
         let out = run(&mut m, 10);
@@ -1780,7 +1919,7 @@ mod tests {
     }
 
     fn chain(tx: &mut Producer<Command>, track: u64, instance: u64, processor: Box<dyn Processor>) {
-        let p = Box::new(PluginRt { instance, processor, bypass: false });
+        let p = Box::new(PluginRt { instance, processor, bypass: false, key: None });
         tx.push(Command::SetPluginChain { track, order: Box::new(vec![(instance, false)]), new: Box::new(vec![p]), target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)) }).ok();
     }
 
@@ -1943,7 +2082,7 @@ mod tests {
     fn recording_notes_its_pre_roll_and_the_measured_round_trip() {
         let (mut m, mut tx, _g, shared) = mixer();
         tx.push(Command::AddTrack(Box::new(TrackRt::new(1, params())))).ok();
-        let slow = Box::new(PluginRt { instance: 9, processor: Box::new(Latent::new(300)), bypass: false });
+        let slow = Box::new(PluginRt { instance: 9, processor: Box::new(Latent::new(300)), bypass: false, key: None });
         tx.push(Command::SetPluginChain { track: 1, order: Box::new(vec![(9, false)]), new: Box::new(vec![slow]), target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)) }).ok();
         assert_eq!(shared.io_latency.load(Ordering::Relaxed), LATENCY_UNKNOWN);
         m.report_io_latency(240.0);
@@ -1989,7 +2128,7 @@ mod tests {
         let data = Arc::new(AudioData { channels: vec![impulse], sample_rate: 48_000 });
         tx.push(Command::AddTrack(Box::new(TrackRt::new(1, params())))).ok();
         tx.push(Command::AddClip { track: 1, clip: ClipRt { start: 100, len: 4, offset: 0, gain: 1.0, mute: false, data, fades: ClipFades::NONE } }).ok();
-        let slow = Box::new(PluginRt { instance: 9, processor: Box::new(Latent::new(300)), bypass: false });
+        let slow = Box::new(PluginRt { instance: 9, processor: Box::new(Latent::new(300)), bypass: false, key: None });
         tx.push(Command::SetPluginChain { track: 1, order: Box::new(vec![(9, false)]), new: Box::new(vec![slow]), target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)) }).ok();
         tx.push(Command::SetLoop { enabled: true, start: 0, end: 2000 }).ok();
         tx.push(Command::Play).ok();
@@ -2019,7 +2158,7 @@ mod tests {
     fn master_inserts_process_the_master_bus() {
         let (mut m, mut tx, _g, _s) = mixer();
         tx.push(Command::AddTrack(Box::new(TrackRt::new(1, TrackParams { monitor: true, ..params() })))).ok();
-        let plugin = Box::new(PluginRt { instance: 7, processor: Box::new(Gain(0.5)), bypass: false });
+        let plugin = Box::new(PluginRt { instance: 7, processor: Box::new(Gain(0.5)), bypass: false, key: None });
         tx.push(Command::SetPluginChain { track: MASTER, order: Box::new(vec![(7, false)]), new: Box::new(vec![plugin]), target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)) }).ok();
         let input = vec![0.8f32; 64];
         let mut out = vec![0.0; 64];
@@ -2054,7 +2193,7 @@ mod tests {
         let (mut m, mut tx, _g, _s) = mixer();
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut t = TrackRt::new(1, params());
-        t.instrument = Some(Box::new(PluginRt { instance: 9, processor: Box::new(Probe(log.clone(), 0)), bypass: false }));
+        t.instrument = Some(Box::new(PluginRt { instance: 9, processor: Box::new(Probe(log.clone(), 0)), bypass: false, key: None }));
         t.midi.push(MidiClipRt {
             start: 0,
             end: 2000,
@@ -2097,8 +2236,8 @@ mod tests {
         let (mut m, mut tx, mut g, _s) = mixer();
         tx.push(Command::AddTrack(Box::new(TrackRt::new(1, params())))).ok();
         let new = vec![
-            Box::new(PluginRt { instance: 1, processor: Box::new(Tag(1)), bypass: false }),
-            Box::new(PluginRt { instance: 2, processor: Box::new(Tag(2)), bypass: false }),
+            Box::new(PluginRt { instance: 1, processor: Box::new(Tag(1)), bypass: false, key: None }),
+            Box::new(PluginRt { instance: 2, processor: Box::new(Tag(2)), bypass: false, key: None }),
         ];
         let target = || Box::new(Vec::with_capacity(PLUGIN_CAPACITY));
         tx.push(Command::SetPluginChain { track: 1, order: Box::new(vec![(1, false), (2, false)]), new: Box::new(new), target: target() }).ok();
@@ -2222,8 +2361,8 @@ mod tests {
         tx.push(Command::AddTrack(Box::new(TrackRt::new(1, TrackParams { monitor: true, ..params() })))).ok();
         tx.push(Command::AddClip { track: 1, clip: dc_clip(0, 4000, 0.5) }).ok();
         // A gain, then 300 samples of delay: the gain processes timeline audio 300 ahead.
-        let gain = Box::new(PluginRt { instance: 7, processor: Box::new(Gain(1.0)), bypass: false });
-        let late = Box::new(PluginRt { instance: 8, processor: Box::new(Latent::new(300)), bypass: false });
+        let gain = Box::new(PluginRt { instance: 7, processor: Box::new(Gain(1.0)), bypass: false, key: None });
+        let late = Box::new(PluginRt { instance: 8, processor: Box::new(Latent::new(300)), bypass: false, key: None });
         tx.push(Command::SetPluginChain { track: 1, order: Box::new(vec![(7, false), (8, false)]), new: Box::new(vec![gain, late]), target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)) }).ok();
         let lanes = vec![env(EnvTarget::Param { instance: 7, id: 0 }, &[(0, 1.0, Hold), (1000, 0.25, Linear)])];
         tx.push(Command::SetAutomation { track: 1, lanes: Box::new(lanes) }).ok();
@@ -2277,5 +2416,74 @@ mod tests {
         tx.push(Command::RemoveTrack(7)).ok();
         m.process(&[], 0, &mut [0.0; 8], 2);
         assert!(matches!(g.pop(), Ok(Garbage::Track(t)) if t.id == 7));
+    }
+
+    const KICKS: [usize; 3] = [2_000, 26_000, 50_000];
+
+    /// Kick bursts (64 samples at 0.8, every half second from sample 2000) on track 1 with its
+    /// fader down, and a steady 0.25 on track 2 (DC shows the gain directly) through `fx`
+    /// (instance, processor, key). The pad is added first: the routing puts the kick before it.
+    fn keyed(fx: Vec<(u64, Box<dyn Processor>, Option<KeyRt>)>, kick_latency: usize) -> (Mixer, Producer<Command>, Arc<SharedState>) {
+        let (m, mut tx, _g, shared) = mixer();
+        let mut kick = vec![0.0f32; 72_000];
+        for h in KICKS {
+            kick[h..h + 64].fill(0.8);
+        }
+        let clip = |data: Vec<f32>| ClipRt { start: 0, len: data.len() as u64, offset: 0, gain: 1.0, mute: false, data: Arc::new(AudioData { channels: vec![data], sample_rate: 48_000 }), fades: ClipFades::NONE };
+        tx.push(Command::AddTrack(Box::new(TrackRt::new(2, params())))).ok();
+        tx.push(Command::AddTrack(Box::new(TrackRt::new(1, TrackParams { volume: 0.0, ..params() })))).ok();
+        tx.push(Command::AddClip { track: 1, clip: clip(kick) }).ok();
+        tx.push(Command::AddClip { track: 2, clip: clip(vec![0.25; 72_000]) }).ok();
+        tx.push(Command::SetRouting(Box::new(vec![1, 2]))).ok();
+        if kick_latency > 0 {
+            chain(&mut tx, 1, 9, Box::new(Latent::new(kick_latency)));
+        }
+        let order = Box::new(fx.iter().map(|c| (c.0, false)).collect());
+        let new = Box::new(fx.into_iter().map(|(instance, processor, key)| Box::new(PluginRt { instance, processor, bypass: false, key })).collect());
+        tx.push(Command::SetPluginChain { track: 2, order, new, target: Box::new(Vec::with_capacity(PLUGIN_CAPACITY)) }).ok();
+        tx.push(Command::Play).ok();
+        (m, tx, shared)
+    }
+
+    fn ducker() -> Box<dyn Processor> {
+        use crate::dynamics::*;
+        let mut c = Compressor::new(48_000.0, None);
+        for (id, v) in [(comp::THRESHOLD, norm_threshold(-40.0)), (comp::RATIO, norm_ratio(20.0)), (comp::ATTACK, norm_attack(0.1)), (comp::RELEASE, norm_release(50.0)), (comp::KNEE, 0.0)] {
+            c.set_param(id, v);
+        }
+        Box::new(c)
+    }
+
+    #[test]
+    fn a_kick_ducks_a_keyed_compressor_on_time_through_plugin_delay() {
+        // 300 samples of plug-in delay on the kick, 100 on the pad before its compressor.
+        let fx = vec![(10, Box::new(Latent::new(100)) as Box<dyn Processor>, None), (11, ducker(), Some(KeyRt::new(1, true)))];
+        let (mut m, mut tx, shared) = keyed(fx, 300);
+        let out = run(&mut m, 160);
+        assert_eq!(shared.latency.load(Ordering::Relaxed), 300, "the pad waits for the kick, nothing more");
+        // The transport started 300 samples early: output sample i is timeline i - 300.
+        for h in KICKS {
+            let at = h + 300;
+            assert!((out[at - 1] - 0.25).abs() < 1e-4, "untouched up to the kick ({h}): {}", out[at - 1]);
+            assert!(out[at] < 0.15 && out[at + 60] < 0.01, "ducks right on the kick ({h}): {} {}", out[at], out[at + 60]);
+            assert!(out[at + 2_400] > out[at + 60] && out[at + 2_400] < 0.2, "recovering 50 ms later: {}", out[at + 2_400]);
+            assert!((out[at + 20_000] - 0.25).abs() < 0.005, "recovered: {}", out[at + 20_000]);
+        }
+        // Post-fader, the kick's closed fader silences the key: no more ducking.
+        tx.push(Command::SetSideChain { track: 2, instance: 11, key: Some(KeyRt::new(1, false)) }).ok();
+        tx.push(Command::Seek(0)).ok();
+        let out = run(&mut m, 120);
+        assert!(out[1_000..].iter().all(|v| (v - 0.25).abs() < 1e-4), "unkeyed by a silent post-fader tap");
+    }
+
+    #[test]
+    fn a_key_opens_a_gate() {
+        let (mut m, _tx, _s) = keyed(vec![(11, Box::new(crate::gate::Gate::new(48_000.0, None)), Some(KeyRt::new(1, true)))], 0);
+        let out = run(&mut m, 120);
+        for h in &KICKS[..2] {
+            assert!(out[h - 10].abs() < 1e-3, "closed before the kick");
+            assert!(out[h + 300] > 0.2, "open on the kick: {}", out[h + 300]);
+            assert!(out[h + 20_000].abs() < 1e-3, "closed again after hold and release");
+        }
     }
 }

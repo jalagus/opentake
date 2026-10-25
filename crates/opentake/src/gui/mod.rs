@@ -100,6 +100,8 @@ pub(crate) struct Snapshot {
     pub meters: HashMap<(usize, SlotRef), Arc<opentake_engine::dynamics::GainMeter>>,
     /// Band meters of built-in multiband compressors whose windows are open.
     pub multiband: HashMap<(usize, SlotRef), Arc<opentake_engine::multiband::MultibandMeter>>,
+    /// Open plug-in windows whose plug-in takes a side chain.
+    pub side_chain_inputs: std::collections::HashSet<(usize, SlotRef)>,
     /// What can be automated, per track index, for tracks showing their automation.
     pub auto_params: HashMap<usize, Vec<AutomationParam>>,
 }
@@ -203,6 +205,8 @@ pub(crate) enum Action {
     SetInstrument { track: usize, query: Option<String> },
     RemovePlugin(usize, SlotRef),
     SetBypass(usize, SlotRef, bool),
+    /// Key a slot from a track (index; `None` = no side chain), tapped pre-fader or not.
+    SetSideChain(usize, SlotRef, Option<usize>, bool),
     SetParam(usize, SlotRef, u32, f64),
     /// Show or hide automation under a track (`None` = every track).
     ShowAutomation { track: Option<usize>, show: bool },
@@ -447,6 +451,7 @@ impl DawApp {
         let taps = open.iter().filter_map(|&(t, s)| Some(((t, s), e.eq_tap(t, s)?))).collect();
         let meters = open.iter().filter_map(|&(t, s)| Some(((t, s), e.fx_meter(t, s)?))).collect();
         let multiband = open.iter().filter_map(|&(t, s)| Some(((t, s), e.multiband_meter(t, s)?))).collect();
+        let side_chain_inputs = open.iter().copied().filter(|&(t, s)| e.supports_side_chain(t, s)).collect();
         let params = open.into_iter().filter_map(|(t, s)| Some(((t, s), e.slot_params(t, s).ok()?))).collect();
         let snap = Snapshot {
             project_path: e.project_path().map(|p| p.to_path_buf()),
@@ -463,6 +468,7 @@ impl DawApp {
             taps,
             meters,
             multiband,
+            side_chain_inputs,
             auto_params,
             project,
         };
@@ -792,6 +798,7 @@ impl DawApp {
                 self.open_plugins.retain(|&(pt, s)| if master { !matches!(s, SlotRef::Master(_)) } else { pt != t || matches!(s, SlotRef::Master(_)) });
             }
             Action::SetBypass(t, s, b) => e.set_slot_bypass(t, s, b)?,
+            Action::SetSideChain(t, s, source, pre) => e.set_side_chain(t, s, source, pre)?,
             Action::SetParam(t, s, id, v) => {
                 let owner = if matches!(s, SlotRef::Master(_)) { None } else { Some(t) };
                 let target = e.param_target(owner, s, id)?;
@@ -1996,6 +2003,9 @@ impl DawApp {
                         if s == SlotRef::Instrument {
                             ui.label(RichText::new("Instrument").size(10.5).color(theme::TEXT_FAINT));
                         }
+                        if snap.side_chain_inputs.contains(&(t, s)) {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| fx_view::side_chain_menu(self, ui, project, t, s));
+                        }
                     });
                     ui.add_space(6.0);
                     let params = snap.params.get(&(t, s)).map(Vec::as_slice).unwrap_or_default();
@@ -2005,7 +2015,13 @@ impl DawApp {
                     }
                     if let Some(kind) = fx.filter(|_| !params.is_empty()) {
                         let bpm = snap.project.tempo_map().tempo_at(snap.status.position_secs.max(0.0));
-                        fx_view::show(self, ui, t, s, kind, params, snap.meters.get(&(t, s)), snap.multiband.get(&(t, s)), bpm);
+                        let owner = if matches!(s, SlotRef::Master(_)) { None } else { Some(t) };
+                        let key = match s {
+                            SlotRef::Effect(k) | SlotRef::Master(k) => project.key_source(owner, k).map(|i| project.tracks[i].name.as_str()),
+                            SlotRef::Instrument => None,
+                        };
+                        let view = fx_view::View { meter: snap.meters.get(&(t, s)), bands: snap.multiband.get(&(t, s)), bpm, key };
+                        fx_view::show(self, ui, t, s, kind, params, view);
                         return;
                     }
                     if params.is_empty() {
@@ -2900,6 +2916,38 @@ mod tests {
     }
 
     #[test]
+    fn plugin_header_picks_a_side_chain_source() {
+        let (mut harness, engine) = harness_with_track();
+        let (c, eq) = {
+            let mut e = engine.lock().unwrap();
+            e.add_track("Kick").unwrap();
+            (e.insert_plugin(0, "comp", None).unwrap(), e.insert_plugin(0, "eq", None).unwrap())
+        };
+        harness.state_mut().bottom = Some(BottomTab::Mixer);
+        harness.state_mut().open_plugins = vec![(0, SlotRef::Effect(c))];
+        harness.step();
+        harness.step();
+        assert!(harness.query_by_label("Key from Guitar").is_none(), "never its own track");
+        click(&mut harness, "Side Chain");
+        click(&mut harness, "Key from Kick");
+        let key = |e: &SharedEngine| e.lock().unwrap().side_chain(0, SlotRef::Effect(c));
+        assert_eq!(key(&engine), Some((1, false)));
+        harness.get_by_label("Key: Kick");
+        harness.get_by_label("Side Chain Kick"); // the key on the mixer's slot
+        harness.get_by_label("Key Low Cut");
+        click(&mut harness, "Key before the source's fader and mute");
+        assert_eq!(key(&engine), Some((1, true)));
+        click(&mut harness, "Side Chain");
+        click(&mut harness, "No Side Chain");
+        assert_eq!(key(&engine), None);
+        // An EQ takes no key: no menu in its header.
+        harness.state_mut().open_plugins = vec![(0, SlotRef::Effect(eq))];
+        harness.step();
+        harness.step();
+        assert!(harness.query_by_label("Side Chain").is_none());
+    }
+
+    #[test]
     fn deesser_editor_switches_mode_and_listen() {
         let (mut harness, engine) = harness_with_track();
         let d = engine.lock().unwrap().insert_plugin(0, "de-esser", None).unwrap();
@@ -3641,6 +3689,7 @@ mod tests {
             e.update_track(1, TrackUpdate { volume: Some(0.6), pan: Some(-0.25), ..Default::default() }).unwrap();
             // A built-in effect, so the shot doesn't depend on the VST3s installed here.
             e.insert_plugin(1, "comp", None).unwrap();
+            e.set_side_chain(1, SlotRef::Effect(0), Some(0), false).unwrap(); // the drums duck the bass
             // Instrument track with a chord progression.
             let keys = e.add_instrument_track("Keys", "synth").unwrap();
             let beat = 60.0 / 110.0;
@@ -3828,6 +3877,7 @@ mod tests {
                 let c = e.insert_plugin(1, "comp", None).unwrap();
                 e.set_plugin_param(1, c, comp::THRESHOLD, dynamics::norm_threshold(-24.0)).unwrap();
                 e.set_plugin_param(1, c, comp::MAKEUP, 4.0 / 24.0).unwrap();
+                e.set_side_chain(1, SlotRef::Effect(c), Some(0), false).unwrap();
                 let d = e.insert_plugin(1, "delay", None).unwrap();
                 let r = e.insert_plugin(1, "reverb", None).unwrap();
                 let l = e.insert_master_plugin("limiter", None).unwrap();

@@ -1,7 +1,8 @@
 //! Editors for the built-in compressor, multiband compressor, limiter, delay and reverb: knobs
 //! for every parameter, plus a transfer curve and gain-reduction meter (compressor), the bands
 //! with draggable crossovers (multiband), meters (limiter), tempo-synced note values (delay)
-//! and the decay tail (reverb).
+//! and the decay tail (reverb). The dynamics show the track keying them; plug-in windows
+//! choose it in their header ([`side_chain_menu`]).
 
 use std::sync::Arc;
 
@@ -12,6 +13,7 @@ use opentake_engine::multiband::{self, MultibandMeter};
 use opentake_engine::reverb;
 use opentake_engine::{chorus, deesser, gate, phaser};
 use opentake_engine::dynamics::{self, CompSettings, GainMeter, comp, limiter};
+use opentake_engine::project::Project;
 use opentake_engine::{ParamView, SlotRef};
 
 use super::{Action, DawApp, theme, widgets};
@@ -61,8 +63,21 @@ impl Kind {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn show(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, kind: Kind, params: &[ParamView], meter: Option<&Arc<GainMeter>>, bands: Option<&Arc<MultibandMeter>>, bpm: f64) {
+/// What an editor shows besides its parameters.
+pub struct View<'a> {
+    pub meter: Option<&'a Arc<GainMeter>>,
+    pub bands: Option<&'a Arc<MultibandMeter>>,
+    /// Tempo at the playhead (delay note values).
+    pub bpm: f64,
+    /// Name of the track keying the slot.
+    pub key: Option<&'a str>,
+}
+
+pub fn show(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, kind: Kind, params: &[ParamView], view: View) {
+    let View { meter, bands, bpm, key } = view;
+    if let Some(name) = key.filter(|_| !matches!(kind, Kind::Delay | Kind::Reverb)) {
+        key_badge(ui, name);
+    }
     match kind {
         Kind::Compressor => compressor(app, ui, t, s, params, meter),
         Kind::Multiband => multiband_view(app, ui, t, s, params, bands),
@@ -74,6 +89,54 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, kind: Kin
         Kind::Chorus => chorus_view(app, ui, t, s, params),
         Kind::Phaser => phaser_view(app, ui, t, s, params),
     }
+}
+
+/// "KEY ‹track›": the detector listens to that track, not the slot's own input.
+fn key_badge(ui: &mut egui::Ui, name: &str) {
+    ui.horizontal(|ui| {
+        let text = RichText::new(format!("KEY  {name}")).size(10.5).strong().color(theme::BG_DEEP);
+        let r = ui.add(egui::Button::new(text).fill(theme::TEMPO).corner_radius(4.0).sense(Sense::hover()));
+        widgets::label(&r, egui::Role::Label, &format!("Key: {name}"));
+        r.on_hover_text(format!("Side chain: the detector listens to {name}"));
+    });
+    ui.add_space(4.0);
+}
+
+/// The side-chain menu in a plug-in window's header (as in Logic): None, or any track or bus
+/// the slot may be keyed by (not one mixed after it), and a PRE toggle for tapping the key
+/// before the source's fader and mute.
+pub fn side_chain_menu(app: &mut DawApp, ui: &mut egui::Ui, project: &Project, t: usize, s: SlotRef) {
+    let (owner, k) = match s {
+        SlotRef::Effect(k) => (Some(t), k),
+        SlotRef::Master(k) => (None, k),
+        SlotRef::Instrument => return,
+    };
+    let slots = owner.map_or(&project.master_plugins, |i| &project.tracks[i].plugins);
+    let current = project.key_source(owner, k);
+    let pre = slots.get(k).and_then(|slot| slot.side_chain).is_some_and(|c| c.pre_fader);
+    // Right to left: the PRE toggle, the menu, its caption.
+    if current.is_some() && widgets::chip(ui, pre, "PRE", theme::TEMPO, "Key before the source's fader and mute", vec2(34.0, 20.0)).clicked() {
+        app.act(Action::SetSideChain(t, s, current, !pre));
+    }
+    let selected = current.map_or("None", |i| project.tracks[i].name.as_str());
+    let picker = egui::ComboBox::from_id_salt(("side_chain", t, s)).selected_text(RichText::new(selected).size(11.0)).width(120.0).truncate().show_ui(ui, |ui| {
+        let none = ui.selectable_label(current.is_none(), "None");
+        widgets::label(&none, egui::Role::Button, "No Side Chain");
+        if none.clicked() && current.is_some() {
+            app.act(Action::SetSideChain(t, s, None, false));
+        }
+        for i in (0..project.tracks.len()).filter(|&i| project.can_key(owner, i)) {
+            let name = &project.tracks[i].name;
+            let item = ui.selectable_label(current == Some(i), name);
+            widgets::label(&item, egui::Role::Button, &format!("Key from {name}"));
+            if item.clicked() && current != Some(i) {
+                app.act(Action::SetSideChain(t, s, Some(i), pre));
+            }
+        }
+    });
+    widgets::label(&picker.response, egui::Role::ComboBox, "Side Chain");
+    picker.response.on_hover_text("Side chain: the track whose signal drives the detector");
+    ui.label(RichText::new("Side Chain:").size(10.5).color(theme::TEXT_FAINT));
 }
 
 fn value(params: &[ParamView], id: u32) -> f64 {
@@ -227,7 +290,7 @@ fn compressor(app: &mut DawApp, ui: &mut egui::Ui, t: usize, s: SlotRef, params:
         bar(ui, "OUT", levels.2, false);
         ui.add_space(8.0);
         ui.vertical(|ui| {
-            knob_row(app, ui, t, s, params, &[comp::THRESHOLD, comp::RATIO, comp::KNEE]);
+            knob_row(app, ui, t, s, params, &[comp::THRESHOLD, comp::RATIO, comp::KNEE, comp::KEY_LOW_CUT]);
             ui.add_space(6.0);
             knob_row(app, ui, t, s, params, &[comp::ATTACK, comp::RELEASE, comp::MAKEUP, comp::MIX]);
         });

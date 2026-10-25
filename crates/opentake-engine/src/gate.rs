@@ -152,17 +152,26 @@ impl Gate {
 }
 
 impl Processor for Gate {
-    fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, _t: &Transport, _e: &[MidiEvent]) {
+    fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, t: &Transport, e: &[MidiEvent]) {
+        self.process_keyed(inputs, None, outputs, frames, t, e);
+    }
+
+    /// Keyed, the side chain (through the key filters) opens and closes the gate.
+    fn process_keyed(&mut self, inputs: &[&[f32]], key: Option<&[&[f32]]>, outputs: &mut [&mut [f32]], frames: usize, _t: &Transport, _e: &[MidiEvent]) {
         if self.dirty {
             self.update();
         }
         let ([il, ir, ..], [ol, or, ..]) = (inputs, outputs) else { return };
+        let (dl, dr) = match key {
+            Some([kl, kr, ..]) => (*kl, *kr),
+            _ => (*il, *ir),
+        };
         // Peak detector: instant rise, ~5 ms fall, so it follows the signal's envelope.
         let fall = coefficient(5.0, self.sample_rate);
         let (mut peak_in, mut peak_out, mut max_atten) = (0.0f32, 0.0f32, 0.0f64);
         for i in 0..frames {
             let (l, r) = (il[i] as f64, ir[i] as f64);
-            let (kl, kr) = (chain(&mut self.key[0], l), chain(&mut self.key[1], r));
+            let (kl, kr) = (chain(&mut self.key[0], dl[i] as f64), chain(&mut self.key[1], dr[i] as f64));
             let level = kl.abs().max(kr.abs());
             self.env = if level > self.env { level } else { fall * self.env + (1.0 - fall) * level };
             let env_db = db(self.env);

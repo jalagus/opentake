@@ -109,7 +109,7 @@ pub fn track_strip(app: &mut DawApp, ui: &mut egui::Ui, t: usize, track: &Track,
             .on_hover_text("Tracks routed to this bus (set their Output) and sends to it");
     } else if let Some(inst) = &track.instrument {
         widgets::section(ui, "Instrument");
-        slot_pill(app, ui, t, SlotRef::Instrument, &inst.name, inst.bypass, w, &snap.instruments);
+        slot_pill(app, ui, t, SlotRef::Instrument, &inst.name, inst.bypass, None, w, &snap.instruments);
     } else {
         widgets::section(ui, "Input");
         let max = snap.status.input_channels.max(1) as u16;
@@ -127,7 +127,8 @@ pub fn track_strip(app: &mut DawApp, ui: &mut egui::Ui, t: usize, track: &Track,
         ui.spacing_mut().item_spacing.y = 3.0;
         egui::ScrollArea::vertical().id_salt(("fx", t)).auto_shrink([false, false]).show(ui, |ui| {
             for (s, slot) in track.plugins.iter().enumerate() {
-                slot_pill(app, ui, t, SlotRef::Effect(s), &slot.name, slot.bypass, w, &[]);
+                let key = snap.project.key_source(Some(t), s).map(|k| snap.project.tracks[k].name.as_str());
+                slot_pill(app, ui, t, SlotRef::Effect(s), &slot.name, slot.bypass, key, w, &[]);
             }
             add_fx_button(app, ui, t, w, snap);
         });
@@ -328,7 +329,8 @@ pub fn master_strip(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot, layout
         ui.spacing_mut().item_spacing.y = 3.0;
         egui::ScrollArea::vertical().id_salt("fx_master").auto_shrink([false, false]).show(ui, |ui| {
             for (s, slot) in snap.project.master_plugins.iter().enumerate() {
-                slot_pill(app, ui, MASTER_UI, SlotRef::Master(s), &slot.name, slot.bypass, w, &[]);
+                let key = snap.project.key_source(None, s).map(|k| snap.project.tracks[k].name.as_str());
+                slot_pill(app, ui, MASTER_UI, SlotRef::Master(s), &slot.name, slot.bypass, key, w, &[]);
             }
             add_fx_button(app, ui, MASTER_UI, w, snap);
         });
@@ -382,9 +384,10 @@ fn fader_section(ui: &mut egui::Ui, gain: &mut f32, peak_db: [f32; 2], a11y: &st
     .inner
 }
 
-/// An insert or instrument slot: power (bypass), name (opens the plug-in window), remove.
+/// An insert or instrument slot: power (bypass), name (opens the plug-in window), a key
+/// when it's side-chained (from `key`), remove.
 #[allow(clippy::too_many_arguments)]
-fn slot_pill(app: &mut DawApp, ui: &mut egui::Ui, t: usize, which: SlotRef, name: &str, bypass: bool, w: f32, instruments: &[(String, String)]) {
+fn slot_pill(app: &mut DawApp, ui: &mut egui::Ui, t: usize, which: SlotRef, name: &str, bypass: bool, key: Option<&str>, w: f32, instruments: &[(String, String)]) {
     let instruments = instruments.to_vec();
     let (rect, _) = ui.allocate_exact_size(vec2(w - 2.0, 22.0), Sense::hover());
     let open = app.open_plugins.contains(&(t, which));
@@ -403,7 +406,7 @@ fn slot_pill(app: &mut DawApp, ui: &mut egui::Ui, t: usize, which: SlotRef, name
         if widgets::icon_plain(ui, Icon::Power, power, if bypass { "Enable plug-in" } else { "Bypass plug-in" }, 18.0).clicked() {
             app.act(Action::SetBypass(t, which, !bypass));
         }
-        let label_w = ui.available_width() - 20.0;
+        let label_w = ui.available_width() - if key.is_some() { 36.0 } else { 20.0 };
         let color = if bypass { theme::TEXT_FAINT } else { theme::TEXT };
         let label = egui::Label::new(RichText::new(short_plugin_name(name)).size(11.0).color(color)).truncate().sense(Sense::click());
         let r = ui.add_sized([label_w, 18.0], label);
@@ -425,6 +428,12 @@ fn slot_pill(app: &mut DawApp, ui: &mut egui::Ui, t: usize, which: SlotRef, name
                     }
                 }
             });
+        }
+        if let Some(source) = key {
+            let (r, resp) = ui.allocate_exact_size(vec2(14.0, 18.0), Sense::hover());
+            widgets::draw_icon(ui.painter(), Icon::Key, r.center(), 5.0, theme::TEMPO);
+            widgets::label(&resp, egui::Role::Image, &format!("Side Chain {source}"));
+            resp.on_hover_text(format!("Side chain from {source}"));
         }
         let remove_tip = if which == SlotRef::Instrument { "Remove instrument" } else { "Remove plug-in" };
         if widgets::icon_plain(ui, Icon::Close, theme::TEXT_DIM, remove_tip, 18.0).clicked() {

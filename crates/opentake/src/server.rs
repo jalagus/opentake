@@ -39,7 +39,9 @@ insert_master_plugin puts effects on the master bus (address them with master: t
 creates a bus track; update_track output routes a track to a bus index or \"master\"; effects on the bus \
 (insert_plugin with its index) process the whole group. Sends feed buses besides the output, at their own \
 level, pre- or post-fader: add_send (without bus it makes a \"Reverb\" bus with the built-in reverb), \
-update_send, remove_send. get_project shows each track's kind, output and sends.
+update_send, remove_send. get_project shows each track's kind, output and sends. Side chains: \
+set_sidechain keys an effect's detector from another track or bus (a kick ducking a pad through a \
+\"comp\" for pumping, a key opening a \"gate\"); get_project and list_plugin_params show the key.
 
 Regions: set_clip_fades gives an audio region fade-in/out curves; overlapping regions on a track \
 crossfade automatically, and crossfade_clips makes a short crossfade between two neighbours. \
@@ -169,9 +171,22 @@ fn project_json(project: &opentake_engine::project::Project, include_notes: bool
             if !track.sends.is_empty() {
                 t["sends"] = json!((0..track.sends.len()).map(|k| send_json(project, i, k)).collect::<Vec<_>>());
             }
+            keys_json(project, Some(i), t.get_mut("plugins"));
         }
     }
+    keys_json(project, None, v.get_mut("master_plugins"));
     v
+}
+
+/// Side chains by track index (the model stores session ids); a key from a gone track goes.
+fn keys_json(project: &opentake_engine::project::Project, owner: Option<usize>, slots: Option<&mut serde_json::Value>) {
+    for (k, slot) in slots.and_then(|s| s.as_array_mut()).into_iter().flatten().enumerate() {
+        let Some(o) = slot.as_object_mut() else { continue };
+        if let (Some(key), Some(source)) = (o.remove("side_chain"), project.key_source(owner, k)) {
+            let pre = key.get("pre_fader").and_then(|p| p.as_bool()).unwrap_or(false);
+            o.insert("side_chain".into(), json!({ "track": source, "name": project.tracks[source].name, "pre_fader": pre }));
+        }
+    }
 }
 
 /// A send as agents see it: bus by index, level in dB.
@@ -346,6 +361,24 @@ pub struct InsertMasterPluginArgs {
     pub plugin: String,
     /// Position in the master chain; omit to append.
     pub position: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SideChainArgs {
+    /// The track whose effect is keyed (ignored with master).
+    #[serde(default)]
+    pub track: usize,
+    /// Zero-based effect slot.
+    pub slot: usize,
+    /// Address the master bus's effect chain instead of a track.
+    #[serde(default)]
+    pub master: bool,
+    /// Index of the key track or bus (e.g. the kick); null or omitted removes the side chain.
+    pub source: Option<usize>,
+    /// Tap the key before the source's fader, pan and mute (so a muted "ghost" kick still
+    /// keys); default after them.
+    #[serde(default)]
+    pub pre_fader: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1503,7 +1536,7 @@ impl DawServer {
         .await
     }
 
-    #[tool(description = "Insert an effect into a track's chain. Built-ins: \"eq\" (6-band parametric EQ), \"comp\" (compressor: threshold, ratio, attack, release, knee, makeup, mix), \"multiband\" (3-band compressor: two crossovers, then threshold, ratio, attack, release, gain, bypass and solo per band, and output), \"limiter\" (look-ahead brickwall: gain, ceiling, release), \"delay\" (ms or tempo-synced note values, feedback, mix, repeat filters, ping-pong), \"reverb\" (algorithmic stereo reverb: pre-delay, size, decay RT60, damping, low cut, width, diffusion, modulation, mix (default 100% wet, for a bus), level), \"gate\" (noise gate: threshold, hysteresis, attack, hold, release, range, key low/high cut), \"deesser\" (de-esser: frequency, threshold, range, release, split or wideband, listen), \"chorus\" (rate, depth, delay, 1-4 voices, width, feedback, tone, mix), \"phaser\" (rate, depth in octaves, center, feedback, 2-12 stages, stereo spread, mix); or a VST3 / AU effect. list_plugin_params shows ids and values. Plug-in latency is compensated automatically. Returns the slot index.")]
+    #[tool(description = "Insert an effect into a track's chain. Built-ins: \"eq\" (6-band parametric EQ), \"comp\" (compressor: threshold, ratio, attack, release, knee, makeup, mix, key low cut; set_sidechain keys it from another track), \"multiband\" (3-band compressor: two crossovers, then threshold, ratio, attack, release, gain, bypass and solo per band, and output), \"limiter\" (look-ahead brickwall: gain, ceiling, release), \"delay\" (ms or tempo-synced note values, feedback, mix, repeat filters, ping-pong), \"reverb\" (algorithmic stereo reverb: pre-delay, size, decay RT60, damping, low cut, width, diffusion, modulation, mix (default 100% wet, for a bus), level), \"gate\" (noise gate: threshold, hysteresis, attack, hold, release, range, key low/high cut), \"deesser\" (de-esser: frequency, threshold, range, release, split or wideband, listen), \"chorus\" (rate, depth, delay, 1-4 voices, width, feedback, tone, mix), \"phaser\" (rate, depth in octaves, center, feedback, 2-12 stages, stereo spread, mix); or a VST3 / AU effect. list_plugin_params shows ids and values. Plug-in latency is compensated automatically. Returns the slot index.")]
     async fn insert_plugin(&self, Parameters(a): Parameters<InsertPluginArgs>) -> ToolResult {
         self.with_engine(move |e| e.insert_plugin(a.track, &a.plugin, a.position).map(|s| json!({ "slot": s }))).await
     }
@@ -1529,7 +1562,7 @@ impl DawServer {
         self.with_engine(move |e| e.set_slot_bypass(a.track, which, a.bypass).map(|_| "ok")).await
     }
 
-    #[tool(description = "List a plugin's parameters with ids, normalized values and display strings.")]
+    #[tool(description = "List a plugin's parameters (params: ids, normalized values and display strings), whether it takes a side chain (side_chain_input) and the track keying it (side_chain: track index, name, pre_fader; null when unkeyed).")]
     async fn list_plugin_params(&self, Parameters(a): Parameters<ListParamsArgs>) -> ToolResult {
         self.with_engine(move |e| {
             let which = if a.master { SlotRef::Master(a.slot) } else { SlotRef::Effect(a.slot) };
@@ -1537,7 +1570,18 @@ impl DawServer {
             if let Some(f) = a.filter.map(|f| f.to_lowercase()) {
                 params.retain(|p| p.title.to_lowercase().contains(&f));
             }
-            Ok(params)
+            let key = e.side_chain(a.track, which).map(|(s, pre)| json!({ "track": s, "name": e.project().tracks[s].name, "pre_fader": pre }));
+            Ok(json!({ "params": params, "side_chain_input": e.supports_side_chain(a.track, which), "side_chain": key }))
+        })
+        .await
+    }
+
+    #[tool(description = "Side-chain an effect's detector to another track or bus (source index; null removes it), e.g. duck a pad or bass with the kick for pumping: put a \"comp\" on the pad, set_sidechain with the kick as source, then threshold low (-30..-40 dB), ratio high (8..20), attack fast (~1 ms), release 100-200 ms; the comp's Key Low Cut keeps a kick key from being all sub. The built-in comp, multiband, limiter, gate (opened by the key) and de-esser take a key, as do VST3 / AU effects with a side-chain input. The audio processed is still the slot's own track; the key is lined up through plug-in delay. pre_fader taps the key before the source's fader and mute (a muted ghost kick still keys).")]
+    async fn set_sidechain(&self, Parameters(a): Parameters<SideChainArgs>) -> ToolResult {
+        let which = if a.master { SlotRef::Master(a.slot) } else { SlotRef::Effect(a.slot) };
+        self.with_engine(move |e| {
+            e.set_side_chain(a.track, which, a.source, a.pre_fader)?;
+            Ok(json!({ "side_chain": e.side_chain(a.track, which).map(|(s, pre)| json!({ "track": s, "pre_fader": pre })) }))
         })
         .await
     }
@@ -1718,5 +1762,22 @@ mod compact_tests {
         let lane = e.add_lane(Some(0), target).unwrap();
         assert_eq!(lane_json(&e, Some(0), lane).unwrap()["target"], json!({ "parameter": "send", "send": 0 }));
         assert_eq!(lane_json(&e, Some(0), lane).unwrap()["name"], json!("Send to Reverb"));
+    }
+
+    #[test]
+    fn project_json_shows_side_chains_by_index() {
+        let mut e = Engine::new();
+        let pad = e.add_track("Pad").unwrap();
+        let kick = e.add_track("Kick").unwrap();
+        e.insert_plugin(pad, "comp", None).unwrap();
+        e.insert_master_plugin("limiter", None).unwrap();
+        let a: SideChainArgs = serde_json::from_value(json!({ "track": pad, "slot": 0, "source": kick, "pre_fader": true })).unwrap();
+        e.set_side_chain(a.track, SlotRef::Effect(a.slot), a.source, a.pre_fader).unwrap();
+        e.set_side_chain(0, SlotRef::Master(0), Some(pad), false).unwrap();
+        let v = project_json(e.project(), false);
+        assert_eq!(v["tracks"][pad]["plugins"][0]["side_chain"], json!({ "track": kick, "name": "Kick", "pre_fader": true }));
+        assert_eq!(v["master_plugins"][0]["side_chain"]["track"], json!(pad));
+        let clear: SideChainArgs = serde_json::from_value(json!({ "slot": 0, "master": true, "source": null })).unwrap();
+        assert!(clear.source.is_none() && clear.master);
     }
 }

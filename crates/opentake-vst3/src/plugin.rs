@@ -199,6 +199,12 @@ impl Vst3Plugin {
         }
     }
 
+    /// Whether the plug-in has a side-chain input (an aux audio input bus), which
+    /// [`Vst3Processor::process_keyed`] feeds.
+    pub fn has_side_chain(&self) -> bool {
+        unsafe { side_chain_bus(&self.inst.component).is_some() }
+    }
+
     /// Prepare the plugin for processing and return the audio-thread half.
     pub fn create_processor(&self, sample_rate: f64, max_block: usize, channels: usize) -> Result<Vst3Processor> {
         Vst3Processor::new(self.inst.clone(), sample_rate, max_block, channels)
@@ -211,6 +217,8 @@ pub struct Vst3Processor {
     processor: ComPtr<IAudioProcessor>,
     in_buses: Vec<usize>,
     out_buses: Vec<usize>,
+    /// The side-chain input bus, activated when the plug-in has one.
+    side_chain: Option<usize>,
     in_ptrs: Vec<*mut f32>,
     out_ptrs: Vec<*mut f32>,
     in_bufs: Vec<AudioBusBuffers>,
@@ -254,9 +262,12 @@ impl Vst3Processor {
             }
             processor.setBusArrangements(in_arr.as_mut_ptr(), n_in as i32, out_arr.as_mut_ptr(), n_out as i32);
 
+            // The main buses, plus the side chain's (fed silence when the slot isn't keyed).
+            let side_chain = side_chain_bus(component);
             for (dir, n) in [(input, n_in), (output, n_out)] {
                 for i in 0..n {
-                    component.activateBus(audio, dir, i as i32, (i == 0) as TBool);
+                    let on = i == 0 || (dir == input && Some(i) == side_chain);
+                    component.activateBus(audio, dir, i as i32, on as TBool);
                 }
             }
             // Instruments receive notes on their first event input bus.
@@ -303,6 +314,7 @@ impl Vst3Processor {
                 scratch: (0..total_in + total_out).map(|_| vec![0.0; max_block]).collect(),
                 in_buses,
                 out_buses,
+                side_chain,
                 params_in: ComWrapper::new(ParamChanges::new()),
                 params_out: ComWrapper::new(ParamChanges::new()),
                 events_in: has_events.then(|| ComWrapper::new(EventList::new())),
@@ -326,16 +338,24 @@ impl Vst3Processor {
     /// Process `frames` samples. `inputs` feed the main input bus (repeated if the plugin
     /// wants more channels), and the main output bus is written to `outputs`.
     pub fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, transport: &Transport, notes: &[NoteEvent]) {
+        self.process_keyed(inputs, None, outputs, frames, transport, notes);
+    }
+
+    /// [`process`](Self::process) with a side-chain signal for the plug-in's aux input bus
+    /// (if it has one; silence there when `key` is `None`).
+    pub fn process_keyed(&mut self, inputs: &[&[f32]], key: Option<&[&[f32]]>, outputs: &mut [&mut [f32]], frames: usize, transport: &Transport, notes: &[NoteEvent]) {
         let frames = frames.min(self.max_block);
         let mut scratch = self.scratch.iter_mut();
 
-        // Wire up channel pointers: main bus to the caller's buffers, everything else to scratch.
+        // Wire up channel pointers: main bus to the caller's buffers, the side chain to the
+        // key, everything else to scratch.
         let mut k = 0;
         for (bus, &n) in self.in_buses.iter().enumerate() {
+            let feed = if bus == 0 { Some(inputs) } else if Some(bus) == self.side_chain { key } else { None };
             for ch in 0..n {
                 let s = scratch.next().expect("scratch sized for all channels");
-                self.in_ptrs[k + ch] = match inputs.get(ch).or(inputs.first()) {
-                    Some(buf) if bus == 0 => buf.as_ptr() as *mut f32,
+                self.in_ptrs[k + ch] = match feed.and_then(|f| f.get(ch).or(f.first())) {
+                    Some(buf) => buf.as_ptr() as *mut f32,
                     _ => {
                         s[..frames].fill(0.0);
                         s.as_mut_ptr()
@@ -455,6 +475,16 @@ unsafe fn create<I: vst3::Interface>(factory: &ComPtr<IPluginFactory>, cid: &TUI
         }
         ComPtr::from_raw(obj as *mut I)
     }
+}
+
+/// Index of the plug-in's side-chain input: the first aux audio input bus after the main one.
+unsafe fn side_chain_bus(component: &ComPtr<IComponent>) -> Option<usize> {
+    let (audio, input) = (MediaTypes_::kAudio as MediaType, BusDirections_::kInput as BusDirection);
+    let n = unsafe { component.getBusCount(audio, input) }.max(0) as usize;
+    (1..n).find(|&i| {
+        let mut info: BusInfo = unsafe { std::mem::zeroed() };
+        unsafe { component.getBusInfo(audio, input, i as i32, &mut info) == kResultOk && info.busType == BusTypes_::kAux as BusType }
+    })
 }
 
 unsafe fn bus_arrangement(processor: &ComPtr<IAudioProcessor>, dir: BusDirection, index: usize) -> SpeakerArrangement {

@@ -20,6 +20,7 @@ you watch the changes appear live — and undo anything you don't like.
 - 🎹 Instrument tracks, piano roll, a built-in synth and GM drum kit; VST3 instruments and effects, plus Audio Units on macOS
 - 🎛️ Built-in EQ, compressor, multiband compressor, limiter, delay, reverb, gate, de-esser, chorus and phaser on any track or the master bus; plug-in delay compensation
 - 🔀 Buses and sends: route tracks into a bus, or send them pre/post-fader to a shared reverb or delay bus
+- 🔑 Side-chain inputs for dynamics: key a compressor, gate, limiter, multiband or de-esser (or a side-chain-capable VST3 / AU) from another track, e.g. a kick pumping a pad
 - 📈 Automation of volume, pan, mute and any plug-in parameter, in lanes under each track, with Read, Touch and Latch modes
 - ⏱️ Project tempo map (tempo and time-signature changes), metronome with count-in
 - 🔁 Cycle recording: loop a section and record take after take, then pick the one that plays
@@ -27,7 +28,7 @@ you watch the changes appear live — and undo anything you don't like.
   fades, crossfades and click-free merging of regions
 - 🎚️ Full mixer, metronome, undo/redo for everything
 - 💾 Export the mix and stems to WAV or FLAC, faster than real time
-- 🤖 MCP server (stdio or HTTP) with 83 tools — the agent and you share one session
+- 🤖 MCP server (stdio or HTTP) with 84 tools — the agent and you share one session
 - 📂 Its own `.otp` project files (double-click to open), Reaper `.rpp` and DAWproject (Bitwig, Studio One, Cubase) projects
 - 🔀 Imports Ableton Live sets (`.als`), Ardour sessions, and Logic Pro projects exported as Final Cut Pro XML
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
@@ -132,6 +133,14 @@ agent.
   empty slot for a bus, a new bus or **New Reverb Send**; each send has its bus (click to change
   it, or No Send), a level knob (double-click: 0 dB), Pre (pre-fader) and M (mute). A bus strip
   counts the tracks and sends feeding it. Send levels can be automated like the fader.
+- **Side chain (ducking / pumping)**: a dynamics plug-in's window has a **Side Chain** menu in its
+  header (built-in compressor, multiband, limiter, gate and de-esser, and VST3 / AU effects with a
+  side-chain input). To make a pad or bass pump with the kick: put a compressor on the pad, set
+  Side Chain to the kick track, then a low threshold (−30 to −40 dB), a high ratio (8:1–20:1), a
+  fast attack (~1 ms) and a 100–200 ms release; raise Key Low Cut so the kick's sub doesn't
+  dominate. **PRE** taps the kick before its fader and mute, so a muted "ghost" kick still keys
+  (post-fader, the default, follows them). A gate keyed by a drum opens on its hits. The editor
+  shows **KEY ‹track›** and the mixer slot a small key; the key is lined up through plug-in delay.
 - **Automation**: the **A** button in a track header (or **A** for all tracks, View → Show
   Automation, or the track's context menu) shows its automation lanes right under it; the **A**
   on the Stereo Out strip (or View → Show Master Automation) shows the master's below the tracks. Pick what a
@@ -208,7 +217,7 @@ of the tool calls behind them):
 `add_track`, `add_bus`, `add_send`, `update_send`, `remove_send`, `move_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `set_clip_gain`, `normalize_clip`, `set_clip_pitch_stretch`, `set_clip_fades`, `crossfade_clips`, `merge_clips`, `remove_clip`,
 `play`, `stop`, `seek`, `record`,
 `scan_plugins`, `insert_plugin`, `remove_plugin`, `insert_master_plugin`, `remove_master_plugin`, `set_plugin_bypass`,
-`list_plugin_params`, `set_plugin_param` (`"eq"` inserts the built-in EQ; `master: true` addresses the master bus),
+`list_plugin_params`, `set_plugin_param`, `set_sidechain` (`"eq"` inserts the built-in EQ; `master: true` addresses the master bus),
 `list_instruments`, `add_instrument_track`, `set_instrument`, `list_instrument_params`, `set_instrument_param`,
 `add_midi_clip`, `set_midi_notes`, `add_midi_notes`, `update_midi_clip`, `copy_midi_clip`, `remove_midi_clip`,
 `inspect_guitar_pro`, `import_guitar_pro`, `inspect_midi_file`, `import_midi_file`, `export_midi_file`,
@@ -283,8 +292,8 @@ automation other than tempo, sends/returns and fades aren't imported.
   objects (some plugins need them for processor ↔ controller messaging). Plugin
   parameters are saved by value, but full state chunks aren't saved yet. Instruments get
   note events only and haven't been tested with many third-party plugins.
-- Audio Units (macOS only): no editor windows (generic sliders), stereo/mono main bus only
-  (no side-chains or extra outputs), notes only (no pitch bend/CC). State is saved as the
+- Audio Units (macOS only): no editor windows (generic sliders), stereo/mono main bus plus a
+  side chain on a second input element (no extra outputs), notes only (no pitch bend/CC). State is saved as the
   unit's property list; Reaper's AU state may not restore. AUv3 extensions that load only
   asynchronously wait up to 10 s and fail if they need the main thread meanwhile.
 - Plugin parameter values, MIDI regions, the built-in synth/drums/effects and master-bus effects
@@ -309,6 +318,11 @@ automation other than tempo, sends/returns and fades aren't imported.
 - Buses: stems export what reaches the master: a bus is one stem with its sources and what
   sends bring to it inside, and a track's stem is its dry signal. Pre-fader sends ignore the
   fader and pan but not the track's mute; sends can't be reordered.
+- Side chains: only effect slots take a key (not instruments); a key that would make a loop (from a track
+  mixed after the keyed one) is refused. A keyed track is read late enough to line the key
+  up, which can add to the total plug-in delay. VST3 side chains use the plug-in's first aux input
+  bus (stereo or mono as it declares); side-chain VST3s / AUs have had little third-party testing,
+  and `.rpp` / DAWproject export drops keys.
 - Automation: plug-in parameters change once per 64-sample block (fader, pan and mute ramp
   within it), so changes land within ~1.3 ms of their point; plug-in editor windows don't follow
   automated values; no automation of region gain, and Touch/Latch only record from the GUI.

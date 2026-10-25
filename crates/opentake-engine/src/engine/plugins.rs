@@ -11,7 +11,7 @@ use opentake_project::{PluginFormat, PluginSlot};
 use opentake_vst3::{ClassInfo, Module, NoteEvent, ScannedPlugin, Vst3Plugin, Vst3Processor};
 
 use super::{Engine, ParamView, display_name};
-use crate::mixer::{Command, MASTER, MAX_BLOCK, MidiEvent, PLUGIN_CAPACITY, PluginRt, Processor, Transport};
+use crate::mixer::{Command, KeyRt, MASTER, MAX_BLOCK, MidiEvent, PLUGIN_CAPACITY, PluginRt, Processor, Transport};
 use crate::drums::{self, DrumSynth};
 use crate::delay::{self, Delay};
 use crate::dynamics::{self, Compressor, GainMeter, Limiter, comp, limiter};
@@ -138,6 +138,10 @@ struct Vst3Insert {
 
 impl Processor for Vst3Insert {
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, t: &Transport, events: &[MidiEvent]) {
+        self.process_keyed(inputs, None, outputs, frames, t, events);
+    }
+
+    fn process_keyed(&mut self, inputs: &[&[f32]], key: Option<&[&[f32]]>, outputs: &mut [&mut [f32]], frames: usize, t: &Transport, events: &[MidiEvent]) {
         let t = opentake_vst3::Transport {
             playing: t.playing,
             recording: t.recording,
@@ -149,7 +153,7 @@ impl Processor for Vst3Insert {
         for e in events.iter().take(self.notes.capacity()) {
             self.notes.push(NoteEvent { offset: e.offset, pitch: e.pitch, velocity: e.velocity as f32 / 127.0 });
         }
-        self.processor.process(inputs, outputs, frames, &t, &self.notes);
+        self.processor.process_keyed(inputs, key, outputs, frames, &t, &self.notes);
     }
 
     fn set_param(&mut self, id: u32, normalized: f64) {
@@ -183,6 +187,7 @@ fn builtin_slot(name: &str, path: &str) -> PluginSlot {
         state: Vec::new(),
         params: Vec::new(),
         id: 0,
+        side_chain: None,
         instance: 0,
     }
 }
@@ -337,6 +342,7 @@ impl Engine {
             state: Vec::new(),
             params: Vec::new(),
             id: 0,
+            side_chain: None,
             instance: 0,
         };
         slot.instance = self.add_to_pool(Loaded::Vst3(plugin));
@@ -456,7 +462,7 @@ impl Engine {
             Some(Loaded::Phaser) => with_params(Box::new(Phaser::new(sr as f64)), &slot.params),
             None => return Ok(None),
         };
-        Ok(Some(Box::new(PluginRt { instance: slot.instance, processor, bypass: slot.bypass })))
+        Ok(Some(Box::new(PluginRt { instance: slot.instance, processor, bypass: slot.bypass, key: slot.side_chain.map(|k| KeyRt::new(k.track, k.pre_fader)) })))
     }
 
     /// Bring the audio thread's effect chain for a track in line with the project,
@@ -556,7 +562,7 @@ impl Engine {
         }
     }
 
-    fn slot_mut(&mut self, track: usize, which: SlotRef) -> Result<&mut PluginSlot> {
+    pub(super) fn slot_mut(&mut self, track: usize, which: SlotRef) -> Result<&mut PluginSlot> {
         if let SlotRef::Master(s) = which {
             return self.project.master_plugins.get_mut(s).ok_or_else(|| anyhow!("the master bus has no plugin at slot {s}"));
         }

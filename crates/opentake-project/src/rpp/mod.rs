@@ -270,6 +270,7 @@ fn import_fx_chain(node: &Node) -> Vec<PluginSlot> {
                     state: n.lines().map(|l| l.raw.clone()).collect(),
                     params: Vec::new(),
                     id: 0,
+                    side_chain: None,
                     instance: 0,
                 });
                 bypass = false;
@@ -713,6 +714,7 @@ mod tests {
             state: vec!["YnBsaXN0".into()],
             params: Vec::new(),
             id: 0,
+            side_chain: None,
             instance: 0,
         };
         let mut p = Project::default();

@@ -280,10 +280,10 @@ impl Project {
     }
 
     /// Whether track `index` may feed `to` (a bus index, `None` = master): `to` must be a bus
-    /// that isn't the track itself or fed by it (through outputs or sends).
+    /// that isn't the track itself or mixed before it (fed by it, or keying it).
     pub fn can_route(&self, index: usize, to: Option<usize>) -> bool {
         let Some(to) = to else { return true };
-        to != index && self.tracks.get(to).is_some_and(|t| t.bus) && !self.feeds(to, index)
+        to != index && self.tracks.get(to).is_some_and(|t| t.bus) && !self.precedes(to, index)
     }
 
     /// Tracks feeding bus `index` directly.
@@ -291,19 +291,26 @@ impl Project {
         (0..self.tracks.len()).filter(|&i| self.output_of(i) == Some(index)).collect()
     }
 
-    /// Mixing order: every track before the buses it feeds through its output or sends
-    /// (plain tracks first, then buses as soon as everything feeding them is in).
+    /// Mixing order: every track before the buses it feeds through its output or sends, and
+    /// before the tracks it keys (plain tracks first, then buses as soon as everything feeding
+    /// or keying them is in).
     pub fn processing_order(&self) -> Vec<usize> {
         let n = self.tracks.len();
-        let targets: Vec<Vec<usize>> = (0..n).map(|i| self.targets(i)).collect();
-        let mut placed: Vec<bool> = self.tracks.iter().map(|t| !t.bus).collect();
-        let mut order: Vec<usize> = (0..n).filter(|&i| placed[i]).collect();
+        let next: Vec<Vec<usize>> = (0..n).map(|i| self.downstream(i)).collect();
+        let mut placed = vec![false; n];
+        let mut order = Vec::with_capacity(n);
         while order.len() < n {
             let before = order.len();
-            for b in 0..n {
-                if !placed[b] && (0..n).all(|i| placed[i] || !targets[i].contains(&b)) {
-                    placed[b] = true;
-                    order.push(b);
+            // Plain tracks while any is ready (they wait only for keys), then one pass of buses.
+            for bus in [false, true] {
+                for b in 0..n {
+                    if !placed[b] && self.tracks[b].bus == bus && (0..n).all(|i| placed[i] || !next[i].contains(&b)) {
+                        placed[b] = true;
+                        order.push(b);
+                    }
+                }
+                if order.len() > before {
+                    break;
                 }
             }
             if order.len() == before {
@@ -333,10 +340,11 @@ impl Project {
         (0..self.tracks.len()).map(|i| !self.tracks[i].mute && (!any_solo || soloed[i] || feeds_solo[i])).collect()
     }
 
-    /// Outputs (and sends) from track indices (as files store them) to session ids; invalid
-    /// outputs (not a bus, or a loop) go to the master, invalid sends go. Call once the
-    /// tracks have their ids.
+    /// Outputs (sends and side-chain keys) from track indices (as files store them) to session
+    /// ids; invalid outputs (not a bus, or a loop) go to the master, invalid sends and keys go.
+    /// Call once the tracks have their ids.
     pub fn outputs_from_indices(&mut self) {
+        let keys = self.take_keys();
         let ids: Vec<(u64, bool)> = self.tracks.iter().map(|t| (t.id, t.bus)).collect();
         for (i, t) in self.tracks.iter_mut().enumerate() {
             t.output = t.output.and_then(|o| ids.get(o as usize).filter(|(_, bus)| *bus && o as usize != i)).map(|(id, _)| *id);
@@ -347,10 +355,12 @@ impl Project {
             }
         }
         self.sends_from_indices();
+        self.keys_from_indices(keys);
     }
 
-    /// Outputs (and sends) from session ids to track indices, for saving.
+    /// Outputs (sends and keys) from session ids to track indices, for saving.
     pub fn outputs_to_indices(&mut self) {
+        self.keys_to_indices();
         self.sends_to_indices();
         let outputs: Vec<Option<usize>> = (0..self.tracks.len()).map(|i| self.output_of(i)).collect();
         for (t, o) in self.tracks.iter_mut().zip(outputs) {
@@ -630,6 +640,10 @@ pub struct PluginSlot {
     /// assigned yet; see [`Project::assign_slot_ids`]).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub id: u32,
+    /// Side-chain (key) input: the track whose signal drives the plug-in's detector (see
+    /// `sidechain.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_chain: Option<crate::sidechain::SideChain>,
     /// Engine handle of the loaded instance (0 = not loaded). Session only.
     #[serde(skip)]
     pub instance: u64,
@@ -755,7 +769,7 @@ mod tests {
     #[test]
     fn slots_get_unique_ids_and_orphaned_lanes_go() {
         use crate::automation::{AutomationLane, AutomationTarget};
-        let slot = |id: u32| PluginSlot { name: "fx".into(), format: PluginFormat::Builtin, path: "p".into(), uid: "p".into(), bypass: false, state: Vec::new(), params: Vec::new(), id, instance: 0 };
+        let slot = |id: u32| PluginSlot { name: "fx".into(), format: PluginFormat::Builtin, path: "p".into(), uid: "p".into(), bypass: false, state: Vec::new(), params: Vec::new(), id, side_chain: None, instance: 0 };
         let mut p = Project::default();
         let mut t = Track::new("A");
         t.plugins = vec![slot(4), slot(0), slot(4)];

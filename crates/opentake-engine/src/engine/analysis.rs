@@ -192,6 +192,15 @@ impl MixJob {
         let mut procs: Vec<Option<TrackProcessors>> = std::mem::take(&mut self.tracks).into_iter().map(Some).collect();
         let mut outs: Vec<Option<[Vec<f32>; 2]>> = (0..procs.len()).map(|_| None).collect();
         let mut bus_in = outs.clone();
+        // Side chains: a key track's signal before its fader (kept only if something keys it
+        // pre-fader) or after it (its output; silence while muted). Key tracks render first.
+        let keyed_pre: Vec<bool> = (0..procs.len()).map(|s| self.project.tracks.iter().flat_map(|t| &t.plugins).chain(&self.project.master_plugins).any(|p| p.side_chain.is_some_and(|k| k.pre_fader && self.project.track_by_id(k.track) == Some(s)))).collect();
+        let mut pre_taps: Vec<Option<[Vec<f32>; 2]>> = outs.clone();
+        let muted = silence();
+        let key_of = |slots: &[opentake_project::PluginSlot], id: u32, owner: Option<usize>| -> Option<(usize, bool)> {
+            let key = slots.iter().find(|s| s.id == id)?.side_chain?;
+            Some((self.project.track_by_id(key.track).filter(|&s| Some(s) != owner)?, key.pre_fader))
+        };
         for i in self.project.processing_order() {
             let (track, Some(mut p)) = (&self.project.tracks[i], procs[i].take()) else { continue };
             let [mut l, mut r] = bus_in[i].take().unwrap_or_else(silence);
@@ -200,7 +209,15 @@ impl MixJob {
                 render_midi(track, inst.as_mut(), &param_lanes(&track.automation, *id), start, sr, &map, &mut l, &mut r);
             }
             for (id, fx) in &mut p.effects {
-                process_stereo(fx.as_mut(), &param_lanes(&track.automation, *id), &mut l, &mut r, &map, start, sr);
+                let key = key_of(&track.plugins, *id, Some(i)).and_then(|(s, pre)| match pre {
+                    true => pre_taps[s].as_ref(),
+                    false if self.project.tracks[s].mute => Some(&muted),
+                    false => outs[s].as_ref(),
+                });
+                process_stereo(fx.as_mut(), &param_lanes(&track.automation, *id), key, &mut l, &mut r, &map, start, sr);
+            }
+            if keyed_pre[i] {
+                pre_taps[i] = Some([l.clone(), r.clone()]);
             }
             // Pre-fader sends tap the signal here, post-fader ones after the fader.
             let pre_fader = track.sends.iter().any(|s| s.pre_fader && !s.mute).then(|| [l.clone(), r.clone()]);
@@ -240,12 +257,17 @@ impl MixJob {
             }
             outs[i] = Some([l, r]);
         }
-        let tracks = self.project.tracks.iter().zip(outs).zip(audible).map(|((t, o), a)| (t.name.clone(), o.unwrap_or_else(silence), a)).collect();
         let lanes = &self.project.master_automation;
         for (id, fx) in &mut self.master {
+            let key = key_of(&self.project.master_plugins, *id, None).and_then(|(s, pre)| match pre {
+                true => pre_taps[s].as_ref(),
+                false if self.project.tracks[s].mute => Some(&muted),
+                false => outs[s].as_ref(),
+            });
             let [l, r] = &mut mix;
-            process_stereo(fx.as_mut(), &param_lanes(lanes, *id), l, r, &map, start, sr);
+            process_stereo(fx.as_mut(), &param_lanes(lanes, *id), key, l, r, &map, start, sr);
         }
+        let tracks = self.project.tracks.iter().zip(outs).zip(audible).map(|((t, o), a)| (t.name.clone(), o.unwrap_or_else(silence), a)).collect();
         let [l, r] = &mut mix;
         let volume = self.project.master_volume;
         apply_fader(l, r, start, sr, |t| {
@@ -301,9 +323,10 @@ fn apply_fader(l: &mut [f32], r: &mut [f32], offset: usize, sr: f64, gains: impl
 }
 
 /// Run an effect over a whole stereo buffer (starting `offset` samples into the song, for
-/// the tempo and automation), then shift the result back by the effect's latency, as the
-/// mixer's delay compensation does.
-fn process_stereo(p: &mut dyn Processor, lanes: &[(u32, &AutomationLane)], l: &mut [f32], r: &mut [f32], map: &TempoMap, offset: usize, sr: f64) {
+/// the tempo and automation) with its side chain, if keyed (lined up with the buffer), then
+/// shift the result back by the effect's latency, as the mixer's delay compensation does.
+#[allow(clippy::too_many_arguments)]
+fn process_stereo(p: &mut dyn Processor, lanes: &[(u32, &AutomationLane)], key: Option<&[Vec<f32>; 2]>, l: &mut [f32], r: &mut [f32], map: &TempoMap, offset: usize, sr: f64) {
     let (mut ol, mut or) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
     let mut start = 0;
     while start < l.len() {
@@ -312,7 +335,8 @@ fn process_stereo(p: &mut dyn Processor, lanes: &[(u32, &AutomationLane)], l: &m
         {
             let inputs: [&[f32]; 2] = [&l[start..start + n], &r[start..start + n]];
             let mut outputs: [&mut [f32]; 2] = [&mut ol[..n], &mut or[..n]];
-            p.process(&inputs, &mut outputs, n, &t, &[]);
+            let key = key.map(|[kl, kr]| [&kl[start..start + n], &kr[start..start + n]]);
+            p.process_keyed(&inputs, key.as_ref().map(|k| &k[..]), &mut outputs, n, &t, &[]);
         }
         l[start..start + n].copy_from_slice(&ol[..n]);
         r[start..start + n].copy_from_slice(&or[..n]);

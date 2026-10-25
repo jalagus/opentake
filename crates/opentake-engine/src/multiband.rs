@@ -227,6 +227,8 @@ pub struct Multiband {
     values: Vec<(u32, f64)>,
     settings: Settings,
     split: [Splitter; 2],
+    /// The side chain's crossovers (detectors only).
+    key_split: [Splitter; 2],
     /// Per band: attack and release coefficients, smoothed gain reduction (dB).
     coefs: [(f64, f64); BANDS],
     reduction: [f64; BANDS],
@@ -243,6 +245,7 @@ impl Multiband {
             values,
             settings,
             split: [Splitter::default(); 2],
+            key_split: [Splitter::default(); 2],
             coefs: [(0.0, 0.0); BANDS],
             reduction: [0.0; BANDS],
             dirty: true,
@@ -255,7 +258,7 @@ impl Multiband {
     fn update(&mut self) {
         self.settings = Settings::from_params(&self.values);
         let s = self.settings;
-        for split in &mut self.split {
+        for split in self.split.iter_mut().chain(&mut self.key_split) {
             split.set(s.low_hz, s.high_hz, self.sample_rate);
         }
         let coef = |ms: f64| (-1.0 / (ms.max(0.01) * 0.001 * self.sample_rate)).exp();
@@ -269,7 +272,12 @@ fn db(x: f64) -> f64 {
 }
 
 impl Processor for Multiband {
-    fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, _t: &Transport, _e: &[MidiEvent]) {
+    fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, t: &Transport, e: &[MidiEvent]) {
+        self.process_keyed(inputs, None, outputs, frames, t, e);
+    }
+
+    /// Keyed, each band's detector hears the same band of the side chain.
+    fn process_keyed(&mut self, inputs: &[&[f32]], key: Option<&[&[f32]]>, outputs: &mut [&mut [f32]], frames: usize, _t: &Transport, _e: &[MidiEvent]) {
         if self.dirty {
             self.update();
         }
@@ -283,6 +291,10 @@ impl Processor for Multiband {
         for i in 0..frames {
             let (l, r) = (il[i] as f64, ir[i] as f64);
             let (bl, br) = (self.split[0].split(l), self.split[1].split(r));
+            let (kl, kr) = match key {
+                Some([kl, kr, ..]) => (self.key_split[0].split(kl[i] as f64), self.key_split[1].split(kr[i] as f64)),
+                _ => (bl, br),
+            };
             let (mut yl, mut yr) = (0.0, 0.0);
             for b in 0..BANDS {
                 let band = s.bands[b];
@@ -290,7 +302,7 @@ impl Processor for Multiband {
                 band_in[b] = band_in[b].max(level);
                 let mut gain = gains[b];
                 if !band.bypass {
-                    let level_db = db(level);
+                    let level_db = db(kl[b].abs().max(kr[b].abs()));
                     let target = level_db - band.comp.curve(level_db);
                     let (attack, release) = self.coefs[b];
                     let coef = if target > self.reduction[b] { attack } else { release };

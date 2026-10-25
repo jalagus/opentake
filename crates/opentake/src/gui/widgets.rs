@@ -61,6 +61,8 @@ pub enum Icon {
     Mixer,
     PianoRoll,
     Tablature,
+    /// A side chain (a key): ring and bit.
+    Key,
 }
 
 /// Rounded transport-style button with a vector icon.
@@ -265,6 +267,13 @@ pub fn draw_icon(p: &egui::Painter, icon: Icon, c: Pos2, r: f32, color: Color32)
             let d = r * 0.75;
             p.line_segment([pos2(c.x - d, c.y - d), pos2(c.x + d, c.y + d)], stroke);
             p.line_segment([pos2(c.x - d, c.y + d), pos2(c.x + d, c.y - d)], stroke);
+        }
+        Icon::Key => {
+            let ring = pos2(c.x - r * 0.45, c.y);
+            p.circle_stroke(ring, r * 0.42, stroke);
+            p.line_segment([pos2(ring.x + r * 0.42, c.y), pos2(c.x + r, c.y)], stroke);
+            p.line_segment([pos2(c.x + r * 0.55, c.y), pos2(c.x + r * 0.55, c.y + r * 0.45)], stroke);
+            p.line_segment([pos2(c.x + r, c.y), pos2(c.x + r, c.y + r * 0.45)], stroke);
         }
         Icon::Power => {
             arc(p, c, r * 0.85, -PI * 0.5 + 0.7, PI * 1.5 - 0.7, stroke);

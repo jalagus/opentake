@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use opentake_project::{PluginSlot, Project, Track};
+use opentake_project::{PluginSlot, Project, SideChain, Track};
 use serde::Serialize;
 
 use super::{Engine, track_params};
@@ -62,6 +62,10 @@ fn instances(p: &Project) -> impl Iterator<Item = u64> + '_ {
 
 fn chain_signature(t: &Track) -> Vec<(u64, bool)> {
     t.plugins.iter().map(|s| (s.instance, s.bypass)).collect()
+}
+
+fn keys(slots: &[PluginSlot]) -> Vec<(u64, Option<SideChain>)> {
+    slots.iter().map(|s| (s.instance, s.side_chain)).collect()
 }
 
 impl Engine {
@@ -236,6 +240,9 @@ impl Engine {
                     if chain_signature(o) != chain_signature(t) {
                         self.sync_chain(i)?;
                     }
+                    if keys(&o.plugins) != keys(&t.plugins) {
+                        self.sync_side_chains(Some(i))?;
+                    }
                     if o.sends != t.sends {
                         self.sync_sends(i)?;
                     }
@@ -248,7 +255,8 @@ impl Engine {
         if added || old_ids != new_ids {
             self.send(Command::ReorderTracks(Box::new(new_ids)))?;
         }
-        let outputs = |p: &Project| p.tracks.iter().map(|t| (t.output, t.sends.iter().map(|s| s.bus).collect::<Vec<_>>())).collect::<Vec<_>>();
+        // Keys order the tracks too.
+        let outputs = |p: &Project| p.tracks.iter().map(|t| (t.output, t.sends.iter().map(|s| s.bus).collect::<Vec<_>>(), keys(&t.plugins))).collect::<Vec<_>>();
         if added || old_ids != self.project.tracks.iter().map(|t| t.id).collect::<Vec<_>>() || outputs(&old) != outputs(&self.project) {
             self.sync_routing()?;
         }
@@ -272,6 +280,9 @@ impl Engine {
             self.sync_master_chain()?;
         } else if old.master_automation != self.project.master_automation {
             self.sync_automation(None)?;
+        }
+        if keys(&old.master_plugins) != keys(&self.project.master_plugins) {
+            self.sync_side_chains(None)?;
         }
         if (old.tempo_bpm, old.time_signature, &old.tempo_changes) != (self.project.tempo_bpm, self.project.time_signature, &self.project.tempo_changes) {
             let cmd = self.tempo_command();

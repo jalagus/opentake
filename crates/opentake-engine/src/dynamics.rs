@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::filter::Biquad;
 use crate::mixer::{MidiEvent, Processor, Transport};
 
 /// Gain reduction and levels for the editor's meters (dB, peak since the last read).
@@ -68,6 +69,8 @@ pub mod comp {
     pub const KNEE: u32 = 4;
     pub const MAKEUP: u32 = 5;
     pub const MIX: u32 = 6;
+    /// High-pass on the detector (own input or side chain), e.g. so a kick key isn't all sub.
+    pub const KEY_LOW_CUT: u32 = 7;
 }
 
 pub fn threshold_of(v: f64) -> f64 {
@@ -100,6 +103,13 @@ pub fn knee_of(v: f64) -> f64 {
 pub fn makeup_of(v: f64) -> f64 {
     24.0 * v.clamp(0.0, 1.0)
 }
+/// Key low cut in Hz, `None` at the bottom of the range (off).
+pub fn key_low_cut_of(v: f64) -> Option<f64> {
+    (v > 0.0).then(|| log_range(v, 20.0, 1000.0))
+}
+pub fn norm_key_low_cut(hz: Option<f64>) -> f64 {
+    hz.map_or(0.0, |hz| norm_log(hz, 20.0, 1000.0).max(1e-3))
+}
 
 /// Compressor parameters: (id, title, units, default normalized value, steps).
 pub fn comp_params() -> Vec<(u32, String, &'static str, f64, i32)> {
@@ -111,6 +121,7 @@ pub fn comp_params() -> Vec<(u32, String, &'static str, f64, i32)> {
         (comp::KNEE, "Knee".into(), "dB", 0.5, 0),
         (comp::MAKEUP, "Makeup".into(), "dB", 0.0, 0),
         (comp::MIX, "Mix".into(), "%", 1.0, 0),
+        (comp::KEY_LOW_CUT, "Key Low Cut".into(), "", 0.0, 0),
     ]
 }
 
@@ -123,6 +134,10 @@ pub fn comp_display(id: u32, v: f64) -> String {
         comp::KNEE => format!("{:.1}", knee_of(v)),
         comp::MAKEUP => format!("{:+.1}", makeup_of(v)),
         comp::MIX => format!("{:.0}", v * 100.0),
+        comp::KEY_LOW_CUT => match key_low_cut_of(v) {
+            None => "Off".into(),
+            Some(hz) => format!("{hz:.0} Hz"),
+        },
         _ => format!("{v:.2}"),
     }
 }
@@ -176,6 +191,8 @@ pub struct Compressor {
     release: f64,
     /// Smoothed gain reduction (dB, ≥ 0).
     reduction: f64,
+    /// Detector high-pass per channel, when Key Low Cut is on.
+    key_cut: Option<[Biquad; 2]>,
     dirty: bool,
     meter: Option<Arc<GainMeter>>,
 }
@@ -184,7 +201,7 @@ impl Compressor {
     pub fn new(sample_rate: f64, meter: Option<Arc<GainMeter>>) -> Self {
         let values: Vec<(u32, f64)> = comp_params().into_iter().map(|p| (p.0, p.3)).collect();
         let settings = CompSettings::from_params(&values);
-        let mut c = Self { sample_rate: sample_rate.max(1.0), values, settings, attack: 0.0, release: 0.0, reduction: 0.0, dirty: true, meter };
+        let mut c = Self { sample_rate: sample_rate.max(1.0), values, settings, attack: 0.0, release: 0.0, reduction: 0.0, key_cut: None, dirty: true, meter };
         c.update();
         c
     }
@@ -193,23 +210,43 @@ impl Compressor {
         self.settings = CompSettings::from_params(&self.values);
         self.attack = coefficient(self.settings.attack_ms, self.sample_rate);
         self.release = coefficient(self.settings.release_ms, self.sample_rate);
+        let cut = self.values.iter().find(|p| p.0 == comp::KEY_LOW_CUT).and_then(|p| key_low_cut_of(p.1));
+        self.key_cut = cut.map(|hz| {
+            // Keep the filters' state when only the frequency moves.
+            let mut f = self.key_cut.unwrap_or_default();
+            f.iter_mut().for_each(|b| b.pass(hz, 0.707, self.sample_rate, true));
+            f
+        });
         self.dirty = false;
     }
 }
 
 impl Processor for Compressor {
-    fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, _t: &Transport, _e: &[MidiEvent]) {
+    fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, t: &Transport, e: &[MidiEvent]) {
+        self.process_keyed(inputs, None, outputs, frames, t, e);
+    }
+
+    fn process_keyed(&mut self, inputs: &[&[f32]], key: Option<&[&[f32]]>, outputs: &mut [&mut [f32]], frames: usize, _t: &Transport, _e: &[MidiEvent]) {
         if self.dirty {
             self.update();
         }
         let ([il, ir, ..], [ol, or, ..]) = (inputs, outputs) else { return };
+        // The detector listens to the side chain when there is one, else to the input.
+        let (dl, dr) = match key {
+            Some([kl, kr, ..]) => (*kl, *kr),
+            _ => (*il, *ir),
+        };
         let s = self.settings;
         let makeup = 10f64.powf(s.makeup_db / 20.0);
         let (mut peak_in, mut peak_out, mut max_gr) = (0.0f32, 0.0f32, 0.0f64);
         for i in 0..frames {
             let (l, r) = (il[i], ir[i]);
+            let (mut kl, mut kr) = (dl[i] as f64, dr[i] as f64);
+            if let Some([fl, fr]) = &mut self.key_cut {
+                (kl, kr) = (fl.run(kl), fr.run(kr));
+            }
             // Stereo-linked peak detector, in dB.
-            let level = to_db(l.abs().max(r.abs())) as f64;
+            let level = to_db(kl.abs().max(kr.abs()) as f32) as f64;
             let target = level - s.curve(level);
             let coef = if target > self.reduction { self.attack } else { self.release };
             self.reduction = coef * self.reduction + (1.0 - coef) * target;
@@ -339,17 +376,27 @@ impl Limiter {
 }
 
 impl Processor for Limiter {
-    fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, _t: &Transport, _e: &[MidiEvent]) {
+    fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, t: &Transport, e: &[MidiEvent]) {
+        self.process_keyed(inputs, None, outputs, frames, t, e);
+    }
+
+    /// Keyed, the gain follows the key's peaks (times Gain) instead of the input's; the
+    /// ceiling clamp still guards the output.
+    fn process_keyed(&mut self, inputs: &[&[f32]], key: Option<&[&[f32]]>, outputs: &mut [&mut [f32]], frames: usize, _t: &Transport, _e: &[MidiEvent]) {
         if self.dirty {
             self.update();
         }
         let ([il, ir, ..], [ol, or, ..]) = (inputs, outputs) else { return };
+        let (dl, dr) = match key {
+            Some([kl, kr, ..]) => (*kl, *kr),
+            _ => (*il, *ir),
+        };
         let la = self.lookahead;
         let (mut peak_in, mut peak_out, mut min_gain) = (0.0f32, 0.0f32, 1.0f64);
         for i in 0..frames {
             let (l, r) = (il[i] * self.gain, ir[i] * self.gain);
-            let peak = l.abs().max(r.abs());
-            peak_in = peak_in.max(peak);
+            peak_in = peak_in.max(l.abs()).max(r.abs());
+            let peak = (dl[i] * self.gain).abs().max((dr[i] * self.gain).abs());
             let need = if peak > self.ceiling { self.ceiling / peak } else { 1.0 };
             // Running minimum of the required gain over the window (lookahead + 1 samples).
             let slot = self.pos % (la + 1);
@@ -438,6 +485,29 @@ mod tests {
         // Below the threshold it's untouched.
         let quiet = run(&mut Compressor::new(48_000.0, None), &sine(0.01, 0.5));
         assert!((peak(&quiet[20_000..]) - 0.01).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_side_chain_drives_the_detector_through_the_key_low_cut() {
+        // A quiet input keyed by a loud 40 Hz sub: ducked, unless Key Low Cut removes the sub.
+        let reduction = |cut: Option<f64>| {
+            let meter = GainMeter::new();
+            let mut c = Compressor::new(48_000.0, Some(meter.clone()));
+            c.set_param(comp::THRESHOLD, norm_threshold(-30.0));
+            c.set_param(comp::KEY_LOW_CUT, norm_key_low_cut(cut));
+            let x = vec![0.01f32; 480];
+            let key: Vec<f32> = (0..48_000).map(|i| 0.8 * (std::f64::consts::TAU * 40.0 * i as f64 / 48_000.0).sin() as f32).collect();
+            let (mut l, mut r) = (vec![0.0f32; 480], vec![0.0f32; 480]);
+            for k in key.chunks(480) {
+                c.process_keyed(&[&x, &x], Some(&[k, k]), &mut [&mut l, &mut r], 480, &Transport::default(), &[]);
+            }
+            meter.take();
+            c.process_keyed(&[&x, &x], Some(&[&key[..480], &key[..480]]), &mut [&mut l, &mut r], 480, &Transport::default(), &[]);
+            meter.take().0
+        };
+        assert!(reduction(None) > 10.0, "keyed by the sub: {}", reduction(None));
+        assert!(reduction(Some(800.0)) < 2.0, "the sub filtered out of the key: {}", reduction(Some(800.0)));
+        assert_eq!(comp_display(comp::KEY_LOW_CUT, 0.0), "Off");
     }
 
     #[test]

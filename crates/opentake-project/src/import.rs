@@ -116,7 +116,7 @@ pub(crate) fn drums_slot() -> PluginSlot {
 }
 
 fn builtin(name: &str, path: &str) -> PluginSlot {
-    PluginSlot { name: name.into(), format: PluginFormat::Builtin, path: path.into(), uid: path.into(), bypass: false, state: Vec::new(), params: Vec::new(), id: 0, instance: 0 }
+    PluginSlot { name: name.into(), format: PluginFormat::Builtin, path: path.into(), uid: path.into(), bypass: false, state: Vec::new(), params: Vec::new(), id: 0, side_chain: None, instance: 0 }
 }
 
 /// A plug-in known only by name. VST3 bundles are found by file name, so guess `<name>.vst3`.
@@ -132,7 +132,7 @@ pub(crate) fn named_plugin(format: PluginFormat, name: &str, vendor: Option<&str
         None => format!("{prefix}: {name}"),
     };
     let path = if format == PluginFormat::Vst3 { format!("{name}.vst3") } else { String::new() };
-    PluginSlot { name: full, format, path, uid: uid.into(), bypass: false, state: Vec::new(), params: Vec::new(), id: 0, instance: 0 }
+    PluginSlot { name: full, format, path, uid: uid.into(), bypass: false, state: Vec::new(), params: Vec::new(), id: 0, side_chain: None, instance: 0 }
 }
 
 /// dB to linear gain.

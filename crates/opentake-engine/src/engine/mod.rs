@@ -21,6 +21,7 @@ mod recording;
 mod regions;
 mod routing;
 mod sends;
+mod sidechain;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -833,6 +834,7 @@ impl Engine {
         let index = self.track_index(index)?;
         self.record("Delete Track", None, |e| {
             e.unroute_bus(index)?;
+            e.drop_keys_from(index)?;
             let track = e.project.tracks.remove(index);
             e.live_chain.remove(&track.id);
             e.live_instrument.remove(&track.id);

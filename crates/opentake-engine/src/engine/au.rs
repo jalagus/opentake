@@ -166,6 +166,10 @@ mod mac {
 
     impl Processor for AuInsert {
         fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, t: &Transport, events: &[MidiEvent]) {
+            self.process_keyed(inputs, None, outputs, frames, t, events);
+        }
+
+        fn process_keyed(&mut self, inputs: &[&[f32]], key: Option<&[&[f32]]>, outputs: &mut [&mut [f32]], frames: usize, t: &Transport, events: &[MidiEvent]) {
             let t = opentake_au::Transport {
                 playing: t.playing,
                 recording: t.recording,
@@ -177,7 +181,7 @@ mod mac {
             for e in events.iter().take(self.notes.capacity()) {
                 self.notes.push(NoteEvent { offset: e.offset, pitch: e.pitch, velocity: e.velocity });
             }
-            self.processor.process(inputs, outputs, frames, &t, &self.notes);
+            self.processor.process_keyed(inputs, key, outputs, frames, &t, &self.notes);
         }
 
         fn set_param(&mut self, id: u32, normalized: f64) {
@@ -221,6 +225,7 @@ mod mac {
                 state: Vec::new(),
                 params: Vec::new(),
                 id: 0,
+                side_chain: None,
                 instance: 0,
             };
             slot.instance = self.add_to_pool(Loaded::Au(plugin));
