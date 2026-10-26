@@ -4,6 +4,7 @@
 pub mod ableton;
 pub mod automation;
 pub mod comp;
+pub mod controller;
 pub mod ardour;
 pub mod dawproject;
 pub mod fade;
@@ -18,6 +19,7 @@ pub mod tempo;
 
 pub use automation::{AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, Curve};
 pub use comp::{COMP_JOIN_SECS, CompSegment, played_clips};
+pub use controller::{BEND_CENTRE, CONTROLLER_SLOTS, Controller, ControllerEvent, ControllerLane};
 pub use fade::{Fade, FadeCurve, effective_fades};
 pub use model::*;
 pub use sends::{AuxSend, MAX_SEND_GAIN};

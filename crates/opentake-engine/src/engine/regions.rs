@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Result, bail};
-use opentake_project::{Clip, MidiClip, Note};
+use opentake_project::{Clip, MidiClip};
 use serde::{Deserialize, Serialize};
 
 use super::Engine;
@@ -223,19 +223,9 @@ impl Engine {
                         t.clips.insert(r.index + 1, right);
                     }
                     RegionData::Midi(c) => {
-                        let left_notes = c
-                            .notes
-                            .iter()
-                            .filter(|n| n.start_secs < cut)
-                            .map(|n| Note { length_secs: n.length_secs.min(cut - n.start_secs), ..*n })
-                            .collect();
-                        let right_notes = c.notes.iter().filter(|n| n.start_secs >= cut).map(|n| Note { start_secs: n.start_secs - cut, ..*n }).collect();
-                        let mut left_tab = c.tab.clone();
-                        let right_tab = left_tab.as_mut().map(|tab| tab.split_off(cut));
-                        let mut left = MidiClip { length_secs: cut, notes: left_notes, tab: left_tab, ..c.clone() };
-                        let right_tempos = left.split_tempos(cut);
+                        let (left, right) = c.split(cut);
                         t.midi_clips[r.index] = left;
-                        t.midi_clips.insert(r.index + 1, MidiClip { position_secs: at_secs, length_secs: c.length_secs - cut, notes: right_notes, tab: right_tab, tempos: right_tempos, ..c });
+                        t.midi_clips.insert(r.index + 1, right);
                     }
                 }
             }

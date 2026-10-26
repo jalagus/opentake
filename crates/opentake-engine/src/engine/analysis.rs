@@ -16,7 +16,7 @@ use serde::Serialize;
 use super::Engine;
 use super::flex::{self, FlexKey};
 use crate::media::AudioData;
-use crate::mixer::{AUTOMATION_BLOCK, ClipFades, MidiEvent, Processor, Transport};
+use crate::mixer::{AUTOMATION_BLOCK, ClipFades, MidiData, MidiEvent, Processor, Transport};
 
 /// Analysis render rate.
 const ANALYSIS_RATE: f64 = 48_000.0;
@@ -392,16 +392,22 @@ pub(super) fn render_clips(clips: &[Clip], start: usize, sr: f64, media: impl Fn
 fn render_midi(track: &opentake_project::Track, inst: &mut dyn Processor, lanes: &[(u32, &AutomationLane)], start: usize, sr: f64, map: &TempoMap, l: &mut [f32], r: &mut [f32]) {
     let len = l.len();
     let total = start + len;
-    let mut events: Vec<(usize, u8, u8)> = Vec::new();
+    let mut events: Vec<(usize, MidiData)> = Vec::new();
     for c in track.midi_clips.iter().filter(|c| !c.mute) {
         for n in c.notes.iter().filter(|n| n.start_secs < c.length_secs) {
             let on = ((c.position_secs + n.start_secs) * sr) as usize;
             let off = ((c.position_secs + (n.start_secs + n.length_secs).min(c.length_secs)) * sr) as usize;
-            events.push((on, n.pitch, n.velocity.max(1)));
-            events.push((off, n.pitch, 0));
+            events.push((on, MidiData::Note { pitch: n.pitch, velocity: n.velocity.max(1) }));
+            events.push((off, MidiData::Note { pitch: n.pitch, velocity: 0 }));
+        }
+        for lane in &c.controllers {
+            for e in lane.events.iter().filter(|e| e.time_secs < c.length_secs) {
+                events.push((((c.position_secs + e.time_secs) * sr) as usize, MidiData::Control { kind: lane.kind, value: lane.kind.raw(e.value) }));
+            }
         }
     }
-    events.sort_by_key(|e| (e.0, e.2 != 0));
+    // Controllers, then note-offs, then note-ons at the same time (as the mixer sends them).
+    events.sort_by_key(|e| (e.0, matches!(e.1, MidiData::Note { velocity: 1.., .. }), matches!(e.1, MidiData::Note { .. })));
     let silence = vec![0.0f32; BLOCK];
     let (mut ol, mut or) = (vec![0.0f32; BLOCK], vec![0.0f32; BLOCK]);
     let latency = inst.latency();
@@ -411,7 +417,7 @@ fn render_midi(track: &opentake_project::Track, inst: &mut dyn Processor, lanes:
         let n = automate(inst, lanes, pos as f64 / sr).min(total + latency - pos);
         let mut block = Vec::new();
         while ei < events.len() && events[ei].0 < pos + n {
-            block.push(MidiEvent { offset: (events[ei].0.saturating_sub(pos)) as u32, pitch: events[ei].1, velocity: events[ei].2 });
+            block.push(MidiEvent { offset: (events[ei].0.saturating_sub(pos)) as u32, data: events[ei].1 });
             ei += 1;
         }
         let t = Transport { tempo_bpm: map.tempo_at(pos as f64 / sr), playing: true, position_samples: pos as i64, ..Transport::default() };

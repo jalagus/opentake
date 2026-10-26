@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use opentake_project::guitarpro::{self, Score, TrackKind, timeline};
-use opentake_project::{MidiClip, Note, TabBar, TabLayout, TabPos, TempoChange, TempoMark};
+use opentake_project::{Controller, ControllerEvent, ControllerLane, MidiClip, Note, PluginFormat, PluginSlot, TabBar, TabLayout, TabPos, TempoChange, TempoMark};
 use serde::Serialize;
 
 use super::Engine;
@@ -48,6 +48,29 @@ pub struct GuitarProTrackInfo {
     pub kind: String,
     pub tuning: Vec<u8>,
     pub notes: usize,
+}
+
+/// A track's bends, slides and vibrato as a pitch-bend lane (song seconds), and the bend
+/// range it needs: ±2 semitones (the usual default) when that covers it, else ±12 (wider
+/// moves are clipped). The built-in synth is set to that range; other instruments must
+/// be set to it by hand.
+fn bend_lane(perf: &timeline::Performance, track: usize) -> Option<(ControllerLane, f64)> {
+    let curve = timeline::pitch_curve(&perf.events, track);
+    let widest = curve.iter().fold(0.0f64, |m, p| m.max(p.1.abs()));
+    let range = if widest <= 2.0 + 1e-9 { 2.0 } else { 12.0 };
+    let bend = Controller::PitchBend;
+    // On the 14-bit grid, so a held bend repeats exactly and thins out.
+    let events = curve.iter().map(|&(t, semis)| ControllerEvent { time_secs: t, value: bend.from_raw(bend.raw((semis / range) as f32)) }).collect();
+    let lane = ControllerLane::new(bend, events);
+    (!lane.events.is_empty()).then_some((lane, range))
+}
+
+/// Set the built-in synth's bend range (other instruments keep theirs).
+fn set_bend_range(slot: &mut PluginSlot, semitones: f64) {
+    if slot.format == PluginFormat::Builtin && slot.path == crate::synth::PATH {
+        slot.params.retain(|p| p.0 != crate::synth::param::BEND_RANGE);
+        slot.params.push((crate::synth::param::BEND_RANGE, crate::synth::bend_range_value(semitones)));
+    }
 }
 
 fn kind_name(kind: TrackKind) -> &'static str {
@@ -270,7 +293,7 @@ impl Engine {
                 e.send(cmd)?;
             }
             let mut created = Vec::new();
-            for (&gp_track, slot) in wanted.iter().zip(slots) {
+            for (&gp_track, mut slot) in wanted.iter().zip(slots) {
                 let gp = &score.tracks[gp_track];
                 let tabbed = gp.kind != TrackKind::Drums && !gp.tuning.is_empty();
                 let notes: Vec<Note> = perf
@@ -286,18 +309,20 @@ impl Engine {
                     })
                     .collect();
                 let tab = tabbed.then(|| TabLayout { tuning: gp.tuning.clone(), capo: gp.capo, bars: tab_bars.clone() });
+                let bends = (gp.kind != TrackKind::Drums).then(|| bend_lane(&perf, gp_track)).flatten();
+                if let Some((_, range)) = &bends {
+                    set_bend_range(&mut slot, *range);
+                }
                 let name = score.tracks[gp_track].name.clone();
                 let index = e.add_track_impl(&name)?;
                 e.project.tracks[index].instrument = Some(slot);
                 e.sync_instrument(index)?;
                 e.project.tracks[index].midi_clips.push(MidiClip {
-                    name: format!("{song_name} — {name}"),
-                    position_secs: start,
-                    length_secs: length,
-                    mute: false,
                     notes: super::midi::sorted(notes),
                     tab,
                     tempos: perf.tempos.iter().map(|&(t, bpm)| TempoMark { start_secs: t, bpm }).collect(),
+                    controllers: bends.map(|b| b.0).into_iter().collect(),
+                    ..MidiClip::new(format!("{song_name} — {name}"), start, length)
                 });
                 e.resync_midi(index)?;
                 created.push(index);
@@ -353,6 +378,16 @@ mod tests {
         assert_eq!(tab.bars[0].section.as_deref(), Some("A Intro"));
         assert_eq!(clip.notes.iter().find(|n| n.pitch == 45).and_then(|n| n.tab), Some(TabPos { string: 0, fret: 5 }));
         assert!(p.tracks[2].midi_clips[0].tab.is_none());
+        // The bend (a whole tone, bar 3 beat 4) and the wide vibrato play as pitch bend, in
+        // the synth's default ±2 range; the drums get none.
+        let bend = clip.lane(Controller::PitchBend).expect("pitch bend lane");
+        let top = bend.events.iter().fold(0.0f32, |m, e| m.max(e.value));
+        assert!(top > 0.95 && top <= 1.0, "a whole tone is the full ±2 range: {top}");
+        assert!(bend.events.iter().any(|e| e.value < -0.2), "vibrato swings below");
+        assert_eq!(bend.events.last().map(|e| e.value), Some(0.0), "back to the centre");
+        let range = guitar.instrument.as_ref().unwrap().params.iter().find(|p| p.0 == crate::synth::param::BEND_RANGE).map(|p| p.1);
+        assert_eq!(range, Some(crate::synth::bend_range_value(2.0)));
+        assert!(p.tracks[2].midi_clips[0].controllers.is_empty());
         // The song's tempo map comes along on every region, drums included.
         assert_eq!(p.tracks[2].midi_clips[0].tempos.len(), 2);
         assert_eq!(p.song_tempo_at(1.0), Some(120.0));

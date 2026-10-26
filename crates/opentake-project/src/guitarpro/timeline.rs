@@ -1,6 +1,7 @@
 //! Turns a [`Score`] into a flat, time-ordered performance: repeats are expanded, tempo
 //! changes applied, ties merged and effects (tremolo, let ring, triplet feel, grace notes,
-//! brush strokes) resolved. Ported from GuitarCraft's `timeline.ts`.
+//! brush strokes) resolved. Ported from GuitarCraft's `timeline.ts`. Bends, slides and
+//! vibrato become a pitch curve per track ([`pitch_curve`]), played as pitch bend.
 
 use std::collections::HashMap;
 
@@ -34,6 +35,11 @@ pub struct NoteEvent {
     pub velocity: u8,
     pub string: u8,
     pub fret: u8,
+    /// Bend curve (offset 0..1 of the note, semitones), slide flags and vibrato (see
+    /// [`super::Note`]).
+    pub bend: Vec<(f64, f64)>,
+    pub slide: u8,
+    pub vibrato: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -188,7 +194,18 @@ pub fn build_performance(score: &Score) -> Performance {
                         }
                         let brush = beat.brush_up.map_or(0.0, |up| brush_delay(up, note.string, track.tuning.len()));
                         let velocity = (beat.dynamic as i32 + if note.accent { 15 } else { 0 } - if note.ghost { 30 } else { 0 }).clamp(1, 127) as u8;
-                        let make = |time: f64, duration: f64| NoteEvent { track: ti, time, duration, midi: note.midi, velocity, string: note.string, fret: note.fret };
+                        let make = |time: f64, duration: f64| NoteEvent {
+                            track: ti,
+                            time,
+                            duration,
+                            midi: note.midi,
+                            velocity,
+                            string: note.string,
+                            fret: note.fret,
+                            bend: note.bend.clone(),
+                            slide: note.slide,
+                            vibrato: note.vibrato,
+                        };
                         if let Some(sub) = beat.tremolo.filter(|_| !beat.grace) {
                             let step = 4.0 * TICKS_PER_QUARTER as f64 / sub as f64;
                             let stop = (beat.start + beat.duration).min(mb.duration) as f64;
@@ -216,6 +233,73 @@ pub fn build_performance(score: &Score) -> Performance {
         }
     }
     Performance { bars, events, tempos, duration: time }
+}
+
+/// Seconds between the points of a generated pitch curve.
+const CURVE_STEP: f64 = 0.01;
+const VIBRATO_HZ: f64 = 5.5;
+
+/// A track's bends, slides and vibrato as one pitch curve: (seconds, semitones) points, each
+/// holding until the next. Pitch bend is per channel, so the curve shapes every note sounding
+/// with an expressive one; it starts at the expressive note and returns to 0 when the next
+/// note starts (or the note ends). Mapping: GP bend points as written (100 = a whole tone);
+/// shift and legato slides glide to the next note on the string over the last third of the
+/// note; slides out fall or rise 5 semitones over the last third; slides in come from 3
+/// semitones below or above over the first tenth of a second; vibrato is a 5.5 Hz wobble of
+/// ±¼ (slight) or ±½ (wide) semitone.
+pub fn pitch_curve(events: &[NoteEvent], track: usize) -> Vec<(f64, f64)> {
+    let notes: Vec<&NoteEvent> = events.iter().filter(|e| e.track == track).collect();
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for (i, n) in notes.iter().enumerate() {
+        if n.bend.is_empty() && n.slide == 0 && n.vibrato == 0 {
+            continue;
+        }
+        let later = &notes[i + 1..];
+        let next = later.iter().find(|m| m.time > n.time + 1e-9).map(|m| m.time);
+        let end = n.time + n.duration;
+        let stop = next.map_or(end, |t| t.min(end));
+        let target = later.iter().find(|m| m.string == n.string && m.time > n.time + 1e-9).map(|m| m.midi as f64 - n.midi as f64);
+        let slide_to = match n.slide {
+            s if s & 3 != 0 => target.unwrap_or(0.0),
+            s if s & 4 != 0 => -5.0,
+            s if s & 8 != 0 => 5.0,
+            _ => 0.0,
+        };
+        let slide_from = match n.slide {
+            s if s & 16 != 0 => -3.0,
+            s if s & 32 != 0 => 3.0,
+            _ => 0.0,
+        };
+        let depth = [0.0, 0.25, 0.5][n.vibrato.min(2) as usize];
+        let at = |t: f64| {
+            let x = ((t - n.time) / n.duration.max(1e-6)).clamp(0.0, 1.0);
+            let glide_in = (1.0 - (t - n.time) / (n.duration / 10.0).min(0.1)).clamp(0.0, 1.0);
+            let glide_out = ((x - 2.0 / 3.0) * 3.0).clamp(0.0, 1.0);
+            bend_at(&n.bend, x) + slide_from * glide_in + slide_to * glide_out + depth * ((t - n.time) * VIBRATO_HZ * std::f64::consts::TAU).sin()
+        };
+        // A chord's other notes may already have drawn here: this note's curve takes over.
+        out.retain(|p| p.0 < n.time - 1e-9);
+        let mut t = n.time;
+        while t < stop - 1e-9 {
+            out.push((t, at(t)));
+            t += CURVE_STEP;
+        }
+        if let Some(t) = next.filter(|&t| t <= end + 1e-9).or(Some(end)) {
+            out.push((t, 0.0));
+        }
+    }
+    out
+}
+
+/// A bend curve's value at `x` (0..1 of the note): linear between its points.
+fn bend_at(points: &[(f64, f64)], x: f64) -> f64 {
+    let Some(first) = points.first() else { return 0.0 };
+    let i = points.partition_point(|p| p.0 <= x);
+    match (i.checked_sub(1).map(|i| points[i]), points.get(i)) {
+        (Some(a), Some(b)) if b.0 > a.0 => a.1 + (b.1 - a.1) * (x - a.0) / (b.0 - a.0),
+        (Some(a), _) => a.1,
+        (None, _) => first.1,
+    }
 }
 
 #[cfg(test)]
@@ -251,5 +335,38 @@ mod tests {
         }
         let drums: Vec<f64> = perf.events.iter().filter(|e| e.track == 1).map(|e| e.time).collect();
         assert_eq!(drums, vec![0.0, 4.0]);
+    }
+
+    fn event(time: f64, duration: f64, midi: u8, string: u8) -> NoteEvent {
+        NoteEvent { track: 0, time, duration, midi, velocity: 100, string, fret: 0, bend: Vec::new(), slide: 0, vibrato: 0 }
+    }
+
+    #[test]
+    fn bends_slides_and_vibrato_become_a_pitch_curve() {
+        let at = |curve: &[(f64, f64)], t: f64| curve.iter().rev().find(|p| p.0 <= t + 1e-9).map_or(0.0, |p| p.1);
+        // A full bend up over the first half, held; the next note returns to 0.
+        let bent = NoteEvent { bend: vec![(0.0, 0.0), (0.5, 2.0), (1.0, 2.0)], ..event(1.0, 1.0, 60, 2) };
+        let curve = pitch_curve(&[event(0.0, 1.0, 55, 1), bent, event(2.0, 1.0, 62, 2)], 0);
+        assert_eq!(curve.first(), Some(&(1.0, 0.0)), "starts at the bent note");
+        assert!((at(&curve, 1.25) - 1.0).abs() < 0.05 && (at(&curve, 1.9) - 2.0).abs() < 1e-9);
+        assert_eq!(*curve.last().unwrap(), (2.0, 0.0));
+
+        // A shift slide up 3 frets to the next note on the string: flat, then gliding at the end.
+        let slide = NoteEvent { slide: 1, ..event(0.0, 0.9, 60, 3) };
+        let curve = pitch_curve(&[slide, event(0.9, 0.5, 63, 3)], 0);
+        assert_eq!(at(&curve, 0.5), 0.0);
+        assert!((at(&curve, 0.89) - 3.0).abs() < 0.2, "{}", at(&curve, 0.89));
+
+        // Wide vibrato swings about ±0.5.
+        let curve = pitch_curve(&[NoteEvent { vibrato: 2, ..event(0.0, 1.0, 60, 0) }], 0);
+        let (lo, hi) = curve.iter().fold((0.0f64, 0.0f64), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
+        assert!(lo < -0.45 && hi > 0.45 && hi <= 0.5, "{lo} {hi}");
+        assert!(pitch_curve(&[event(0.0, 1.0, 60, 0)], 0).is_empty(), "plain notes draw nothing");
+
+        // The fixture's bend (bar 3, beat 4: a full bend over the note) is in the performance.
+        let perf = build_performance(&fixture());
+        let curve = pitch_curve(&perf.events, 0);
+        let top = curve.iter().fold(0.0f64, |m, p| m.max(p.1));
+        assert!(top > 1.9 && top <= 2.0, "rises to a whole tone over the note: {top}");
     }
 }

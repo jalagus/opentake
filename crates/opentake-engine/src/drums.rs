@@ -2,10 +2,13 @@
 //! (e.g. from Guitar Pro) can be heard without a drum plugin. Each hit mixes a pitched
 //! sine sweep (kick, toms, snare body), filtered noise (snare, hats, cymbals) and a
 //! metallic cluster of square waves (hats, cymbals, cowbell), each with its own decay.
+//! Of the controllers only volume (CC7) applies; one-shots ignore bends and the pedal.
 
 use std::f32::consts::TAU;
 
-use crate::mixer::{MidiEvent, Processor, Transport};
+use opentake_project::Controller;
+
+use crate::mixer::{MidiData, MidiEvent, Processor, Transport};
 
 const VOICES: usize = 32;
 
@@ -140,11 +143,13 @@ pub struct DrumSynth {
     values: [f64; 3],
     clock: u64,
     noise: u32,
+    /// CC7 as a gain (127 = unity).
+    volume: f32,
 }
 
 impl DrumSynth {
     pub fn new(sample_rate: f64) -> Self {
-        Self { sample_rate: sample_rate.max(1.0) as f32, voices: [Voice::IDLE; VOICES], values: PARAMS.map(|p| p.3), clock: 0, noise: 0x1234_5678 }
+        Self { sample_rate: sample_rate.max(1.0) as f32, voices: [Voice::IDLE; VOICES], values: PARAMS.map(|p| p.3), clock: 0, noise: 0x1234_5678, volume: 1.0 }
     }
 
     fn hit(&mut self, key: u8, velocity: u8) {
@@ -189,7 +194,7 @@ impl DrumSynth {
         let dt = 1.0 / sr;
         let decay = decay_scale(self.values[0]);
         let tone = tone_scale(self.values[1]);
-        let gain = 10f64.powf(level_db(self.values[2]) / 20.0) as f32 * 0.5;
+        let gain = 10f64.powf(level_db(self.values[2]) / 20.0) as f32 * 0.5 * self.volume * self.volume;
         // Per-sample envelope multiplier for a decay time.
         let k = |secs: f32| (-dt / (secs * decay).max(0.002)).exp();
 
@@ -272,8 +277,10 @@ impl Processor for DrumSynth {
                 at = offset;
             }
             // One-shots: note-offs are ignored.
-            if e.velocity > 0 {
-                self.hit(e.pitch, e.velocity);
+            match e.data {
+                MidiData::Note { pitch, velocity } if velocity > 0 => self.hit(pitch, velocity),
+                MidiData::Control { kind: Controller::VOLUME, value } => self.volume = Controller::VOLUME.from_raw(value),
+                _ => {}
             }
         }
         if at < frames {
@@ -309,7 +316,7 @@ mod tests {
     fn every_gm_drum_sounds_and_dies_away() {
         for key in 27..=87u8 {
             let mut s = DrumSynth::new(48_000.0);
-            let hit = run(&mut s, &[MidiEvent { offset: 10, pitch: key, velocity: 120 }], 4800);
+            let hit = run(&mut s, &[MidiEvent::note(10, key, 120)], 4800);
             assert!(hit[..10].iter().all(|&x| x == 0.0), "key {key}: silent before the hit");
             let p = peak(&hit);
             assert!(p > 0.01 && p < 2.0, "key {key}: peak {p}");
@@ -325,8 +332,8 @@ mod tests {
     #[test]
     fn closed_hat_chokes_open_hat() {
         let mut s = DrumSynth::new(48_000.0);
-        run(&mut s, &[MidiEvent { offset: 0, pitch: 46, velocity: 120 }], 4800);
-        run(&mut s, &[MidiEvent { offset: 0, pitch: 42, velocity: 1 }], 4800);
+        run(&mut s, &[MidiEvent::note(0, 46, 120)], 4800);
+        run(&mut s, &[MidiEvent::note(0, 42, 1)], 4800);
         // 0.2 s later the open hat (0.45 s decay) would still ring if not choked.
         let tail = run(&mut s, &[], 9600);
         assert!(peak(&tail[4800..]) < 0.01, "open hat choked: {}", peak(&tail[4800..]));
@@ -335,10 +342,10 @@ mod tests {
     #[test]
     fn kick_is_low_and_loud_hats_are_bright() {
         let mut s = DrumSynth::new(48_000.0);
-        let kick = run(&mut s, &[MidiEvent { offset: 0, pitch: 36, velocity: 127 }], 4800);
+        let kick = run(&mut s, &[MidiEvent::note(0, 36, 127)], 4800);
         let zero_crossings = |x: &[f32]| x.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count();
         let mut s = DrumSynth::new(48_000.0);
-        let hat = run(&mut s, &[MidiEvent { offset: 0, pitch: 42, velocity: 127 }], 4800);
+        let hat = run(&mut s, &[MidiEvent::note(0, 42, 127)], 4800);
         assert!(zero_crossings(&kick) < 40, "kick crossings {}", zero_crossings(&kick));
         assert!(zero_crossings(&hat[..1200]) > 100, "hat crossings {}", zero_crossings(&hat[..1200]));
         assert!(peak(&kick) > 0.2);

@@ -8,13 +8,15 @@
 //! latency), so a note played in time with what's heard lands on the beat. On stop each
 //! armed instrument track gets one region spanning the recording; a cycle recording merges
 //! every pass into one region spanning the cycle (overdub), from the record point if that
-//! was earlier. There's no input monitoring switch: input always plays through the
+//! was earlier. Pitch bend, controllers (the sustain pedal too, like Logic: notes keep the
+//! length they were held) and channel pressure are recorded into the region's controller
+//! lanes the same way. There's no input monitoring switch: input always plays through the
 //! receiving track's instrument.
 
 use std::sync::atomic::Ordering;
 
 use anyhow::{Result, anyhow};
-use opentake_project::{MidiClip, Note};
+use opentake_project::{Controller, ControllerEvent, ControllerLane, MidiClip, Note};
 use serde::Serialize;
 
 use super::Engine;
@@ -39,10 +41,10 @@ pub(super) struct TakeNote {
     pub velocity: u8,
 }
 
-/// The notes of a take. Keys let go while the sustain pedal is down end when it comes up,
-/// and notes still held end at `end`. In a cycle recording a note-off before its note-on
-/// (the key was held over the wrap) ends the note at the cycle end. Notes are at least
-/// `min_len` long.
+/// The notes of a take: each lasts as long as its key was held (the sustain pedal is
+/// recorded as a controller), and notes still held end at `end`. In a cycle recording a
+/// note-off before its note-on (the key was held over the wrap) ends the note at the cycle
+/// end. Notes are at least `min_len` long.
 pub(super) fn take_notes(events: &[RecMidi], cycle: Option<(i64, i64)>, end: i64, min_len: i64) -> Vec<TakeNote> {
     let mut notes = Vec::new();
     let mut close = |pitch: usize, (start, velocity): (i64, u8), at: i64| {
@@ -52,41 +54,46 @@ pub(super) fn take_notes(events: &[RecMidi], cycle: Option<(i64, i64)>, end: i64
         };
         notes.push(TakeNote { start, end: at.max(start + min_len), pitch: pitch as u8, velocity });
     };
-    // Sounding notes (start, velocity) by pitch: keys held, and keys the pedal holds.
+    // Sounding notes (start, velocity) by pitch.
     let mut held: [Option<(i64, u8)>; 128] = [None; 128];
-    let mut pedal: [Option<(i64, u8)>; 128] = [None; 128];
-    let mut sustain = false;
     for e in events {
         let RecMidi::Msg(t, msg) = *e else { continue };
         match msg {
             MidiMsg::NoteOn { pitch, velocity } => {
-                let p = pitch as usize;
-                for n in [held[p].take(), pedal[p].take()].into_iter().flatten() {
-                    close(p, n, t);
-                }
-                held[p] = Some((t, velocity));
-            }
-            MidiMsg::NoteOff { pitch } => {
-                let p = pitch as usize;
-                if let Some(n) = held[p].take() {
-                    if sustain { pedal[p] = Some(n) } else { close(p, n, t) }
+                if let Some(n) = held[pitch as usize].replace((t, velocity)) {
+                    close(pitch as usize, n, t);
                 }
             }
-            MidiMsg::Sustain(down) => {
-                sustain = down;
-                if !down {
-                    (0..128).for_each(|p| pedal[p].take().into_iter().for_each(|n| close(p, n, t)));
-                }
-            }
-            MidiMsg::AllNotesOff => {
-                sustain = false;
-                (0..128).for_each(|p| [held[p].take(), pedal[p].take()].into_iter().flatten().for_each(|n| close(p, n, t)));
-            }
+            MidiMsg::NoteOff { pitch } => held[pitch as usize].take().into_iter().for_each(|n| close(pitch as usize, n, t)),
+            MidiMsg::AllNotesOff => (0..128).for_each(|p| held[p].take().into_iter().for_each(|n| close(p, n, t))),
+            MidiMsg::Control(..) => {}
         }
     }
-    (0..128).for_each(|p| [held[p].take(), pedal[p].take()].into_iter().flatten().for_each(|n| close(p, n, end)));
+    (0..128).for_each(|p| held[p].take().into_iter().for_each(|n| close(p, n, end)));
     notes.sort_by_key(|n| (n.start, n.pitch));
     notes
+}
+
+/// The controller lanes of a take for a region spanning timeline samples `from..to`: every
+/// controller message, at its time from the region start (earlier ones at the start, so the
+/// region opens with the value they left). Cycle passes merge; exact duplicates (an event at
+/// the same time, or repeating the value before it) are dropped.
+pub(super) fn take_controllers(events: &[RecMidi], from: i64, to: i64, sr: f64) -> Vec<ControllerLane> {
+    let mut lanes: Vec<(Controller, Vec<ControllerEvent>)> = Vec::new();
+    for e in events {
+        let RecMidi::Msg(t, MidiMsg::Control(kind, raw)) = *e else { continue };
+        if t >= to {
+            continue;
+        }
+        let ev = ControllerEvent { time_secs: (t.max(from) - from) as f64 / sr, value: kind.from_raw(raw) };
+        match lanes.iter_mut().find(|l| l.0 == kind) {
+            Some(l) => l.1.push(ev),
+            None => lanes.push((kind, vec![ev])),
+        }
+    }
+    let mut lanes: Vec<ControllerLane> = lanes.into_iter().map(|(kind, events)| ControllerLane::new(kind, events)).collect();
+    lanes.sort_by_key(|l| l.kind);
+    lanes
 }
 
 /// The MIDI inputs there are and which are chosen and open.
@@ -108,6 +115,8 @@ pub struct RecordedMidi {
     pub position_secs: f64,
     pub length_secs: f64,
     pub notes: usize,
+    /// Controller events (pitch bend, CCs, pressure) recorded.
+    pub controller_events: usize,
 }
 
 impl Engine {
@@ -267,18 +276,20 @@ impl Engine {
             .filter(|(start, end, _)| end - start >= min_len)
             .map(|(start, end, n)| Note { start_secs: secs(start - from), length_secs: secs(end - start), pitch: n.pitch, velocity: n.velocity.max(1), tab: None })
             .collect();
-        if notes.is_empty() {
+        let controllers = take_controllers(&take.events, from, to, sr);
+        let controller_events = controllers.iter().map(|l| l.events.len()).sum();
+        if notes.is_empty() && controller_events == 0 {
             return Ok(Vec::new());
         }
         let mut added = Vec::new();
         for id in take.tracks {
             let Some(index) = self.project.track_by_id(id) else { continue };
             let name = self.project.tracks[index].name.clone();
-            let clip = MidiClip { name: name.clone(), position_secs: secs(from), length_secs: secs(to - from), mute: false, notes: notes.clone(), tab: None, tempos: Vec::new() };
+            let clip = MidiClip { notes: notes.clone(), controllers: controllers.clone(), ..MidiClip::new(name.clone(), secs(from), secs(to - from)) };
             self.project.tracks[index].midi_clips.push(clip);
             self.resync_midi(index)?;
             let region = self.project.tracks[index].midi_clips.len() - 1;
-            added.push(RecordedMidi { track: index, region, name, position_secs: secs(from), length_secs: secs(to - from), notes: notes.len() });
+            added.push(RecordedMidi { track: index, region, name, position_secs: secs(from), length_secs: secs(to - from), notes: notes.len(), controller_events });
         }
         Ok(added)
     }
@@ -302,17 +313,32 @@ mod tests {
     }
 
     #[test]
-    fn take_notes_follow_the_pedal_and_end_at_the_stop() {
-        let pedal = |t, down| RecMidi::Msg(t, MidiMsg::Sustain(down));
-        let events = [on(0, 60), off(100, 60), pedal(150, true), on(200, 62), off(300, 62), on(350, 62), off(400, 62), pedal(500, false), on(600, 64)];
-        // 62 restruck while the pedal held it: the first ends there; 64 is held at the stop.
+    fn take_notes_last_as_held_and_end_at_the_stop() {
+        let pedal = |t, v| RecMidi::Msg(t, MidiMsg::Control(Controller::SUSTAIN, v));
+        let events = [on(0, 60), off(100, 60), pedal(150, 127), on(200, 62), on(350, 62), off(400, 62), pedal(500, 0), on(600, 64)];
+        // The pedal doesn't lengthen notes; 62 struck again ends the first; 64 is held at the stop.
         let notes = take_notes(&events, None, 1000, 10);
-        assert_eq!(notes, vec![note(0, 100, 60), note(200, 350, 62), note(350, 500, 62), note(600, 1000, 64)]);
+        assert_eq!(notes, vec![note(0, 100, 60), note(200, 350, 62), note(350, 400, 62), note(600, 1000, 64)]);
         // All Notes Off ends everything; very short notes get the minimum length.
         let events = [on(0, 60), on(5, 61), off(6, 61), RecMidi::Msg(50, MidiMsg::AllNotesOff)];
         assert_eq!(take_notes(&events, None, 1000, 10), vec![note(0, 50, 60), note(5, 15, 61)]);
         // Held over a cycle wrap: ends at the cycle end.
         assert_eq!(take_notes(&[on(1900, 60), off(1100, 60)], Some((1000, 2000)), 1500, 10), vec![note(1900, 2000, 60)]);
+    }
+
+    #[test]
+    fn take_controllers_make_lanes_relative_to_the_region() {
+        let cc = |t, kind, v| RecMidi::Msg(t, MidiMsg::Control(kind, v));
+        let bend = Controller::PitchBend;
+        let events = [cc(500, bend, 9000), cc(900, bend, 10000), on(1000, 60), cc(1000, bend, 12000), cc(1500, bend, 12000), cc(1500, Controller::SUSTAIN, 127), cc(1700, bend, 8192), cc(3000, bend, 0)];
+        let lanes = take_controllers(&events, 1000, 2000, 1000.0);
+        let ev = |t: f64, v: f32| ControllerEvent { time_secs: t, value: v };
+        assert_eq!(lanes.len(), 2);
+        assert_eq!(lanes[0].kind, bend);
+        // Before the region: the latest lands at its start, then is overwritten by the event
+        // right there; the repeat at 1500 and anything after the end go.
+        assert_eq!(lanes[0].events, vec![ev(0.0, bend.from_raw(12000)), ev(0.7, 0.0)]);
+        assert_eq!(lanes[1].events, vec![ev(0.5, 1.0)]);
     }
 
     /// An engine with instrument tracks "Keys" and "Pads" and a test mixer reading one MIDI
@@ -464,6 +490,34 @@ mod tests {
         assert!(e.project().tracks.iter().all(|t| t.midi_clips.is_empty()));
         run(&mut mixer, 1);
         assert_eq!(e.status().position_secs, 1.0);
+    }
+
+    #[test]
+    fn recording_captures_pitch_bend_and_controllers_where_they_were_heard() {
+        let (mut e, mut mixer, mut tx) = rig();
+        arm(&mut e, 0, true);
+        e.start_recording().unwrap();
+        run(&mut mixer, 50); // 0.5 s
+        play(&mut tx, &[0xB0, 64, 127]);
+        play(&mut tx, &[0x90, 60, 100]);
+        play(&mut tx, &[0xE0, 0, 0x60]); // bend up
+        run(&mut mixer, 10);
+        play(&mut tx, &[0xB0, 1, 90]); // mod wheel
+        play(&mut tx, &[0xB0, 1, 90]); // repeated: dropped
+        play(&mut tx, &[0x80, 60, 0]);
+        run(&mut mixer, 10);
+        play(&mut tx, &[0xE0, 0, 0x40]); // back to the centre
+        play(&mut tx, &[0xB0, 64, 0]);
+        run(&mut mixer, 10);
+        let r = stop(&mut e, &mut mixer);
+        assert_eq!((r.midi_regions[0].notes, r.midi_regions[0].controller_events), (1, 5));
+        let c = &e.project().tracks[0].midi_clips[0];
+        let lane = |k| c.lane(k).unwrap().events.iter().map(|e| ((e.time_secs * 1000.0).round(), e.value)).collect::<Vec<_>>();
+        // Placed like the notes: 0.5 s less half a callback.
+        assert_eq!(lane(Controller::PitchBend), vec![(495.0, Controller::PitchBend.from_raw(0x60 << 7)), (695.0, 0.0)]);
+        assert_eq!(lane(Controller::MOD_WHEEL), vec![(595.0, 90.0 / 127.0)]);
+        assert_eq!(lane(Controller::SUSTAIN), vec![(495.0, 1.0), (695.0, 0.0)]);
+        assert!((c.notes[0].length_secs - 0.1).abs() < MS, "the pedal doesn't lengthen the note: {:?}", c.notes[0]);
     }
 
     #[test]

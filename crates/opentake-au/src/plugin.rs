@@ -441,6 +441,17 @@ impl AuProcessor {
         self.inst.set_param(id, normalized);
     }
 
+    /// Send a short MIDI message (a controller, pitch bend or channel pressure: status
+    /// byte and two data bytes) to an instrument, `offset` samples into the next
+    /// [`process`](Self::process) block. Call it before that block's `process`; effects
+    /// without MIDI input ignore it.
+    pub fn queue_midi(&mut self, offset: u32, status: u8, data1: u8, data2: u8) {
+        if self.inst.midi {
+            let offset = offset.min(self.max_block.saturating_sub(1) as u32);
+            unsafe { MusicDeviceMIDIEvent(self.inst.unit, status as u32, (data1 & 0x7F) as u32, (data2 & 0x7F) as u32, offset) };
+        }
+    }
+
     /// Process `frames` samples (up to the max block). `inputs` feed an effect's input;
     /// the unit's output is written to every channel of `outputs`.
     pub fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize, transport: &Transport, notes: &[NoteEvent]) {
@@ -841,6 +852,21 @@ mod tests {
         crate::pump_events(Duration::from_millis(100));
         assert!(plugin.take_edits().is_empty());
         assert!(plugin.has_editor(), "Apple's AUDelay comes with a Cocoa view");
+    }
+
+    #[test]
+    fn controllers_reach_an_instrument() {
+        let plugin = load("aumu:dls :appl");
+        let mut proc = plugin.create_processor(SR, BLOCK).unwrap();
+        let note = NoteEvent { offset: 0, pitch: 69, velocity: 110 };
+        let plain = render(&mut proc, 0.0, &[note], 8);
+        let mut proc = plugin.create_processor(SR, BLOCK).unwrap();
+        // Full bend up (status 0xE0, LSB, MSB) and the mod wheel, before the note.
+        proc.queue_midi(0, 0xE0, 0x7F, 0x7F);
+        proc.queue_midi(0, 0xB0, 1, 127);
+        let bent = render(&mut proc, 0.0, &[note], 8);
+        let crossings = |s: &[f32]| s.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
+        assert!(crossings(&bent[BLOCK..]) > crossings(&plain[BLOCK..]), "bent up: {} vs {}", crossings(&bent[BLOCK..]), crossings(&plain[BLOCK..]));
     }
 
     #[test]

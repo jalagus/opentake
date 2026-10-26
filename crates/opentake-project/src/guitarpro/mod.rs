@@ -127,8 +127,13 @@ pub struct Note {
     pub let_ring: bool,
     pub accent: bool,
     pub ghost: bool,
-    /// Bend curve as (offset 0..1 of the note, semitones). Not played back yet.
+    /// Bend curve as (offset 0..1 of the note, semitones).
     pub bend: Vec<(f64, f64)>,
+    /// Slide flags: 1 shift slide, 2 legato slide (both to the next note on the string),
+    /// 4 slide out downwards, 8 out upwards, 16 in from below, 32 in from above.
+    pub slide: u8,
+    /// Vibrato: 0 none, 1 slight, 2 wide.
+    pub vibrato: u8,
 }
 
 /// Parse a Guitar Pro file from bytes (`.gp` ZIP container or raw GPIF XML).
@@ -202,6 +207,7 @@ mod tests {
         let bent = &score.tracks[0].bars[2].voices[0].beats[3].notes[0];
         assert_eq!(bent.bend.last().map(|p| p.1), Some(2.0), "100 = full = 2 semitones");
         assert!(score.tracks[0].bars[3].voices[0].beats[0].notes[0].let_ring);
+        assert_eq!(score.tracks[0].bars[3].voices[0].beats[0].notes[0].vibrato, 2, "wide");
         // A note without a Midi property is derived from tuning + fret.
         assert_eq!(score.tracks[0].bars[2].voices[0].beats[0].notes[0].midi, 45 + 7);
     }

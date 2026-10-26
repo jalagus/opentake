@@ -13,13 +13,14 @@
 //! [`BlockClock`] maps a message played during the previous callback period to the same
 //! relative frame of this callback. Live notes therefore play a constant one buffer late,
 //! without jitter; with no timing (tests, or a host that gives none) they land at frame 0.
-//! Pitch bend, modulation and other controllers are ignored for now: only notes, the
-//! sustain pedal and all-notes-off are used.
+//! Notes, control changes, pitch bend and channel pressure are used (omni: every channel);
+//! polyphonic aftertouch, program changes and sysex are ignored.
 
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
+use opentake_project::Controller;
 use rtrb::{Consumer, Producer};
 use serde::{Deserialize, Serialize};
 
@@ -62,8 +63,9 @@ pub fn now_ns() -> i64 {
 pub enum MidiMsg {
     NoteOn { pitch: u8, velocity: u8 },
     NoteOff { pitch: u8 },
-    /// Sustain pedal (CC64) down or up.
-    Sustain(bool),
+    /// A controller at its raw value: 0..=127, pitch bend 0..=16383 (8192 = centre). The
+    /// sustain pedal is CC64 (down from 64).
+    Control(Controller, u16),
     /// All Notes Off (CC123) or All Sound Off (CC120).
     AllNotesOff,
 }
@@ -93,11 +95,13 @@ pub fn parse(bytes: &[u8], running: &mut u8) -> Option<MidiMsg> {
         },
         0x80 => Some(MidiMsg::NoteOff { pitch: byte(0)? }),
         0xB0 => match (byte(0)?, byte(1)?) {
-            (64, v) => Some(MidiMsg::Sustain(v >= 64)),
             (120 | 123, _) => Some(MidiMsg::AllNotesOff),
-            _ => None,
+            (121.., _) => None, // other channel mode messages
+            (cc, v) => Some(MidiMsg::Control(Controller::Cc(cc), v as u16)),
         },
-        _ => None, // pitch bend, aftertouch, program change: not yet
+        0xD0 => Some(MidiMsg::Control(Controller::ChannelPressure, byte(0)? as u16)),
+        0xE0 => Some(MidiMsg::Control(Controller::PitchBend, byte(0)? as u16 | (byte(1)? as u16) << 7)),
+        _ => None, // polyphonic aftertouch, program change
     }
 }
 
@@ -267,17 +271,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_notes_sustain_and_running_status() {
+    fn parses_notes_controllers_and_running_status() {
         let mut rs = 0;
         assert_eq!(parse(&[0x90, 60, 100], &mut rs), Some(MidiMsg::NoteOn { pitch: 60, velocity: 100 }));
         assert_eq!(parse(&[0x93, 60, 0], &mut rs), Some(MidiMsg::NoteOff { pitch: 60 }), "velocity 0 is a note-off");
         assert_eq!(parse(&[0x80, 61, 64], &mut rs), Some(MidiMsg::NoteOff { pitch: 61 }));
-        assert_eq!(parse(&[0xB0, 64, 127], &mut rs), Some(MidiMsg::Sustain(true)));
-        assert_eq!(parse(&[0xB0, 64, 10], &mut rs), Some(MidiMsg::Sustain(false)));
+        assert_eq!(parse(&[0xB0, 64, 127], &mut rs), Some(MidiMsg::Control(Controller::SUSTAIN, 127)));
         assert_eq!(parse(&[0xB0, 123, 0], &mut rs), Some(MidiMsg::AllNotesOff));
         assert_eq!(parse(&[0xB0, 120, 0], &mut rs), Some(MidiMsg::AllNotesOff));
-        assert_eq!(parse(&[0xB0, 1, 50], &mut rs), None, "mod wheel is ignored");
-        assert_eq!(parse(&[0xE0, 0, 64], &mut rs), None, "pitch bend is ignored");
+        assert_eq!(parse(&[0xB0, 121, 0], &mut rs), None, "reset all controllers is a mode message");
+        assert_eq!(parse(&[0xB1, 1, 50], &mut rs), Some(MidiMsg::Control(Controller::MOD_WHEEL, 50)));
+        assert_eq!(parse(&[0xE0, 0, 64], &mut rs), Some(MidiMsg::Control(Controller::PitchBend, 8192)), "centre");
+        assert_eq!(parse(&[0xE0, 0x7F, 0x7F], &mut rs), Some(MidiMsg::Control(Controller::PitchBend, 16383)));
+        assert_eq!(parse(&[0xD0, 90], &mut rs), Some(MidiMsg::Control(Controller::ChannelPressure, 90)));
+        assert_eq!(parse(&[0xA0, 60, 90], &mut rs), None, "polyphonic aftertouch is ignored");
         // Running status: data bytes reuse the last status; real-time bytes don't cancel it.
         parse(&[0x90, 60, 100], &mut rs);
         assert_eq!(parse(&[0xF8], &mut rs), None);

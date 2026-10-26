@@ -332,7 +332,7 @@ impl Ctx<'_> {
                 let end = if span.1.is_finite() { span.1 } else { notes.iter().map(|n| n.start_secs + n.length_secs).fold(start, f64::max) };
                 notes.iter_mut().for_each(|n| n.start_secs -= start);
                 notes.sort_by(|a, b| a.start_secs.total_cmp(&b.start_secs));
-                let clip = MidiClip { name: name.unwrap_or_default().to_string(), position_secs: start, length_secs: end - start, mute: false, notes, tab: None, tempos: Vec::new() };
+                let clip = MidiClip { name: name.unwrap_or_default().to_string(), position_secs: start, length_secs: end - start, mute: false, notes, tab: None, tempos: Vec::new(), controllers: Vec::new() };
                 self.tracks[t].midi_clips.push(clip);
             }
             _ => {
@@ -795,6 +795,7 @@ mod tests {
             notes: vec![Note { start_secs: 0.5, length_secs: 7.0, pitch: 60, velocity: 100, tab: None }],
             tab: None,
             tempos: Vec::new(),
+            controllers: Vec::new(),
         });
         p.tracks = vec![audio, keys];
 

@@ -138,7 +138,8 @@ mod mac {
     use super::{AudioUnitInfo, Engine, PREFIX};
     use crate::engine::ParamView;
     use crate::engine::plugins::Loaded;
-    use crate::mixer::{MAX_BLOCK, MidiEvent, Processor, Transport};
+    use crate::mixer::{MAX_BLOCK, MidiData, MidiEvent, Processor, Transport};
+    use opentake_project::Controller;
 
     /// Base64 in lines of 128 characters, the way Reaper stores plug-in state.
     pub(super) fn encode_state(state: &[u8]) -> Vec<String> {
@@ -177,9 +178,18 @@ mod mac {
                 time_sig: t.time_sig,
                 position_samples: t.position_samples,
             };
+            // Controllers go out as MIDI before the block's notes, at their offsets.
             self.notes.clear();
-            for e in events.iter().take(self.notes.capacity()) {
-                self.notes.push(NoteEvent { offset: e.offset, pitch: e.pitch, velocity: e.velocity });
+            for e in events {
+                let offset = e.offset.min(frames.saturating_sub(1) as u32);
+                match e.data {
+                    MidiData::Note { pitch, velocity } if self.notes.len() < self.notes.capacity() => self.notes.push(NoteEvent { offset, pitch, velocity }),
+                    MidiData::Note { .. } => {}
+                    MidiData::Control { kind, value } => {
+                        let (status, d1, d2) = midi_bytes(kind, value);
+                        self.processor.queue_midi(offset, status, d1, d2);
+                    }
+                }
             }
             self.processor.process_keyed(inputs, key, outputs, frames, &t, &self.notes);
         }
@@ -190,6 +200,15 @@ mod mac {
 
         fn latency(&self) -> usize {
             self.latency
+        }
+    }
+
+    /// A controller as a MIDI message on channel 1: status and data bytes.
+    pub(in crate::engine) fn midi_bytes(kind: Controller, value: u16) -> (u8, u8, u8) {
+        match kind {
+            Controller::PitchBend => (0xE0, (value & 0x7F) as u8, (value >> 7 & 0x7F) as u8),
+            Controller::ChannelPressure => (0xD0, value.min(127) as u8, 0),
+            Controller::Cc(n) => (0xB0, n & 0x7F, value.min(127) as u8),
         }
     }
 

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use opentake_engine::project::{AutomationMode, AutomationPoint, AutomationTarget, Curve, Note};
+use opentake_engine::project::{AutomationMode, AutomationPoint, AutomationTarget, Controller, ControllerEvent, Curve, Note};
 use opentake_engine::midi_input::MidiSelection;
 use opentake_engine::{AudioConfig, Engine, MidiClipUpdate, SendUpdate, SlotRef, TrackUpdate};
 
@@ -38,7 +38,10 @@ Projects can be saved/loaded as native .otp, Reaper .rpp or .dawproject files; A
 
 MIDI: add_instrument_track (\"synth\" = built-in synth, or a VST3 / AU instrument from list_instruments) -> \
 add_midi_clip -> set_midi_notes / add_midi_notes (times in seconds relative to the region start, \
-pitch 60 = middle C, velocity 1..127). Every edit — yours or the user's — can be undone with undo/redo; \
+pitch 60 = middle C, velocity 1..127). Pitch bend, mod wheel and other controllers: \
+get_midi_controllers / set_midi_controllers (events at times relative to the region start; values in MIDI \
+units, or semitones for pitch bend with bend_range; the built-in synth bends ±2 semitones by default, set by its \
+Bend Range parameter). Every edit — yours or the user's — can be undone with undo/redo; \
 get_history lists the steps. Songs: import_guitar_pro (.gp) and import_midi_file (.mid) create \
 instrument tracks; export_midi_file writes the MIDI regions back out.
 
@@ -296,6 +299,11 @@ fn compact_track(t: &mut serde_json::Value, include_notes: bool) {
                 let count = c.get("notes").and_then(|n| n.as_array()).map_or(0, |n| n.len());
                 c.as_object_mut().map(|o| o.remove("notes"));
                 c["note_count"] = json!(count);
+                // Controller lanes as counts (get_midi_controllers has the events).
+                if let Some(lanes) = c.as_object_mut().and_then(|o| o.remove("controllers")) {
+                    let lanes = serde_json::from_value::<Vec<opentake_engine::project::ControllerLane>>(lanes).unwrap_or_default();
+                    c["controllers"] = json!(lanes.iter().map(|l| json!({ "kind": controller_name(l.kind), "event_count": l.events.len() })).collect::<Vec<_>>());
+                }
             }
             if let Some(tab) = c.get_mut("tab").filter(|t| t.is_object()) {
                 let bars = tab.get("bars").and_then(|b| b.as_array()).map_or(0, |b| b.len());
@@ -708,6 +716,88 @@ pub struct MidiNotesArgs {
     /// MIDI region index on the track (see get_project → midi_clips).
     pub clip: usize,
     pub notes: Vec<NoteArg>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetMidiControllersArgs {
+    pub track: usize,
+    /// MIDI region index on the track.
+    pub clip: usize,
+    /// Only this controller (see set_midi_controllers' kind); omit for every lane.
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ControllerEventArg {
+    /// Seconds from the start of the region.
+    pub time_secs: f64,
+    /// CC and pressure 0..127; pitch bend -8192..8191 (0 = centre), or semitones when
+    /// bend_range is given.
+    pub value: f64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetMidiControllersArgs {
+    pub track: usize,
+    pub clip: usize,
+    /// "pitch_bend", "mod_wheel" (CC1), "volume" (CC7), "pan" (CC10), "expression" (CC11),
+    /// "sustain" (CC64), "pressure" (channel pressure), or any CC as "cc74" / "74".
+    pub kind: String,
+    /// The events (each holds until the next). Empty with replace removes the lane.
+    pub events: Vec<ControllerEventArg>,
+    /// "replace" (default) the lane's events, or "add" to them (an event at the same time
+    /// replaces the old one).
+    pub mode: Option<String>,
+    /// Pitch bend only: values are semitones and the instrument bends ±bend_range (the
+    /// built-in synth's Bend Range parameter, 2 by default).
+    pub bend_range: Option<f64>,
+}
+
+/// A controller from a tool argument.
+fn parse_controller(kind: &str) -> anyhow::Result<Controller> {
+    let k = kind.trim().to_lowercase().replace([' ', '-'], "_");
+    Ok(match k.as_str() {
+        "pitch_bend" | "pitchbend" | "bend" => Controller::PitchBend,
+        "pressure" | "channel_pressure" | "aftertouch" => Controller::ChannelPressure,
+        "mod_wheel" | "modwheel" | "modulation" | "mod" => Controller::MOD_WHEEL,
+        "volume" => Controller::VOLUME,
+        "pan" => Controller::PAN,
+        "expression" => Controller::EXPRESSION,
+        "sustain" | "sustain_pedal" | "pedal" => Controller::SUSTAIN,
+        _ => match k.trim_start_matches("cc").parse::<u8>() {
+            Ok(n) if n < 120 => Controller::Cc(n),
+            _ => anyhow::bail!("unknown controller '{kind}': use pitch_bend, mod_wheel, volume, pan, expression, sustain, pressure or cc0..cc119"),
+        },
+    })
+}
+
+fn controller_name(kind: Controller) -> String {
+    match kind {
+        Controller::PitchBend => "pitch_bend".into(),
+        Controller::ChannelPressure => "pressure".into(),
+        Controller::Cc(n) => format!("cc{n}"),
+    }
+}
+
+/// A controller value in MIDI units: CC and pressure 0..127, pitch bend -8192..8191.
+fn natural_value(kind: Controller, value: f32) -> i32 {
+    kind.raw(value) as i32 - if kind == Controller::PitchBend { 8192 } else { 0 }
+}
+
+fn controller_events(kind: Controller, events: &[ControllerEventArg], bend_range: Option<f64>) -> anyhow::Result<Vec<ControllerEvent>> {
+    events
+        .iter()
+        .map(|e| {
+            let value = match (kind, bend_range) {
+                (Controller::PitchBend, Some(range)) if range > 0.0 => (e.value / range).clamp(-1.0, 1.0),
+                (Controller::PitchBend, None) => (e.value / 8192.0).clamp(-1.0, 1.0),
+                (Controller::PitchBend, Some(_)) => anyhow::bail!("bend_range must be positive"),
+                _ if !(0.0..=127.0).contains(&e.value) => anyhow::bail!("{} values are 0..127 (got {})", controller_name(kind), e.value),
+                _ => e.value / 127.0,
+            };
+            Ok(ControllerEvent { time_secs: e.time_secs, value: value as f32 })
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1542,6 +1632,41 @@ impl DawServer {
         self.with_engine(move |e| e.add_midi_notes(a.track, a.clip, notes).map(|n| json!({ "note_count": n }))).await
     }
 
+    #[tool(description = "The controller lanes of a MIDI region: pitch bend (-8192..8191, 0 = centre), CCs and channel pressure (0..127), each event holding until the next; times in seconds relative to the region start.")]
+    async fn get_midi_controllers(&self, Parameters(a): Parameters<GetMidiControllersArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let only = a.kind.as_deref().map(parse_controller).transpose()?;
+            let track = e.project().tracks.get(a.track).ok_or_else(|| anyhow::anyhow!("no track {}", a.track))?;
+            let clip = track.midi_clips.get(a.clip).ok_or_else(|| anyhow::anyhow!("track {} has no MIDI region {}", a.track, a.clip))?;
+            let lanes: Vec<_> = clip
+                .controllers
+                .iter()
+                .filter(|l| only.is_none_or(|k| k == l.kind))
+                .map(|l| {
+                    let events: Vec<_> = l.events.iter().map(|ev| json!({ "time_secs": ev.time_secs, "value": natural_value(l.kind, ev.value) })).collect();
+                    json!({ "kind": controller_name(l.kind), "name": l.kind.name(), "events": events })
+                })
+                .collect();
+            Ok(json!({ "region": clip.name, "length_secs": clip.length_secs, "lanes": lanes }))
+        })
+        .await
+    }
+
+    #[tool(description = "Set a MIDI region's pitch bend, CC (mod wheel, volume, expression, sustain, pan, any CC) or channel-pressure events: replace the lane (default) or add to it. Values in MIDI units (CC 0..127, pitch bend -8192..8191) or, for pitch bend with bend_range, semitones. Events are steps, so draw a bend or swell as several events (e.g. every 10-20 ms). Instruments get them sample-accurately, and starting playback mid-region sends each controller's value there. Undoable. Returns the lane's event count.")]
+    async fn set_midi_controllers(&self, Parameters(a): Parameters<SetMidiControllersArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let kind = parse_controller(&a.kind)?;
+            let replace = match a.mode.as_deref().map(str::to_lowercase).as_deref() {
+                None | Some("replace") => true,
+                Some("add") => false,
+                Some(m) => anyhow::bail!("mode must be replace or add, not '{m}'"),
+            };
+            let events = controller_events(kind, &a.events, a.bend_range)?;
+            e.set_midi_controllers(a.track, a.clip, kind, events, replace).map(|n| json!({ "kind": controller_name(kind), "event_count": n }))
+        })
+        .await
+    }
+
     #[tool(description = "Change a MIDI region: rename, move (optionally to another track), resize or mute.")]
     async fn update_midi_clip(&self, Parameters(a): Parameters<UpdateMidiClipArgs>) -> ToolResult {
         self.with_engine(move |e| {
@@ -1791,6 +1916,7 @@ mod compact_tests {
             notes: vec![Note { start_secs: 0.0, length_secs: 0.5, pitch: 60, velocity: 100, tab: None }; 3],
             tab: None,
             tempos: Vec::new(),
+            controllers: Vec::new(),
         });
         p.tracks.push(t);
         let compact = project_json(&p, false);
@@ -1800,6 +1926,30 @@ mod compact_tests {
         assert_eq!(compact["tracks"][0]["index"], 0);
         let full = project_json(&p, true);
         assert_eq!(full["tracks"][0]["midi_clips"][0]["notes"].as_array().map(|n| n.len()), Some(3));
+    }
+
+    #[test]
+    fn controller_tools_take_midi_units_or_semitones() {
+        assert_eq!(parse_controller("Pitch Bend").unwrap(), Controller::PitchBend);
+        assert_eq!(parse_controller("cc74").unwrap(), Controller::Cc(74));
+        assert_eq!(parse_controller("64").unwrap(), Controller::SUSTAIN);
+        assert!(parse_controller("cc123").is_err(), "channel mode messages aren't controllers");
+        let ev = |t: f64, v: f64| ControllerEventArg { time_secs: t, value: v };
+        let bend = controller_events(Controller::PitchBend, &[ev(0.0, -8192.0), ev(0.5, 4096.0)], None).unwrap();
+        assert_eq!(bend.iter().map(|e| e.value).collect::<Vec<_>>(), vec![-1.0, 0.5]);
+        let semis = controller_events(Controller::PitchBend, &[ev(0.0, 1.0)], Some(2.0)).unwrap();
+        assert_eq!(semis[0].value, 0.5);
+        assert!(controller_events(Controller::VOLUME, &[ev(0.0, 200.0)], None).is_err());
+
+        let mut e = Engine::new();
+        let t = e.add_instrument_track("Keys", "synth").unwrap();
+        e.add_midi_clip(t, 0.0, 2.0, None).unwrap();
+        e.set_midi_controllers(t, 0, Controller::PitchBend, bend, true).unwrap();
+        e.set_midi_controllers(t, 0, Controller::VOLUME, controller_events(Controller::VOLUME, &[ev(0.0, 100.0)], None).unwrap(), true).unwrap();
+        let v = project_json(e.project(), false);
+        assert_eq!(v["tracks"][t]["midi_clips"][0]["controllers"], json!([{ "kind": "pitch_bend", "event_count": 2 }, { "kind": "cc7", "event_count": 1 }]));
+        assert_eq!(natural_value(Controller::PitchBend, -1.0), -8192);
+        assert_eq!(natural_value(Controller::VOLUME, 100.0 / 127.0), 100);
     }
 
     #[test]

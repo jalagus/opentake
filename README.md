@@ -18,6 +18,7 @@ you watch the changes appear live — and undo anything you don't like.
 
 - 🎙️ Multitrack recording from any audio interface (CoreAudio, WASAPI, ALSA/JACK via cpal), latency-compensated with a built-in loopback measurement
 - 🎹 Instrument tracks, piano roll, a built-in synth and GM drum kit; VST3 instruments and effects, plus Audio Units on macOS
+- 🎚️ Pitch bend, mod wheel and any CC or channel pressure: drawn in the piano roll's MIDI Draw lane, recorded from a keyboard, chased when playback starts mid-region
 - 🎛️ Built-in EQ, compressor, multiband compressor, limiter, delay, reverb, gate, de-esser, chorus and phaser on any track or the master bus; plug-in delay compensation
 - 🪟 Plug-ins' own editor windows (VST3 on macOS and Windows, Audio Units): what you turn there is undoable and writes automation
 - 🔀 Buses and sends: route tracks into a bus, or send them pre/post-fader to a shared reverb or delay bus
@@ -32,7 +33,7 @@ you watch the changes appear live — and undo anything you don't like.
   fades, crossfades and click-free merging of regions
 - 🎚️ Full mixer, metronome, undo/redo for everything
 - 💾 Export the mix and stems to WAV or FLAC, faster than real time
-- 🤖 MCP server (stdio or HTTP) with 90 tools — the agent and you share one session
+- 🤖 MCP server (stdio or HTTP) with 92 tools — the agent and you share one session
 - 📂 Its own `.otp` project files (double-click to open), Reaper `.rpp` and DAWproject (Bitwig, Studio One, Cubase) projects
 - 🔀 Imports Ableton Live sets (`.als`), Ardour sessions, and Logic Pro projects exported as Final Cut Pro XML
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
@@ -117,20 +118,33 @@ agent.
 - **Record and arrange**: audio and instrument tracks; move, trim, split, copy and loop regions
   with snapping; tempo and time-signature changes; a metronome with count-in.
 - **MIDI**: a built-in synth and drum kit or any VST3 / Audio Unit instrument, edited in the piano roll.
+- **Controllers (MIDI Draw)**: the piano roll's **MIDI Draw** button opens a lane under the notes
+  for pitch bend, mod wheel (CC1), volume (CC7), expression (CC11), sustain (CC64), pan (CC10),
+  channel pressure or any CC number. Drag on empty space to draw a curve with the pencil, click
+  to add a step, drag a handle to move it, right-click or ⌫ to delete; each gesture is one undo
+  step. Pitch bend is centred at 0. Controllers play sample-accurately, and starting mid-region
+  (or a cycle wrap) sends each controller's value at that point, like Logic's chase; stop
+  centres the bend and lifts the pedal. The built-in synth bends ±2 semitones (its Bend Range
+  parameter goes to ±24), turns the mod wheel into vibrato and follows volume, expression and
+  the sustain pedal; VST3 instruments get controllers as the parameters they map them to,
+  Audio Units as MIDI.
 - **Play and record MIDI**: plug in a keyboard (Audio Settings → MIDI Inputs: all inputs by
   default, or tick the ones to use; the MIDI light in the control bar flashes as notes come in).
   What you play goes to every record-armed (**R**) instrument track, or with none armed to the
   selected one, like Logic. Press record (**R**): armed instrument tracks record MIDI — together
   with armed audio tracks, or on their own without an audio input — and the notes appear in the
   red region as you play. Stop makes one MIDI region per track, with notes placed where you heard
-  them (output latency compensated) and the sustain pedal folded into note lengths. With the
+  them (output latency compensated); pitch bend, mod wheel, the sustain pedal and other CCs are
+  recorded into its controller lanes the same way (notes keep the length they were held). With the
   cycle on, every pass merges into one region over the cycle (overdub). One undo removes the
   take and puts the playhead back where recording began.
 - **Guitar Pro import**: drop a `.gp` file to get one instrument track per part, the song's
-  tempo map, and tablature or notation that scrolls along with the arrangement (**T**).
+  tempo map, and tablature or notation that scrolls along with the arrangement (**T**). Bends,
+  slides and vibrato are played as a pitch-bend lane (the built-in synth's bend range is set to
+  ±2 semitones, or ±12 when a slide or bend goes further).
 - **MIDI files**: drop a `.mid` file (or File → Import MIDI File…) to pick its parts; each
-  becomes an instrument track (channel 10 on the drum kit). File → Export MIDI File… writes
-  the MIDI regions back out.
+  becomes an instrument track (channel 10 on the drum kit), with its CCs, pitch bend and
+  channel pressure. File → Export MIDI File… writes the MIDI regions (notes and controllers) back out.
 - **Mix**: an inspector and a mixer (**I**, **X**), plus built-in EQ, compressor, multiband compressor, limiter,
   delay, reverb, gate, de-esser, chorus and phaser alongside VST3 and Audio Unit effects. The reverb (pre-delay,
   size, decay, damping, low cut, width, diffusion, modulation) shows its decay tail as you turn
@@ -247,10 +261,15 @@ of the tool calls behind them):
 `scan_plugins`, `insert_plugin`, `remove_plugin`, `insert_master_plugin`, `remove_master_plugin`, `set_plugin_bypass`, `open_plugin_editor`,
 `list_plugin_params`, `set_plugin_param`, `set_sidechain` (`"eq"` inserts the built-in EQ; `master: true` addresses the master bus),
 `list_instruments`, `add_instrument_track`, `set_instrument`, `list_instrument_params`, `set_instrument_param`,
-`add_midi_clip`, `set_midi_notes`, `add_midi_notes`, `update_midi_clip`, `copy_midi_clip`, `remove_midi_clip`,
+`add_midi_clip`, `set_midi_notes`, `add_midi_notes`, `get_midi_controllers`, `set_midi_controllers`, `update_midi_clip`, `copy_midi_clip`, `remove_midi_clip`,
 `inspect_guitar_pro`, `import_guitar_pro`, `inspect_midi_file`, `import_midi_file`, `export_midi_file`,
 `list_automation_params`, `get_automation`, `add_automation_lane`, `set_automation_points`, `clear_automation`,
 `set_automation_lane`, `remove_automation_lane`.
+
+Controllers: `set_midi_controllers` sets a MIDI region's pitch bend, CC or channel-pressure
+events (seconds from the region start; CC 0..127, pitch bend -8192..8191, or semitones with
+`bend_range`), replacing the lane or adding to it; `get_midi_controllers` reads them back and
+`get_project` lists each region's lanes with their event counts.
 
 Automation: `list_automation_params` lists what a track (or `master: true`) can automate;
 `add_automation_lane` creates a lane and `set_automation_points` draws it, with times in seconds
@@ -322,23 +341,31 @@ automation other than tempo, sends/returns and fades aren't imported.
   loop) keeps the generic parameter sliders. A window the user resizes is fitted to the
   plug-in on the next GUI frame, and a preset loaded in an editor updates only parameters
   OpenTake has already saved. Plugin parameters are saved by value, but full state chunks
-  aren't saved yet. Instruments get note events only and haven't been tested with many
-  third-party plugins.
+  aren't saved yet. VST3 has no MIDI controller events: pitch bend and CCs reach an
+  instrument only as the parameters it maps them to (`IMidiMapping`), and are dropped
+  otherwise. Instruments haven't been tested with many third-party plugins.
 - Audio Units (macOS only): editor windows for Cocoa views (AUv2) and AUv3 view controllers
   (the latter untested so far); stereo/mono main bus plus a
-  side chain on a second input element (no extra outputs), notes only (no pitch bend/CC). State is saved as the
+  side chain on a second input element (no extra outputs); notes and controllers go in as MIDI. State is saved as the
   unit's property list; Reaper's AU state may not restore. AUv3 extensions that load only
   asynchronously wait up to 10 s and fail if they need the main thread meanwhile.
 - Plugin parameter values, MIDI regions, the built-in synth/drums/effects and master-bus effects
-  are saved in `.otp` projects only (`.rpp` export skips them; VST3 instruments are exported).
+  are saved in `.otp` projects only (`.rpp` export skips them, controller lanes included; VST3 instruments are exported).
+  DAWproject and Ableton imports bring MIDI notes only, not their controllers.
 - Guitar Pro: only GP7/8 (`.gp`, `.gpif`); `.gp3`–`.gp5` and `.gpx` are recognised but not
-  imported yet. Bends, slides and vibrato aren't played back (no pitch bend yet).
+  imported yet. Bends, slides and vibrato become pitch bend, which is per track (channel): a
+  bend shapes every note sounding with it, and other instruments must be set to the bend
+  range by hand (the built-in synth is set for you). Whammy bar and harmonics aren't played.
   `cargo run -p opentake-project --example gpinfo -- song.gp` prints what the reader sees.
 - MIDI files: notes, tempo and time signatures are imported (format 0/1; format 2 is read
-  as parallel tracks); program changes only pick names, and CC, pitch bend and lyrics are skipped.
-- MIDI: notes and the sustain pedal only — pitch bend, mod wheel and other CCs from MIDI
-  inputs are ignored (live and when recording; the pedal is folded into note lengths), and
-  channels are merged (omni). Live MIDI plays one audio buffer late (constant, no jitter) and
+  as parallel tracks) with CCs, pitch bend and channel pressure; program changes only pick
+  names; polyphonic aftertouch, sysex and lyrics are skipped.
+- MIDI: notes, CCs, pitch bend and channel pressure (no polyphonic aftertouch or MPE), and
+  channels are merged (omni). Live, the sustain pedal also holds notes for instruments that
+  ignore CC64; played back from a region it's up to the instrument (the built-in synth and AUs
+  honour it, VST3 if it maps CC64). Chasing sends a controller's neutral value (centred bend,
+  mod wheel and pedal off, expression full) before its first event; volume and other CCs
+  without a neutral value keep what they had. Live MIDI plays one audio buffer late (constant, no jitter) and
   through any plug-in delay compensation. MIDI recording merges cycle passes (no MIDI take
   folders, no replace mode or quantize-on-input yet); a key held over the cycle end ends there.
   Notes are in seconds, so changing the tempo map doesn't stretch existing regions (they keep

@@ -397,14 +397,29 @@ impl ParamChanges {
 
     /// Host-side: set a parameter to `value` at the start of the next block.
     pub fn push(&self, id: ParamID, value: ParamValue) -> bool {
-        let queue = match self.find(id) {
-            Some(q) => q,
-            None => match self.alloc(id) {
-                Some(q) => q,
-                None => return false,
-            },
-        };
-        unsafe { queue.addPoint(0, value, std::ptr::null_mut()) == kResultOk }
+        self.push_at(id, 0, value)
+    }
+
+    /// Host-side: set a parameter to `value` at sample `offset` of the next block (offsets
+    /// per parameter in increasing order). A point at the same offset as the last one
+    /// replaces it, and a full queue moves its last point to the newest value, so the
+    /// parameter always ends the block where it should.
+    pub fn push_at(&self, id: ParamID, offset: i32, value: ParamValue) -> bool {
+        let Some(queue) = self.find(id).or_else(|| self.alloc(id)) else { return false };
+        let len = queue.len.get();
+        let last = len.checked_sub(1).map(|i| queue.points[i].get());
+        match last {
+            Some((o, _)) if o >= offset || len >= MAX_POINTS => {
+                queue.points[len - 1].set((o.max(offset), value));
+                true
+            }
+            _ => unsafe { queue.addPoint(offset, value, std::ptr::null_mut()) == kResultOk },
+        }
+    }
+
+    /// The queued points of parameter `id`.
+    pub fn points(&self, id: ParamID) -> Vec<(i32, ParamValue)> {
+        self.find(id).map(|q| q.points[..q.len.get()].iter().map(Cell::get).collect()).unwrap_or_default()
     }
 
     /// Iterate the last value of every changed parameter (used for plugin -> host changes).
@@ -470,6 +485,23 @@ impl IParameterChangesTrait for ParamChanges {
             unsafe { *index = pos as int32 };
         }
         unsafe { self.getParameterData(pos as int32) }
+    }
+}
+
+/// VST3 numbers MIDI controllers like `ControllerNumbers`: CCs 0..=127, then channel
+/// pressure and pitch bend.
+pub const MIDI_CONTROLLERS: usize = 130;
+pub const CTRL_AFTERTOUCH: u8 = 128;
+pub const CTRL_PITCH_BEND: u8 = 129;
+
+/// VST3 has no MIDI controller events: a plug-in maps controllers to parameters
+/// (`IMidiMapping`) and the host sends them as parameter changes. Queue controller
+/// `controller` at `offset` as its parameter's change; a controller the plug-in doesn't map
+/// is dropped (false).
+pub fn queue_midi_control(changes: &ParamChanges, map: &[Option<ParamID>; MIDI_CONTROLLERS], offset: i32, controller: u8, normalized: ParamValue) -> bool {
+    match map.get(controller as usize).copied().flatten() {
+        Some(id) => changes.push_at(id, offset, normalized.clamp(0.0, 1.0)),
+        None => false,
     }
 }
 
@@ -549,5 +581,37 @@ impl IEventListTrait for EventList {
             return kInvalidArgument;
         }
         if self.push(unsafe { *e }) { kResultOk } else { kResultFalse }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn midi_controllers_become_parameter_changes_at_their_offsets() {
+        let changes = ParamChanges::new();
+        let mut map = [None; MIDI_CONTROLLERS];
+        map[CTRL_PITCH_BEND as usize] = Some(1000);
+        map[1] = Some(1001);
+        // Automation at the block start, then a bend moving through the block.
+        changes.push(1000, 0.5);
+        for (offset, v) in [(10, 0.6), (10, 0.65), (200, 0.7)] {
+            assert!(queue_midi_control(&changes, &map, offset, CTRL_PITCH_BEND, v));
+        }
+        assert!(queue_midi_control(&changes, &map, 5, 1, 2.0));
+        assert!(!queue_midi_control(&changes, &map, 5, 7, 0.3), "CC7 isn't mapped: dropped");
+        assert_eq!(changes.points(1000), vec![(0, 0.5), (10, 0.65), (200, 0.7)], "same offset replaces");
+        assert_eq!(changes.points(1001), vec![(5, 1.0)], "clamped to 0..1");
+        assert_eq!(unsafe { changes.getParameterCount() }, 2);
+        // A dense stream fills the queue; the last point follows the newest value.
+        for i in 0..40 {
+            queue_midi_control(&changes, &map, 300 + i, CTRL_PITCH_BEND, i as f64 / 40.0);
+        }
+        let points = changes.points(1000);
+        assert_eq!(points.len(), MAX_POINTS);
+        assert_eq!(*points.last().unwrap(), (339, 39.0 / 40.0));
+        changes.clear();
+        assert!(changes.points(1000).is_empty());
     }
 }

@@ -211,6 +211,8 @@ pub(crate) enum Action {
     ExportMidiFile(PathBuf),
     AddMidiRegion { track: usize, position: f64, length: f64 },
     SetNotes { track: usize, clip: usize, notes: Vec<Note> },
+    /// Replace one controller lane of a MIDI region.
+    SetControllers { track: usize, clip: usize, kind: opentake_engine::project::Controller, events: Vec<opentake_engine::project::ControllerEvent> },
     LiveNote { track: usize, pitch: u8, velocity: u8 },
     ScanPlugins,
     AddPluginPath(PathBuf),
@@ -889,6 +891,7 @@ impl DawApp {
                 self.open_piano_roll(RegionRef::midi(track, i));
             }
             Action::SetNotes { track, clip, notes } => e.set_midi_notes(track, clip, notes)?,
+            Action::SetControllers { track, clip, kind, events } => drop(e.set_midi_controllers(track, clip, kind, events, true)?),
             Action::LiveNote { track, pitch, velocity } => e.live_note(track, pitch, velocity)?,
             Action::ScanPlugins => {
                 let (plugins, errors) = e.scan_plugins();
@@ -1178,11 +1181,21 @@ impl DawApp {
         self.act(Action::ShowAutomation { track: None, show: !shown });
     }
 
-    /// Delete: a selected automation point, then selected notes in the open piano roll, take
-    /// priority over the selected region.
+    /// Delete: a selected automation point, then a selected controller event or notes in the
+    /// open piano roll, take priority over the selected region.
     fn delete_selection(&mut self, snap: &Snapshot) {
         if let Some(s) = self.view.auto_sel.take() {
             self.act(Action::DeletePoints { owner: s.owner, lane: s.lane, indices: vec![s.point] });
+            return;
+        }
+        if self.bottom == Some(BottomTab::PianoRoll)
+            && let (Some(i), Some((t, c))) = (self.piano.ctrl_sel.take(), self.piano.region)
+            && let Some(lane) = snap.project.tracks.get(t).and_then(|tr| tr.midi_clips.get(c)).and_then(|clip| clip.lane(self.piano.ctrl_kind))
+            && i < lane.events.len()
+        {
+            let mut events = lane.events.clone();
+            events.remove(i);
+            self.act(Action::SetControllers { track: t, clip: c, kind: lane.kind, events });
             return;
         }
         if self.bottom == Some(BottomTab::PianoRoll) && !self.piano.selected.is_empty() {
@@ -3594,6 +3607,121 @@ mod tests {
         }
         assert!(after.iter().any(|n| n.pitch == 60 && (n.start_secs - 0.5).abs() < 0.02));
         assert!(after.iter().any(|n| n.pitch == 62 && (n.start_secs - 1.0).abs() < 0.02));
+    }
+
+    /// A Keys track with a 2 s region of three notes, open in the piano roll at 400 px/s.
+    fn harness_with_piano_roll() -> (Harness<'static, DawApp>, SharedEngine) {
+        let (mut harness, engine) = harness_with_track();
+        {
+            let mut e = engine.lock().unwrap();
+            let t = e.add_instrument_track("Keys", "synth").unwrap();
+            let c = e.add_midi_clip(t, 0.0, 2.0, None).unwrap();
+            let note = |start: f64, pitch: u8| Note { start_secs: start, length_secs: 0.4, pitch, velocity: 100, tab: None };
+            e.set_midi_notes(t, c, vec![note(0.0, 60), note(0.5, 64), note(1.0, 67)]).unwrap();
+        }
+        harness.state_mut().snap_mode = timeline::SnapMode::Off;
+        harness.state_mut().view.px_per_sec = 400.0;
+        harness.state_mut().open_piano_roll(RegionRef::midi(1, 0));
+        harness.step();
+        harness.step();
+        (harness, engine)
+    }
+
+    #[test]
+    fn piano_roll_pencil_draws_a_pitch_bend_curve_as_one_step() {
+        use opentake_engine::project::Controller;
+        let (mut harness, engine) = harness_with_piano_roll();
+        assert!(harness.state().piano.ctrl_rect.is_none(), "hidden until asked for");
+        click(&mut harness, "MIDI Draw");
+        assert_eq!(harness.state().piano.ctrl_kind, Controller::PitchBend, "the lane shows pitch bend first");
+        let lane = harness.state().piano.ctrl_rect.expect("controller lane drawn");
+        let (geo_left, pps, start) = {
+            let g = harness.state().piano.geo.unwrap();
+            (g.0.left(), g.3, g.4)
+        };
+        let x = |t: f64| geo_left + ((t - start) * pps as f64) as f32;
+        // Pencil from the top (full bend up) at 0.2 s down to the bottom at 0.8 s.
+        let (from, to) = (egui::pos2(x(0.2), lane.top() + 4.0), egui::pos2(x(0.8), lane.bottom() - 4.0));
+        harness.hover_at(from);
+        harness.step();
+        harness.drag_at(from);
+        harness.step();
+        for i in 1..=24 {
+            harness.hover_at(from + (to - from) * (i as f32 / 24.0));
+            harness.step();
+        }
+        harness.drop_at(to);
+        harness.step();
+        harness.step();
+        let events = {
+            let e = engine.lock().unwrap();
+            assert_eq!(e.history_info().undo.as_deref(), Some("Edit Pitch Bend"));
+            e.project().tracks[1].midi_clips[0].lane(Controller::PitchBend).expect("a bend lane").events.clone()
+        };
+        assert!(events.len() >= 10, "a curve of events: {events:?}");
+        assert!((events[0].time_secs - 0.2).abs() < 0.02 && events[0].value > 0.9, "{:?}", events[0]);
+        assert!(events.last().unwrap().value < -0.9 && (events.last().unwrap().time_secs - 0.8).abs() < 0.02);
+        assert!(events.windows(2).all(|w| w[1].time_secs > w[0].time_secs && w[1].value <= w[0].value), "falls left to right");
+
+        // A click adds one event; right-click on it deletes it; each is one step.
+        let click_at = egui::pos2(x(1.5), lane.center().y);
+        let press = |h: &mut Harness<'static, DawApp>, button: egui::PointerButton| {
+            for pressed in [true, false] {
+                h.event(egui::Event::PointerButton { pos: click_at, button, pressed, modifiers: egui::Modifiers::NONE });
+                h.step();
+            }
+            h.step();
+        };
+        harness.hover_at(click_at);
+        harness.step();
+        press(&mut harness, egui::PointerButton::Primary);
+        let count = || engine.lock().unwrap().project().tracks[1].midi_clips[0].lane(Controller::PitchBend).unwrap().events.len();
+        assert_eq!(count(), events.len() + 1);
+        press(&mut harness, egui::PointerButton::Secondary);
+        assert_eq!(count(), events.len());
+        engine.lock().unwrap().undo().unwrap();
+        engine.lock().unwrap().undo().unwrap();
+        engine.lock().unwrap().undo().unwrap();
+        assert!(engine.lock().unwrap().project().tracks[1].midi_clips[0].controllers.is_empty(), "three gestures, three steps");
+    }
+
+    /// Renders the piano roll with a drawn pitch-bend curve to a PNG for visual review:
+    /// `OPENTAKE_SCREENSHOT=/tmp/bend.png cargo test -p opentake render_controller_lane -- --ignored`
+    #[test]
+    #[ignore = "renders with wgpu; run manually for visual checks"]
+    fn render_controller_lane() {
+        use opentake_engine::project::{Controller, ControllerEvent};
+        let out = std::env::var("OPENTAKE_SCREENSHOT").unwrap_or_else(|_| "opentake-bend.png".into());
+        let engine: SharedEngine = Arc::new(Mutex::new(Engine::new()));
+        {
+            let mut e = engine.lock().unwrap();
+            let t = e.add_instrument_track("Lead", "synth").unwrap();
+            let c = e.add_midi_clip(t, 0.0, 4.0, None).unwrap();
+            let note = |start: f64, len: f64, pitch: u8| Note { start_secs: start, length_secs: len, pitch, velocity: 100, tab: None };
+            e.set_midi_notes(t, c, vec![note(0.0, 0.9, 64), note(1.0, 1.4, 67), note(2.5, 1.2, 69)]).unwrap();
+            let bend: Vec<ControllerEvent> = (0..=60).map(|i| {
+                let t = 1.0 + i as f64 * 0.02;
+                ControllerEvent { time_secs: t, value: (((t - 1.0) / 0.6).min(1.0) * 0.5) as f32 + if t > 1.6 { 0.08 * ((t - 1.6) * 35.0).sin() as f32 } else { 0.0 } }
+            }).chain([ControllerEvent { time_secs: 2.4, value: 0.0 }]).collect();
+            e.set_midi_controllers(t, c, Controller::PitchBend, bend, true).unwrap();
+            e.set_midi_controllers(t, c, Controller::MOD_WHEEL, vec![ControllerEvent { time_secs: 2.5, value: 0.6 }], true).unwrap();
+        }
+        let app_engine = engine.clone();
+        let mut harness = Harness::builder()
+            .with_size([1100.0, 620.0])
+            .with_pixels_per_point(2.0)
+            .with_step_dt(1.0 / 60.0)
+            .wgpu()
+            .build_eframe(move |cc| {
+                theme::apply(&cc.egui_ctx);
+                DawApp::new(app_engine, None)
+            });
+        harness.state_mut().view.px_per_sec = 200.0;
+        harness.state_mut().open_piano_roll(RegionRef::midi(0, 0));
+        for _ in 0..4 {
+            harness.step();
+        }
+        harness.render().expect("render").save(&out).expect("save png");
     }
 
     #[test]

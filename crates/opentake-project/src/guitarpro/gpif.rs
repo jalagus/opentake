@@ -179,6 +179,12 @@ fn parse_note(el: El, track: &Track) -> Note {
         accent: num::<u32>(&text(child(Some(el), "Accent")), 0) > 0,
         ghost: child(Some(el), "AntiAccent").is_some(),
         bend: Vec::new(),
+        slide: num(&prop_value("Slide", "Flags"), 0u32).min(255) as u8,
+        vibrato: match text(child(Some(el), "Vibrato")).as_str() {
+            "Slight" => 1,
+            "Wide" => 2,
+            _ => 0,
+        },
     };
     if prop("Bended").is_some() {
         let f = |name: &str, fallback: f64| prop_value(name, "Float").parse::<f64>().unwrap_or(fallback);

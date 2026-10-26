@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use rtrb::{Consumer, Producer};
 
-use opentake_project::{Fade, FadeCurve, TempoMap};
+use opentake_project::{BEND_CENTRE, CONTROLLER_SLOTS, Controller, Fade, FadeCurve, TempoMap};
 use opentake_project::automation::{AutomationPoint, envelope_at, pos_to_gain};
 
 use crate::media::AudioData;
@@ -21,7 +21,7 @@ const CLIP_CAPACITY: usize = 1024;
 pub const PLUGIN_CAPACITY: usize = 32;
 const MIDI_CLIP_CAPACITY: usize = 512;
 const EVENT_CAPACITY: usize = 1024;
-const LIVE_CAPACITY: usize = 128;
+const LIVE_CAPACITY: usize = 256;
 /// Tracks that play live MIDI input at once.
 pub const MAX_MIDI_TARGETS: usize = 16;
 /// MIDI messages handled per device callback.
@@ -50,12 +50,29 @@ pub struct Transport {
     pub position_samples: i64,
 }
 
-/// A note event inside a block. `velocity` 0 = note-off.
+/// An event for an instrument at `offset` frames into a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MidiEvent {
     pub offset: u32,
-    pub pitch: u8,
-    pub velocity: u8,
+    pub data: MidiData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MidiData {
+    /// `velocity` 0 = note-off.
+    Note { pitch: u8, velocity: u8 },
+    /// A controller at its raw MIDI value: 0..=127, pitch bend 0..=16383 (8192 = centre).
+    Control { kind: Controller, value: u16 },
+}
+
+impl MidiEvent {
+    pub const fn note(offset: u32, pitch: u8, velocity: u8) -> Self {
+        Self { offset, data: MidiData::Note { pitch, velocity } }
+    }
+
+    pub const fn control(offset: u32, kind: Controller, value: u16) -> Self {
+        Self { offset, data: MidiData::Control { kind, value } }
+    }
 }
 
 /// Live MIDI captured while recording, for the control side: messages at the timeline
@@ -121,13 +138,22 @@ pub struct NoteRt {
     pub velocity: u8,
 }
 
-/// A MIDI region; `notes` sorted by start.
+/// A controller event in absolute timeline samples (raw MIDI value, see [`MidiData`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CtrlRt {
+    pub at: u64,
+    pub kind: Controller,
+    pub value: u16,
+}
+
+/// A MIDI region; `notes` sorted by start, `ctrl` (inside the region) by time.
 #[derive(Debug, Clone)]
 pub struct MidiClipRt {
     pub start: u64,
     pub end: u64,
     pub mute: bool,
     pub notes: Vec<NoteRt>,
+    pub ctrl: Vec<CtrlRt>,
 }
 
 #[derive(Clone)]
@@ -255,12 +281,7 @@ pub struct TrackRt {
     pub instrument: Option<Box<PluginRt>>,
     pub plugins: Vec<Box<PluginRt>>,
     buf: [Vec<f32>; 2],
-    events: Vec<MidiEvent>,
-    /// Notes played live (piano-roll audition) waiting for the next block.
-    live: Vec<MidiEvent>,
-    /// Which pitches are sounding, so they can be released on stop/seek/edit.
-    active: [bool; 128],
-    flush: bool,
+    feed: MidiFeed,
     /// Live input's sustain pedal, and the keys let go while it's down (still sounding).
     sustain: bool,
     sustained: [bool; 128],
@@ -302,10 +323,7 @@ impl TrackRt {
             instrument: None,
             plugins: Vec::with_capacity(PLUGIN_CAPACITY),
             buf: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
-            events: Vec::with_capacity(EVENT_CAPACITY),
-            live: Vec::with_capacity(LIVE_CAPACITY),
-            active: [false; 128],
-            flush: false,
+            feed: MidiFeed::new(),
             sustain: false,
             sustained: [false; 128],
             latency: 0,
@@ -652,7 +670,7 @@ impl Mixer {
 
     fn flush_all_notes(&mut self) {
         for t in &mut self.tracks {
-            t.flush = true;
+            t.feed.flush = true;
         }
     }
 
@@ -947,7 +965,7 @@ impl Mixer {
                 Command::ReplaceMidi { track, mut clips } => {
                     if let Some(t) = self.track_mut(track) {
                         std::mem::swap(&mut t.midi, &mut *clips);
-                        t.flush = true;
+                        t.feed.flush = true;
                     }
                     self.discard(Garbage::Midi(clips));
                 }
@@ -978,7 +996,8 @@ impl Mixer {
                 Command::SetInstrument { track, plugin } => {
                     let old = match self.track_mut(track) {
                         Some(t) => {
-                            t.active = [false; 128];
+                            t.feed.active = [false; 128];
+                            t.feed.chase = true; // the new instrument starts from the regions' controllers
                             std::mem::replace(&mut t.instrument, plugin)
                         }
                         None => plugin,
@@ -1038,8 +1057,8 @@ impl Mixer {
                 }
                 Command::LiveNote { track, pitch, velocity } => {
                     if let Some(t) = self.track_mut(track) {
-                        if t.live.len() < t.live.capacity() {
-                            t.live.push(MidiEvent { offset: 0, pitch: pitch.min(127), velocity });
+                        if t.feed.live.len() < t.feed.live.capacity() {
+                            t.feed.live.push(MidiEvent::note(0, pitch.min(127), velocity));
                         }
                     }
                 }
@@ -1058,7 +1077,7 @@ impl Mixer {
                         if !ids[..len].contains(&id)
                             && let Some(t) = self.track_mut(id)
                         {
-                            (t.flush, t.sustain, t.sustained) = (true, false, [false; 128]);
+                            (t.feed.flush, t.sustain, t.sustained) = (true, false, [false; 128]);
                         }
                     }
                     (self.midi_targets, self.midi_target_len) = (ids, len);
@@ -1169,7 +1188,7 @@ impl Mixer {
                 }
                 MidiMsg::NoteOff { pitch } => drop(keys[pitch as usize / 64].fetch_and(!(1 << (pitch % 64)), Ordering::Relaxed)),
                 MidiMsg::AllNotesOff => keys.iter().for_each(|k| k.store(0, Ordering::Relaxed)),
-                MidiMsg::Sustain(_) => {}
+                MidiMsg::Control(..) => {}
             }
             if self.transport.recording {
                 let pos = self.record_position(local, latency);
@@ -1374,14 +1393,14 @@ impl Mixer {
             if let Some(inst) = track.instrument.as_mut() {
                 apply_params(&mut track.automation, inst, clock.at(clock.start, back));
                 back += if inst.bypass { 0 } else { inst.processor.latency() };
-                collect_events(&mut track.events, &mut track.live, &mut track.active, &mut track.flush, &track.midi, pos, n, self.transport.playing);
+                track.feed.collect(&track.midi, pos, n, self.transport.playing);
                 let [sl, sr] = &mut self.scratch;
                 sl[..n].fill(0.0);
                 sr[..n].fill(0.0);
                 if !inst.bypass {
                     let inputs: [&[f32]; 2] = [&l[..n], &r[..n]];
                     let mut outputs: [&mut [f32]; 2] = [&mut sl[..n], &mut sr[..n]];
-                    inst.processor.process(&inputs, &mut outputs, n, &transport, &track.events);
+                    inst.processor.process(&inputs, &mut outputs, n, &transport, &track.feed.events);
                 }
                 for i in 0..n {
                     l[i] += sl[i];
@@ -1745,95 +1764,153 @@ impl TrackRt {
 }
 
 /// Live MIDI input for an instrument track at `offset` in the block. The sustain pedal holds
-/// keys let go while it's down until it comes up (instruments see no controllers yet), and a
-/// held key struck again restarts. Allocation-free.
+/// keys let go while it's down until it comes up (so it works with instruments that ignore
+/// CC64 too; the pedal itself is passed on), and a held key struck again restarts.
+/// Controllers go straight to the instrument. Allocation-free.
 fn live_midi(t: &mut TrackRt, msg: MidiMsg, offset: u32) {
-    let live = &mut t.live;
-    let mut push = |pitch: u8, velocity: u8| {
+    let live = &mut t.feed.live;
+    let mut push = |e: MidiEvent| {
         if live.len() < live.capacity() {
-            live.push(MidiEvent { offset, pitch, velocity });
+            live.push(e);
         }
     };
     match msg {
         MidiMsg::NoteOn { pitch, velocity } => {
             if std::mem::take(&mut t.sustained[pitch as usize]) {
-                push(pitch, 0);
+                push(MidiEvent::note(offset, pitch, 0));
             }
-            push(pitch, velocity);
+            push(MidiEvent::note(offset, pitch, velocity));
         }
         MidiMsg::NoteOff { pitch } if t.sustain => t.sustained[pitch as usize] = true,
-        MidiMsg::NoteOff { pitch } => push(pitch, 0),
-        MidiMsg::Sustain(down) => {
-            t.sustain = down;
-            if !down {
-                for (pitch, held) in t.sustained.iter_mut().enumerate() {
-                    if std::mem::take(held) {
-                        push(pitch as u8, 0);
+        MidiMsg::NoteOff { pitch } => push(MidiEvent::note(offset, pitch, 0)),
+        MidiMsg::Control(kind, value) => {
+            if kind == Controller::SUSTAIN {
+                t.sustain = value >= 64;
+                if !t.sustain {
+                    for (pitch, held) in t.sustained.iter_mut().enumerate() {
+                        if std::mem::take(held) {
+                            push(MidiEvent::note(offset, pitch as u8, 0));
+                        }
+                    }
+                }
+            }
+            push(MidiEvent::control(offset, kind, value));
+        }
+        MidiMsg::AllNotesOff => (t.feed.flush, t.sustain, t.sustained) = (true, false, [false; 128]),
+    }
+}
+
+/// What an instrument track sends its instrument.
+struct MidiFeed {
+    /// This block's events.
+    events: Vec<MidiEvent>,
+    /// Played live (piano-roll audition, MIDI input), waiting for the next block.
+    live: Vec<MidiEvent>,
+    /// Which pitches are sounding, so they can be released on stop/seek/edit.
+    active: [bool; 128],
+    /// Release what's sounding and reset the controllers (stop, seek, cycle wrap, edits).
+    flush: bool,
+    /// Send the regions' controller state at the playhead when playback next runs.
+    chase: bool,
+    /// Controllers were sent since the last reset.
+    touched: bool,
+}
+
+impl MidiFeed {
+    fn new() -> Self {
+        Self { events: Vec::with_capacity(EVENT_CAPACITY), live: Vec::with_capacity(LIVE_CAPACITY), active: [false; 128], flush: false, chase: true, touched: false }
+    }
+
+    fn push(&mut self, e: MidiEvent) {
+        if self.events.len() < self.events.capacity() {
+            self.touched |= matches!(e.data, MidiData::Control { .. });
+            self.events.push(e);
+        }
+    }
+
+    /// Gather this block's events: pending note-offs and controller resets, the controller
+    /// state at the playhead (chase), live input, then the regions' controllers and notes.
+    /// Allocation-free.
+    fn collect(&mut self, midi: &[MidiClipRt], pos: u64, n: usize, playing: bool) {
+        self.events.clear();
+        if std::mem::take(&mut self.flush) {
+            for pitch in 0..128 {
+                if std::mem::take(&mut self.active[pitch]) {
+                    self.push(MidiEvent::note(0, pitch as u8, 0));
+                }
+            }
+            // Bend back to the centre, pedal and modulation off.
+            if std::mem::take(&mut self.touched) {
+                self.push(MidiEvent::control(0, Controller::PitchBend, BEND_CENTRE));
+                self.push(MidiEvent::control(0, Controller::SUSTAIN, 0));
+                self.push(MidiEvent::control(0, Controller::MOD_WHEEL, 0));
+            }
+            self.chase = true;
+        }
+        if playing && std::mem::take(&mut self.chase) {
+            self.chase(midi, pos);
+        }
+        for i in 0..self.live.len() {
+            let e = self.live[i];
+            if let MidiData::Note { pitch, velocity } = e.data {
+                self.active[pitch as usize] = velocity > 0;
+            }
+            self.push(e);
+        }
+        self.live.clear();
+        if playing {
+            let end = pos + n as u64;
+            for clip in midi.iter().filter(|c| !c.mute && c.start < end && c.end > pos) {
+                // Controllers first, so a bend at a note's start applies to it.
+                let first = clip.ctrl.partition_point(|c| c.at < pos);
+                for c in clip.ctrl[first..].iter().take_while(|c| c.at < end) {
+                    self.push(MidiEvent::control((c.at - pos) as u32, c.kind, c.value));
+                }
+                for note in &clip.notes {
+                    if note.start >= end {
+                        break;
+                    }
+                    if note.start >= pos && note.end > note.start {
+                        self.push(MidiEvent::note((note.start - pos) as u32, note.pitch, note.velocity.max(1)));
+                        self.active[note.pitch as usize] = true;
+                    }
+                    if note.end > pos && note.end <= end && self.active[note.pitch as usize] {
+                        let offset = ((note.end - pos) as u32).min(n as u32 - 1);
+                        self.push(MidiEvent::note(offset, note.pitch, 0));
+                        self.active[note.pitch as usize] = false;
                     }
                 }
             }
         }
-        MidiMsg::AllNotesOff => (t.flush, t.sustain, t.sustained) = (true, false, [false; 128]),
+        // Stable insertion sort by offset (short, nearly sorted lists; no allocation).
+        let events = &mut self.events;
+        for i in 1..events.len() {
+            let mut j = i;
+            while j > 0 && events[j - 1].offset > events[j].offset {
+                events.swap(j - 1, j);
+                j -= 1;
+            }
+        }
     }
-}
 
-/// Gather this block's note events for an instrument track: pending note-offs (after
-/// stop/seek/edits), live audition notes, then notes from the MIDI regions. Allocation-free.
-#[allow(clippy::too_many_arguments)]
-fn collect_events(
-    events: &mut Vec<MidiEvent>,
-    live: &mut Vec<MidiEvent>,
-    active: &mut [bool; 128],
-    flush: &mut bool,
-    midi: &[MidiClipRt],
-    pos: u64,
-    n: usize,
-    playing: bool,
-) {
-    events.clear();
-    let push = |events: &mut Vec<MidiEvent>, e: MidiEvent| {
-        if events.len() < events.capacity() {
-            events.push(e);
-        }
-    };
-    if *flush {
-        for (pitch, on) in active.iter_mut().enumerate() {
-            if *on {
-                push(events, MidiEvent { offset: 0, pitch: pitch as u8, velocity: 0 });
-                *on = false;
+    /// Starting mid-song: every controller the regions use gets its last value before `pos`
+    /// (or its neutral value if it hasn't moved yet), so a bend or a volume swell is right
+    /// wherever playback starts.
+    fn chase(&mut self, midi: &[MidiClipRt], pos: u64) {
+        let mut last: [Option<(u64, u16)>; CONTROLLER_SLOTS] = [None; CONTROLLER_SLOTS];
+        let mut used = [false; CONTROLLER_SLOTS];
+        for c in midi.iter().filter(|c| !c.mute).flat_map(|c| &c.ctrl) {
+            let slot = c.kind.slot();
+            used[slot] = true;
+            if c.at < pos && last[slot].is_none_or(|(at, _)| c.at >= at) {
+                last[slot] = Some((c.at, c.value));
             }
         }
-        *flush = false;
-    }
-    for e in live.drain(..) {
-        active[e.pitch as usize] = e.velocity > 0;
-        push(events, e);
-    }
-    if playing {
-        let end = pos + n as u64;
-        for clip in midi.iter().filter(|c| !c.mute && c.start < end && c.end > pos) {
-            for note in &clip.notes {
-                if note.start >= end {
-                    break;
-                }
-                if note.start >= pos && note.end > note.start {
-                    push(events, MidiEvent { offset: (note.start - pos) as u32, pitch: note.pitch, velocity: note.velocity.max(1) });
-                    active[note.pitch as usize] = true;
-                }
-                if note.end > pos && note.end <= end && active[note.pitch as usize] {
-                    let offset = ((note.end - pos) as u32).min(n as u32 - 1);
-                    push(events, MidiEvent { offset, pitch: note.pitch, velocity: 0 });
-                    active[note.pitch as usize] = false;
-                }
+        for slot in (0..CONTROLLER_SLOTS).filter(|&s| used[s]) {
+            let kind = Controller::from_slot(slot);
+            if let Some(value) = last[slot].map(|l| l.1).or_else(|| kind.neutral().map(|v| kind.raw(v))) {
+                self.push(MidiEvent::control(0, kind, value));
             }
-        }
-    }
-    // Stable insertion sort by offset (tiny lists, no allocation).
-    for i in 1..events.len() {
-        let mut j = i;
-        while j > 0 && events[j - 1].offset > events[j].offset {
-            events.swap(j - 1, j);
-            j -= 1;
         }
     }
 }
@@ -2449,6 +2526,7 @@ mod tests {
             end: 2000,
             mute: false,
             notes: vec![NoteRt { start: 100, end: 700, pitch: 60, velocity: 100 }, NoteRt { start: 600, end: 5000, pitch: 64, velocity: 90 }],
+            ctrl: Vec::new(),
         });
         tx.push(Command::AddTrack(Box::new(t))).ok();
         tx.push(Command::Play).ok();
@@ -2458,15 +2536,100 @@ mod tests {
         m.process(&[], 0, &mut out, 2);
         assert!(out.iter().all(|&s| (s - 0.25).abs() < 1e-6), "instrument output is mixed in");
         let ev = log.lock().unwrap().clone();
-        assert!(ev.contains(&(100, MidiEvent { offset: 100, pitch: 60, velocity: 100 })), "{ev:?}");
-        assert!(ev.iter().any(|&(at, e)| at == 700 && e.pitch == 60 && e.velocity == 0), "note-off at 700: {ev:?}");
-        assert!(ev.iter().any(|&(at, e)| at == 600 && e.pitch == 64 && e.velocity == 90));
+        assert!(ev.contains(&(100, MidiEvent::note(100, 60, 100))), "{ev:?}");
+        assert!(ev.iter().any(|&(at, e)| at == 700 && e.data == MidiData::Note { pitch: 60, velocity: 0 }), "note-off at 700: {ev:?}");
+        assert!(ev.iter().any(|&(at, e)| at == 600 && e.data == MidiData::Note { pitch: 64, velocity: 90 }));
         // Second note is clamped to its region end (2000 → block containing 2000 is not reached yet).
         // Stopping releases the still-sounding note.
         tx.push(Command::Stop).ok();
         m.process(&[], 0, &mut out, 2);
         let ev = log.lock().unwrap().clone();
-        assert!(ev.iter().any(|&(_, e)| e.pitch == 64 && e.velocity == 0), "stop sends note-off: {ev:?}");
+        assert!(ev.iter().any(|&(_, e)| e.data == MidiData::Note { pitch: 64, velocity: 0 }), "stop sends note-off: {ev:?}");
+    }
+
+    type EventLog = std::sync::Arc<std::sync::Mutex<Vec<(u64, MidiEvent)>>>;
+
+    /// A track whose instrument logs the controller events it receives (timeline sample,
+    /// kind, raw value), with one region 0..20000 bending at 1000 and 3000 and a CC7 at 5000.
+    fn controller_rig() -> (Mixer, Producer<Command>, EventLog) {
+        let (m, mut tx, _g, _s) = mixer();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut t = TrackRt::new(1, params());
+        t.instrument = Some(Box::new(PluginRt { instance: 9, processor: Box::new(Probe(log.clone(), 0)), bypass: false, key: None }));
+        let c = |at, kind, value| CtrlRt { at, kind, value };
+        t.midi.push(MidiClipRt {
+            start: 0,
+            end: 20_000,
+            mute: false,
+            notes: vec![NoteRt { start: 1000, end: 2000, pitch: 60, velocity: 100 }],
+            ctrl: vec![c(1000, Controller::PitchBend, 12_000), c(3000, Controller::PitchBend, 4000), c(5000, Controller::VOLUME, 50)],
+        });
+        tx.push(Command::AddTrack(Box::new(t))).ok();
+        (m, tx, log)
+    }
+
+    fn controls(log: &EventLog) -> Vec<(u64, Controller, u16)> {
+        let mut log = log.lock().unwrap();
+        let out = log.iter().filter_map(|&(at, e)| match e.data {
+            MidiData::Control { kind, value } => Some((at, kind, value)),
+            _ => None,
+        });
+        let out = out.collect();
+        log.clear();
+        out
+    }
+
+    #[test]
+    fn controllers_reach_the_instrument_sample_accurately_ahead_of_notes() {
+        let (mut m, mut tx, log) = controller_rig();
+        tx.push(Command::Play).ok();
+        let mut out = vec![0.0; 2 * 512];
+        for _ in 0..12 {
+            m.process(&[], 0, &mut out, 2);
+        }
+        let all = log.lock().unwrap().clone();
+        let bend = all.iter().position(|e| e.0 == 1000 && matches!(e.1.data, MidiData::Control { .. })).expect("bend at 1000");
+        let note = all.iter().position(|e| e.0 == 1000 && matches!(e.1.data, MidiData::Note { .. })).expect("note at 1000");
+        assert!(bend < note, "the bend comes before the note it shapes");
+        let got = controls(&log);
+        // From the start the regions' controllers are chased: the bend is neutral there and
+        // CC7 has no neutral value.
+        assert_eq!(got[0], (0, Controller::PitchBend, BEND_CENTRE));
+        assert_eq!(&got[1..], &[(1000, Controller::PitchBend, 12_000), (3000, Controller::PitchBend, 4000), (5000, Controller::VOLUME, 50)]);
+    }
+
+    #[test]
+    fn seek_and_cycle_chase_the_controller_state() {
+        let (mut m, mut tx, log) = controller_rig();
+        let mut out = vec![0.0; 2 * 256];
+        // Starting mid-region sends the last values before the playhead.
+        tx.push(Command::Seek(6000)).ok();
+        tx.push(Command::Play).ok();
+        m.process(&[], 0, &mut out, 2);
+        let got = controls(&log);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.contains(&(6000, Controller::PitchBend, 4000)) && got.contains(&(6000, Controller::VOLUME, 50)), "{got:?}");
+        // Seeking while playing resets, then chases at the new position.
+        tx.push(Command::Seek(2000)).ok();
+        m.process(&[], 0, &mut out, 2);
+        let got = controls(&log);
+        let start = got.iter().position(|c| c.1 == Controller::PitchBend && c.2 == BEND_CENTRE).expect("reset first");
+        assert!(got[start..].contains(&(2000, Controller::PitchBend, 12_000)), "{got:?}");
+        // The cycle wrap chases at the loop start (the bend before 1000 is neutral).
+        tx.push(Command::SetLoop { enabled: true, start: 500, end: 3500 }).ok();
+        tx.push(Command::Seek(3200)).ok();
+        m.process(&[], 0, &mut out, 2);
+        controls(&log);
+        m.process(&[], 0, &mut out, 2);
+        let got = controls(&log);
+        assert!(got.contains(&(500, Controller::PitchBend, BEND_CENTRE)), "{got:?}");
+        // Stopping centres the bend and lifts the pedal.
+        tx.push(Command::Stop).ok();
+        m.process(&[], 0, &mut out, 2);
+        let got = controls(&log);
+        assert!(got.iter().any(|c| c.1 == Controller::PitchBend && c.2 == BEND_CENTRE) && got.iter().any(|c| c.1 == Controller::SUSTAIN && c.2 == 0), "{got:?}");
+        m.process(&[], 0, &mut out, 2);
+        assert!(controls(&log).is_empty(), "nothing more while stopped");
     }
 
     struct Tag(u64);

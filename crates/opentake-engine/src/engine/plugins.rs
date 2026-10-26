@@ -7,11 +7,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use opentake_project::{PluginFormat, PluginSlot};
+use opentake_project::{Controller, PluginFormat, PluginSlot};
 use opentake_vst3::{ClassInfo, Module, NoteEvent, ScannedPlugin, Vst3Plugin, Vst3Processor};
 
 use super::{Engine, ParamView, display_name};
-use crate::mixer::{Command, KeyRt, MASTER, MAX_BLOCK, MidiEvent, PLUGIN_CAPACITY, PluginRt, Processor, Transport};
+use crate::mixer::{Command, KeyRt, MASTER, MAX_BLOCK, MidiData, MidiEvent, PLUGIN_CAPACITY, PluginRt, Processor, Transport};
 use crate::drums::{self, DrumSynth};
 use crate::delay::{self, Delay};
 use crate::dynamics::{self, Compressor, GainMeter, Limiter, comp, limiter};
@@ -149,9 +149,17 @@ impl Processor for Vst3Insert {
             time_sig: t.time_sig,
             position_samples: t.position_samples,
         };
+        // Controllers become changes of the parameters the plug-in maps them to.
         self.notes.clear();
-        for e in events.iter().take(self.notes.capacity()) {
-            self.notes.push(NoteEvent { offset: e.offset, pitch: e.pitch, velocity: e.velocity as f32 / 127.0 });
+        for e in events {
+            match e.data {
+                MidiData::Note { pitch, velocity } if self.notes.len() < self.notes.capacity() => self.notes.push(NoteEvent { offset: e.offset, pitch, velocity: velocity as f32 / 127.0 }),
+                MidiData::Note { .. } => {}
+                MidiData::Control { kind, value } => {
+                    let (number, normalized) = vst3_control(kind, value);
+                    self.processor.queue_midi_control(e.offset.min(frames.saturating_sub(1) as u32), number, normalized);
+                }
+            }
         }
         self.processor.process_keyed(inputs, key, outputs, frames, &t, &self.notes);
     }
@@ -162,6 +170,16 @@ impl Processor for Vst3Insert {
 
     fn latency(&self) -> usize {
         self.latency
+    }
+}
+
+/// VST3's number for a controller (CCs 0..=127, then channel pressure and pitch bend) and
+/// its raw value as 0..1.
+fn vst3_control(kind: Controller, value: u16) -> (u8, f64) {
+    match kind {
+        Controller::PitchBend => (opentake_vst3::host::CTRL_PITCH_BEND, value.min(16383) as f64 / 16383.0),
+        Controller::ChannelPressure => (opentake_vst3::host::CTRL_AFTERTOUCH, value.min(127) as f64 / 127.0),
+        Controller::Cc(n) => (n & 0x7F, value.min(127) as f64 / 127.0),
     }
 }
 
@@ -869,6 +887,16 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controllers_map_to_vst3_controller_numbers() {
+        use opentake_vst3::host::{CTRL_AFTERTOUCH, CTRL_PITCH_BEND};
+        assert_eq!(vst3_control(Controller::PitchBend, 0), (CTRL_PITCH_BEND, 0.0));
+        let (n, centre) = vst3_control(Controller::PitchBend, opentake_project::BEND_CENTRE);
+        assert!(n == CTRL_PITCH_BEND && (centre - 0.5).abs() < 1e-4);
+        assert_eq!(vst3_control(Controller::MOD_WHEEL, 127), (1, 1.0));
+        assert_eq!(vst3_control(Controller::ChannelPressure, 0), (CTRL_AFTERTOUCH, 0.0));
+    }
 
     #[test]
     fn builtin_synth_as_instrument_with_params_and_undo() {

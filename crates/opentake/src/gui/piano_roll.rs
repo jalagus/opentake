@@ -1,6 +1,7 @@
-//! Piano roll editor for the selected MIDI region.
+//! Piano roll editor for the selected MIDI region, with a controller lane under the notes
+//! (Logic's MIDI Draw): pitch bend, mod wheel and any other CC or channel pressure.
 
-use opentake_engine::project::{MidiClip, Note, Project};
+use opentake_engine::project::{Controller, ControllerEvent, ControllerLane, MidiClip, Note, Project};
 use eframe::egui;
 use egui::{Align, Align2, Color32, CursorIcon, FontId, Layout, Pos2, Rangef, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
 
@@ -12,6 +13,20 @@ const KEYS_W: f32 = 58.0;
 const TOOLBAR_H: f32 = 30.0;
 const RULER_H: f32 = 18.0;
 const EDGE_GRAB: f32 = 6.0;
+/// Height of the controller lane under the notes.
+const CTRL_H: f32 = 96.0;
+/// Pick radius of a controller event's handle.
+const CTRL_GRAB: f32 = 6.0;
+/// Lanes in the picker, in Logic's order.
+const CTRL_KINDS: [Controller; 7] = [
+    Controller::PitchBend,
+    Controller::MOD_WHEEL,
+    Controller::VOLUME,
+    Controller::EXPRESSION,
+    Controller::SUSTAIN,
+    Controller::PAN,
+    Controller::ChannelPressure,
+];
 const NOTE_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
 fn is_black(pitch: u8) -> bool {
@@ -41,6 +56,16 @@ struct NoteDrag {
     dpitch: i32,
 }
 
+/// A gesture in the controller lane; `events` is the lane as it will be when it ends (one
+/// undo step).
+struct CtrlDrag {
+    events: Vec<ControllerEvent>,
+    /// Moving the event at this index, else drawing with the pencil.
+    moving: Option<usize>,
+    /// Pencil stroke so far: (seconds, value), in drawing order.
+    stroke: Vec<(f64, f32)>,
+}
+
 /// Piano roll view state (lives in the app; the region itself lives in the engine).
 pub struct PianoRoll {
     pub region: Option<(usize, usize)>,
@@ -56,9 +81,17 @@ pub struct PianoRoll {
     /// Velocity used for new notes and shown for the selection.
     velocity: u8,
     centered_for: Option<(usize, usize)>,
+    /// The controller lane under the notes (MIDI Draw): shown, which controller, and its
+    /// selected event.
+    pub show_ctrl: bool,
+    pub ctrl_kind: Controller,
+    pub ctrl_sel: Option<usize>,
+    ctrl_drag: Option<CtrlDrag>,
     /// Last frame's geometry, so tests can locate notes on screen.
     #[cfg(test)]
     pub geo: Option<(Rect, f32, f32, f32, f64)>,
+    #[cfg(test)]
+    pub ctrl_rect: Option<Rect>,
 }
 
 impl Default for PianoRoll {
@@ -73,8 +106,14 @@ impl Default for PianoRoll {
             audition: None,
             velocity: 100,
             centered_for: None,
+            show_ctrl: false,
+            ctrl_kind: Controller::PitchBend,
+            ctrl_sel: None,
+            ctrl_drag: None,
             #[cfg(test)]
             geo: None,
+            #[cfg(test)]
+            ctrl_rect: None,
         }
     }
 }
@@ -85,6 +124,8 @@ impl PianoRoll {
             self.region = Some((track, clip));
             self.selected.clear();
             self.drag = None;
+            self.ctrl_sel = None;
+            self.ctrl_drag = None;
         }
     }
 }
@@ -161,8 +202,13 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
     let toolbar = Rect::from_min_size(full.min, vec2(full.width(), TOOLBAR_H));
     let ruler = Rect::from_min_max(pos2(grid_left, toolbar.bottom()), pos2(full.right(), toolbar.bottom() + RULER_H));
     let body = Rect::from_min_max(pos2(full.left(), ruler.bottom()), full.max);
-    let keys = Rect::from_min_max(pos2(grid_left - KEYS_W, body.top()), pos2(grid_left, body.bottom()));
-    let grid = Rect::from_min_max(pos2(grid_left, body.top()), body.max);
+    // The controller lane takes the bottom (leaving the notes at least as much room).
+    let lane_h = if app.piano.show_ctrl { CTRL_H.min(body.height() / 2.0) } else { 0.0 };
+    let notes_bottom = body.bottom() - lane_h;
+    let keys = Rect::from_min_max(pos2(grid_left - KEYS_W, body.top()), pos2(grid_left, notes_bottom));
+    let grid = Rect::from_min_max(pos2(grid_left, body.top()), pos2(body.right(), notes_bottom));
+    let ctrl = Rect::from_min_max(pos2(grid_left, notes_bottom), body.max);
+    let ctrl_keys = Rect::from_min_max(pos2(grid_left - KEYS_W, notes_bottom), pos2(grid_left, body.bottom()));
     let gutter = Rect::from_min_max(pos2(full.left(), toolbar.bottom()), pos2(keys.left(), full.bottom()));
 
     // Center the view on the notes the first time a region is shown.
@@ -178,6 +224,13 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
         let (t0, t1) = (app.view.start, app.view.start + (grid.width() / app.view.px_per_sec) as f64);
         if clip.position_secs < t0 || clip.position_secs > t1 {
             app.view.start = (clip.position_secs - (20.0 / app.view.px_per_sec) as f64).max(0.0);
+        }
+        // A region with controllers opens with the lane shown, on one it has.
+        if let Some(l) = clip.controllers.first() {
+            app.piano.show_ctrl = true;
+            if clip.lane(app.piano.ctrl_kind).is_none() {
+                app.piano.ctrl_kind = l.kind;
+            }
         }
     }
 
@@ -206,11 +259,16 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
     let held: &[u8] = if snap.status.midi_input_tracks.contains(&track) { &snap.status.midi_keys_down } else { &[] };
     keyboard(app, ui, &geo, keys, track, held);
 
+    if ctrl.height() > 0.0 {
+        let lane_geo = Geo { grid: ctrl, ..geo };
+        controller_lane(app, ui, &lane_geo, ctrl_keys, track, ci, clip, project, color);
+    }
+
     // Playhead (relative to the region).
     let rel = snap.status.position_secs - clip.position_secs;
     let x = geo.x_of(rel);
     if rel >= 0.0 && x >= grid.left() && x <= grid.right() {
-        ui.painter().vline(x, grid.y_range(), Stroke::new(1.0, theme::PLAYHEAD));
+        ui.painter().vline(x, Rangef::new(grid.top(), ctrl.bottom().max(grid.bottom())), Stroke::new(1.0, theme::PLAYHEAD));
     }
     ui.allocate_rect(full, Sense::hover());
 }
@@ -258,9 +316,20 @@ fn toolbar_ui(app: &mut DawApp, ui: &mut egui::Ui, rect: Rect, track: usize, ci:
                 app.act(Action::SetNotes { track, clip: ci, notes });
             }
         }
+        ui.separator();
+        let r = ui.selectable_label(app.piano.show_ctrl, "MIDI Draw").on_hover_text("Show the controller lane: pitch bend, mod wheel, CCs");
+        if r.clicked() {
+            app.piano.show_ctrl = !app.piano.show_ctrl;
+        }
+        if app.piano.show_ctrl {
+            controller_picker(app, ui, track, ci, clip);
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             timeline::zoom_controls(app, ui, "piano_zoom", playhead);
-            ui.label(RichText::new("Double-click: add note · Drag: move · Edge: resize · ⌫: delete").size(10.0).color(theme::TEXT_FAINT));
+            // The hint only where it fits next to the controls.
+            if ui.available_width() > 360.0 {
+                ui.label(RichText::new("Double-click: add note · Drag: move · Edge: resize · ⌫: delete").size(10.0).color(theme::TEXT_FAINT));
+            }
         });
     });
 }
@@ -502,6 +571,200 @@ fn notes_interaction(
     }
 }
 
+/// Which controller the lane under the notes shows: the common ones, any lane the region
+/// has, and any CC by number.
+fn controller_picker(app: &mut DawApp, ui: &mut egui::Ui, track: usize, ci: usize, clip: &MidiClip) {
+    let label = |k: Controller| if clip.lane(k).is_some() { format!("{} •", k.name()) } else { k.name() };
+    let mut kind = app.piano.ctrl_kind;
+    let others = clip.controllers.iter().map(|l| l.kind).filter(|k| !CTRL_KINDS.contains(k));
+    let r = egui::ComboBox::from_id_salt(("piano_ctrl", track, ci)).selected_text(label(kind)).width(150.0).show_ui(ui, |ui| {
+        for k in CTRL_KINDS.into_iter().chain(others) {
+            ui.selectable_value(&mut kind, k, label(k));
+        }
+        if !matches!(kind, Controller::Cc(_)) || CTRL_KINDS.contains(&kind) {
+            ui.selectable_value(&mut kind, Controller::Cc(74), "Other CC…");
+        }
+    });
+    widgets::label(&r.response, egui::Role::ComboBox, "Controller Lane");
+    if let Controller::Cc(mut n) = kind {
+        let r = ui.add(egui::DragValue::new(&mut n).range(0..=119).prefix("CC "));
+        widgets::label(&r, egui::Role::SpinButton, "Controller Number");
+        kind = Controller::Cc(n);
+    }
+    if kind != app.piano.ctrl_kind {
+        app.piano.ctrl_kind = kind;
+        app.piano.ctrl_sel = None;
+        app.piano.ctrl_drag = None;
+    }
+}
+
+/// Lane value (pitch bend -1..1, else 0..1) at height `y`, and back.
+fn lane_value(kind: Controller, rect: Rect, y: f32) -> f32 {
+    let inner = rect.shrink2(vec2(0.0, 6.0));
+    let v = ((inner.bottom() - y) / inner.height()).clamp(0.0, 1.0);
+    if kind.is_bipolar() { v * 2.0 - 1.0 } else { v }
+}
+
+fn lane_y(kind: Controller, rect: Rect, v: f32) -> f32 {
+    let inner = rect.shrink2(vec2(0.0, 6.0));
+    let v = if kind.is_bipolar() { (v + 1.0) / 2.0 } else { v };
+    inner.bottom() - v * inner.height()
+}
+
+/// The lane with a pencil stroke drawn over it: events the stroke passed over are replaced
+/// by the stroke's.
+fn with_stroke(events: &[ControllerEvent], stroke: &[(f64, f32)]) -> Vec<ControllerEvent> {
+    let (lo, hi) = stroke.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+    let mut out: Vec<ControllerEvent> = events.iter().filter(|e| e.time_secs < lo - 1e-9 || e.time_secs > hi + 1e-9).copied().collect();
+    out.extend(stroke.iter().map(|&(t, v)| ControllerEvent { time_secs: t, value: v }));
+    out
+}
+
+/// The controller lane: events drawn as steps with stems; click adds an event, drag on an
+/// event moves it, drag elsewhere draws (pencil), right-click or ⌫ deletes. Each gesture
+/// is one undo step.
+#[allow(clippy::too_many_arguments)]
+fn controller_lane(app: &mut DawApp, ui: &egui::Ui, geo: &Geo, keys: Rect, track: usize, ci: usize, clip: &MidiClip, project: &Project, color: Color32) {
+    let rect = geo.grid;
+    let kind = app.piano.ctrl_kind;
+    #[cfg(test)]
+    {
+        app.piano.ctrl_rect = Some(rect);
+    }
+    let stored: Vec<ControllerEvent> = clip.lane(kind).map(|l| l.events.clone()).unwrap_or_default();
+    let resp = ui.interact(rect, ui.make_persistent_id(("piano_ctrl_lane", track, ci)), Sense::click_and_drag());
+    widgets::label(&resp, egui::Role::Group, "Controller Lane");
+    let max_t = clip.length_secs;
+    let point = |p: Pos2| (geo.t_of(p.x).clamp(0.0, max_t), lane_value(kind, rect, p.y));
+    let shown = |app: &DawApp| app.piano.ctrl_drag.as_ref().map_or(stored.clone(), |d| d.events.clone());
+    let hit = |events: &[ControllerEvent], p: Pos2| {
+        events.iter().enumerate().rev().find(|(_, e)| (geo.x_of(e.time_secs) - p.x).abs() <= CTRL_GRAB && (lane_y(kind, rect, e.value) - p.y).abs() <= CTRL_GRAB * 1.5).map(|(i, _)| i)
+    };
+    let commit = |app: &mut DawApp, events: Vec<ControllerEvent>| {
+        let events = ControllerLane::new(kind, events).events;
+        app.act(Action::SetControllers { track, clip: ci, kind, events });
+    };
+
+    let pointer = resp.interact_pointer_pos();
+    if resp.secondary_clicked() {
+        if let Some(i) = pointer.and_then(|p| hit(&stored, p)) {
+            let mut events = stored.clone();
+            events.remove(i);
+            app.piano.ctrl_sel = None;
+            commit(app, events);
+        }
+    } else if resp.clicked()
+        && let Some(p) = pointer
+    {
+        match hit(&stored, p) {
+            Some(i) => app.piano.ctrl_sel = Some(i),
+            None => {
+                let (t, v) = point(p);
+                let t = snap_to(app.snap_mode, ui, clip.position_secs + t, project, geo.px_per_sec) - clip.position_secs;
+                let mut events = stored.clone();
+                events.push(ControllerEvent { time_secs: t.clamp(0.0, max_t), value: v });
+                app.piano.ctrl_sel = None;
+                commit(app, events);
+            }
+        }
+    }
+    if resp.drag_started()
+        && let Some(p) = ui.input(|i| i.pointer.press_origin()).or(pointer)
+    {
+        let moving = hit(&stored, p);
+        app.piano.ctrl_sel = moving;
+        let stroke = if moving.is_none() { vec![point(p)] } else { Vec::new() };
+        let events = if moving.is_none() { with_stroke(&stored, &stroke) } else { stored.clone() };
+        app.piano.ctrl_drag = Some(CtrlDrag { events, moving, stroke });
+    }
+    if resp.dragged()
+        && let (Some(p), Some(d)) = (pointer, app.piano.ctrl_drag.as_mut())
+    {
+        let (t, v) = point(p);
+        match d.moving {
+            Some(i) => {
+                if let Some(e) = d.events.get_mut(i) {
+                    *e = ControllerEvent { time_secs: t, value: v };
+                }
+            }
+            None => {
+                // An event every few pixels (and at least 10 ms apart) along the stroke;
+                // going back over it redraws that stretch.
+                let step = (4.0 / geo.px_per_sec as f64).max(0.01);
+                let last = d.stroke.last().map_or(t, |l| l.0);
+                if (t - last).abs() >= step {
+                    let (lo, hi) = (last.min(t), last.max(t));
+                    d.stroke.retain(|s| s.0 <= lo + 1e-9 || s.0 >= hi - 1e-9);
+                    d.stroke.push((t, v));
+                    d.events = with_stroke(&stored, &d.stroke);
+                }
+            }
+        }
+    }
+    if resp.drag_stopped()
+        && let Some(d) = app.piano.ctrl_drag.take()
+        && d.events != stored
+    {
+        app.piano.ctrl_sel = None;
+        commit(app, d.events);
+    }
+
+    // Draw: background, the centre line for pitch bend (else quarter lines), then steps.
+    let p = ui.painter().with_clip_rect(rect);
+    p.rect_filled(rect, 0.0, theme::BG_DEEP);
+    p.hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, theme::BORDER));
+    let guides: &[f32] = if kind.is_bipolar() { &[-0.5, 0.0, 0.5] } else { &[0.25, 0.5, 0.75] };
+    for &g in guides {
+        let stroke = if g == 0.0 { Stroke::new(1.0, theme::TEXT_FAINT) } else { Stroke::new(1.0, theme::GRID_SUB) };
+        p.hline(rect.x_range(), lane_y(kind, rect, g), stroke);
+    }
+    let end_x = geo.x_of(max_t);
+    if end_x < rect.right() {
+        p.rect_filled(Rect::from_min_max(pos2(end_x, rect.top()), rect.max), 0.0, Color32::from_black_alpha(90));
+    }
+    let events = shown(app);
+    let base = lane_y(kind, rect, 0.0);
+    let line = theme::shade(color, 1.1);
+    for (i, e) in events.iter().enumerate() {
+        let x = geo.x_of(e.time_secs);
+        let next = events.get(i + 1).map_or(end_x, |n| geo.x_of(n.time_secs)).min(end_x);
+        let y = lane_y(kind, rect, e.value);
+        if next > x {
+            p.rect_filled(Rect::from_min_max(pos2(x, y.min(base)), pos2(next, y.max(base))), 0.0, theme::with_alpha(color, 46));
+            p.hline(x..=next, y, Stroke::new(1.5, line));
+        }
+        p.vline(x, Rangef::new(y.min(base), y.max(base)), Stroke::new(1.0, theme::with_alpha(line, 160)));
+        let selected = app.piano.ctrl_sel == Some(i) || app.piano.ctrl_drag.as_ref().is_some_and(|d| d.moving == Some(i));
+        // Handles where events are far enough apart to grab one (a drawn curve is a line).
+        let prev = i.checked_sub(1).map_or(f32::MIN, |j| geo.x_of(events[j].time_secs));
+        if selected || (x - prev > 3.0 * CTRL_GRAB && geo.x_of(events.get(i + 1).map_or(f64::MAX, |n| n.time_secs)) - x > 3.0 * CTRL_GRAB) {
+            p.circle_filled(pos2(x, y), if selected { 3.5 } else { 2.5 }, if selected { Color32::WHITE } else { line });
+        }
+    }
+
+    // Name and scale left of the lane, under the keyboard.
+    let k = ui.painter().with_clip_rect(keys);
+    k.rect_filled(keys, 0.0, theme::BG_HEADER);
+    k.hline(keys.x_range(), keys.top() + 0.5, Stroke::new(1.0, theme::BORDER));
+    let short = match kind {
+        Controller::PitchBend => "Bend".to_string(),
+        Controller::ChannelPressure => "Pressure".to_string(),
+        Controller::MOD_WHEEL => "Mod".to_string(),
+        Controller::Cc(n) => format!("CC{n}"),
+    };
+    k.text(keys.left_top() + vec2(5.0, 4.0), Align2::LEFT_TOP, short, FontId::proportional(10.0), theme::TEXT_DIM);
+    let scale = if kind.is_bipolar() { [("+", 1.0), ("0", 0.0), ("−", -1.0)] } else { [("127", 1.0), ("64", 0.5), ("0", 0.0)] };
+    for (text, v) in scale {
+        k.text(pos2(keys.right() - 4.0, lane_y(kind, rect, v)), Align2::RIGHT_CENTER, text, FontId::proportional(9.0), theme::TEXT_FAINT);
+    }
+    k.vline(keys.right() - 0.5, keys.y_range(), Stroke::new(1.0, theme::BORDER));
+    if let Some(p) = resp.hover_pos() {
+        let (_, v) = point(p);
+        let raw = kind.raw(v) as i32 - if kind.is_bipolar() { 8192 } else { 0 };
+        ui.painter().text(p + vec2(10.0, -12.0), Align2::LEFT_BOTTOM, raw.to_string(), FontId::proportional(10.0), theme::TEXT_DIM);
+    }
+}
+
 /// Play `pitch` (releasing any previous audition note), or just release with `None`.
 fn audition(app: &mut DawApp, track: usize, pitch: Option<u8>) {
     if let Some((t, p)) = app.piano.audition.take() {
@@ -578,6 +841,17 @@ pub(crate) mod tests {
         assert_eq!((out[1].start_secs, out[1].pitch), (1.25, 64));
         let r = NoteDrag { mode: DragMode::Resize, ..d };
         assert_eq!(dragged_notes(&[a], &[a], &r, 4.0)[0].length_secs, 0.75);
+    }
+
+    #[test]
+    fn a_stroke_replaces_the_events_it_passes_over() {
+        let ev = |t: f64, v: f32| ControllerEvent { time_secs: t, value: v };
+        let lane = [ev(0.0, 0.1), ev(1.0, 0.2), ev(2.0, 0.3)];
+        let out = with_stroke(&lane, &[(0.5, 0.9), (1.5, 0.8)]);
+        assert_eq!(out, vec![ev(0.0, 0.1), ev(2.0, 0.3), ev(0.5, 0.9), ev(1.5, 0.8)]);
+        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 112.0));
+        assert_eq!(lane_value(Controller::PitchBend, r, lane_y(Controller::PitchBend, r, 0.0)), 0.0, "centre");
+        assert_eq!(lane_value(Controller::MOD_WHEEL, r, 0.0), 1.0);
     }
 
     /// Screen centre of a note, from the geometry the piano roll last drew with.

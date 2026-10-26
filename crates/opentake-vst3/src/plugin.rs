@@ -15,7 +15,7 @@ use vst3::Steinberg::*;
 use vst3::{ComPtr, ComWrapper};
 
 use crate::editor::{Edit, EditQueue, Vst3Editor};
-use crate::host::{ComponentHandler, EventList, HostApp, MemoryStream, ParamChanges, from_wstring};
+use crate::host::{ComponentHandler, EventList, HostApp, MIDI_CONTROLLERS, MemoryStream, ParamChanges, from_wstring};
 use crate::module::{ClassInfo, Module};
 use crate::{Error, Result};
 
@@ -256,6 +256,8 @@ pub struct Vst3Processor {
     params_in: ComWrapper<ParamChanges>,
     params_out: ComWrapper<ParamChanges>,
     events_in: Option<ComWrapper<EventList>>,
+    /// The parameter each MIDI controller drives (`IMidiMapping`), looked up once.
+    midi_map: [Option<ParamID>; MIDI_CONTROLLERS],
     generation: u64,
     sample_rate: f64,
     max_block: usize,
@@ -346,6 +348,7 @@ impl Vst3Processor {
                 params_in: ComWrapper::new(ParamChanges::new()),
                 params_out: ComWrapper::new(ParamChanges::new()),
                 events_in: has_events.then(|| ComWrapper::new(EventList::new())),
+                midi_map: midi_mapping(inst.controller.as_ref()),
                 generation,
                 sample_rate,
                 max_block,
@@ -361,6 +364,13 @@ impl Vst3Processor {
     /// Queue a parameter change to be applied at the start of the next block.
     pub fn queue_param(&mut self, id: u32, normalized: f64) -> bool {
         self.params_in.push(id, normalized)
+    }
+
+    /// Queue a MIDI controller (VST3 numbering: CCs 0..=127, 128 channel pressure, 129
+    /// pitch bend; value 0..1) at `offset` in the next block, as a change of the parameter
+    /// the plug-in maps it to. False (dropped) when the plug-in maps no parameter to it.
+    pub fn queue_midi_control(&mut self, offset: u32, controller: u8, normalized: f64) -> bool {
+        crate::host::queue_midi_control(&self.params_in, &self.midi_map, offset as i32, controller, normalized)
     }
 
     /// Process `frames` samples. `inputs` feed the main input bus (repeated if the plugin
@@ -481,6 +491,20 @@ impl Vst3Processor {
             }
         }
     }
+}
+
+/// Which parameter the plug-in drives with each MIDI controller (bus 0, channel 1).
+fn midi_mapping(controller: Option<&ComPtr<IEditController>>) -> [Option<ParamID>; MIDI_CONTROLLERS] {
+    let mut map = [None; MIDI_CONTROLLERS];
+    if let Some(mapping) = controller.and_then(|c| c.cast::<IMidiMapping>()) {
+        for (n, slot) in map.iter_mut().enumerate() {
+            let mut id: ParamID = 0;
+            if unsafe { mapping.getMidiControllerAssignment(0, 0, n as CtrlNumber, &mut id) } == kResultOk {
+                *slot = Some(id);
+            }
+        }
+    }
+    map
 }
 
 impl Drop for Vst3Processor {

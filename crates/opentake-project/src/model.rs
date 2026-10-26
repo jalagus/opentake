@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::automation::{AutomationLane, AutomationTarget};
 use crate::comp::CompSegment;
+use crate::controller::{Controller, ControllerLane};
 use crate::fade::Fade;
 use crate::tempo::{TempoChange, TempoMap};
 
@@ -386,6 +387,9 @@ pub struct MidiClip {
     /// notes are already timed by them. Shown so you can see what tempo is playing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tempos: Vec<TempoMark>,
+    /// Pitch bend, CC and channel-pressure events, one lane per controller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controllers: Vec<ControllerLane>,
 }
 
 /// A tempo change inside a region, relative to the region start.
@@ -397,6 +401,41 @@ pub struct TempoMark {
 }
 
 impl MidiClip {
+    /// An empty region.
+    pub fn new(name: impl Into<String>, position_secs: f64, length_secs: f64) -> Self {
+        Self { name: name.into(), position_secs, length_secs, mute: false, notes: Vec::new(), tab: None, tempos: Vec::new(), controllers: Vec::new() }
+    }
+
+    pub fn lane(&self, kind: Controller) -> Option<&ControllerLane> {
+        self.controllers.iter().find(|l| l.kind == kind)
+    }
+
+    /// Replace one controller's events (none removes the lane).
+    pub fn set_lane(&mut self, lane: ControllerLane) {
+        self.controllers.retain(|l| l.kind != lane.kind);
+        if !lane.events.is_empty() {
+            self.controllers.push(lane);
+            self.controllers.sort_by_key(|l| l.kind);
+        }
+    }
+
+    /// Split at `cut` seconds into the region: notes crossing it are shortened on the left,
+    /// later ones move to the right part; tab bars, tempo marks and controllers are split
+    /// too (the right part starts with every controller's value at the cut).
+    pub fn split(&self, cut: f64) -> (MidiClip, MidiClip) {
+        let left_notes = self.notes.iter().filter(|n| n.start_secs < cut).map(|n| Note { length_secs: n.length_secs.min(cut - n.start_secs), ..*n }).collect();
+        let right_notes = self.notes.iter().filter(|n| n.start_secs >= cut).map(|n| Note { start_secs: n.start_secs - cut, ..*n }).collect();
+        let mut left_tab = self.tab.clone();
+        let right_tab = left_tab.as_mut().map(|t| t.split_off(cut));
+        let mut left_ctrl = self.controllers.clone();
+        let right_ctrl = left_ctrl.iter_mut().map(|l| l.split_off(cut)).filter(|l| !l.events.is_empty()).collect();
+        left_ctrl.retain(|l| !l.events.is_empty());
+        let mut left = MidiClip { length_secs: cut, notes: left_notes, tab: left_tab, controllers: left_ctrl, ..self.clone() };
+        let tempos = left.split_tempos(cut);
+        let right = MidiClip { position_secs: self.position_secs + cut, length_secs: self.length_secs - cut, notes: right_notes, tab: right_tab, tempos, controllers: right_ctrl, ..self.clone() };
+        (left, right)
+    }
+
     /// The song tempo at `rel` seconds into the region, if the region carries tempo marks.
     pub fn tempo_at(&self, rel: f64) -> Option<f64> {
         let i = self.tempos.partition_point(|m| m.start_secs <= rel + 1e-9);
@@ -815,6 +854,31 @@ mod tests {
         // Tracks without automation don't write the fields.
         let json = serde_json::to_string(&Track::new("B")).unwrap();
         assert!(!json.contains("automation"), "{json}");
+    }
+
+    #[test]
+    fn midi_split_partitions_controllers_and_old_files_load() {
+        use crate::controller::ControllerEvent;
+        let ev = |t: f64, v: f32| ControllerEvent { time_secs: t, value: v };
+        let mut c = MidiClip::new("Riff", 1.0, 4.0);
+        c.notes = vec![note(60, None), Note { start_secs: 2.5, ..note(62, None) }];
+        c.set_lane(ControllerLane::new(Controller::PitchBend, vec![ev(0.0, 0.0), ev(1.5, 0.5), ev(3.0, 0.0)]));
+        c.set_lane(ControllerLane::new(Controller::MOD_WHEEL, vec![ev(3.0, 1.0)]));
+        let (l, r) = c.split(2.0);
+        assert_eq!((l.length_secs, r.position_secs, r.length_secs), (2.0, 3.0, 2.0));
+        assert_eq!((l.notes.len(), r.notes.len()), (1, 1));
+        assert_eq!(l.controllers.len(), 1, "the mod wheel only moves later");
+        assert_eq!(r.lane(Controller::PitchBend).unwrap().events, vec![ev(0.0, 0.5), ev(1.0, 0.0)], "carries the bend held at the cut");
+        assert_eq!(r.lane(Controller::MOD_WHEEL).unwrap().events, vec![ev(1.0, 1.0)]);
+
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains(r#""kind":"pitch_bend""#) && json.contains(r#"{"cc":1}"#), "{json}");
+        assert_eq!(serde_json::from_str::<MidiClip>(&json).unwrap(), c);
+        let old: MidiClip = serde_json::from_str(r#"{"name":"m","position_secs":0,"length_secs":1,"notes":[]}"#).unwrap();
+        assert!(old.controllers.is_empty());
+        assert!(!serde_json::to_string(&old).unwrap().contains("controllers"), "empty lanes aren't written");
+        c.set_lane(ControllerLane::new(Controller::MOD_WHEEL, Vec::new()));
+        assert!(c.lane(Controller::MOD_WHEEL).is_none(), "an empty lane is removed");
     }
 
     #[test]

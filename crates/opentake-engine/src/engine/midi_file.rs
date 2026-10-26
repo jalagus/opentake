@@ -1,13 +1,14 @@
 //! Standard MIDI Files: import as instrument tracks with MIDI regions (like the Guitar Pro
-//! import), and export the project's MIDI regions.
+//! import), and export the project's MIDI regions. Notes, control changes (except channel
+//! mode messages), pitch bend and channel pressure are carried both ways.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use midly::num::{u4, u7, u15, u24, u28};
-use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
-use opentake_project::{MidiClip, Note, Project, TempoMark};
+use midly::num::{u4, u7, u14, u15, u24, u28};
+use midly::{Format, Header, MetaMessage, MidiMessage, PitchBend, Smf, Timing, TrackEvent, TrackEventKind};
+use opentake_project::{Controller, ControllerEvent, ControllerLane, MidiClip, Note, Project, TempoMark};
 use serde::Serialize;
 
 use super::Engine;
@@ -79,6 +80,7 @@ struct Part {
     channel: u8,
     program: Option<u8>,
     notes: Vec<Note>,
+    controllers: Vec<ControllerLane>,
 }
 
 struct Song {
@@ -190,6 +192,7 @@ fn parse(bytes: &[u8]) -> Result<Song> {
         let mut name = String::new();
         let mut programs: [Option<u8>; 16] = [None; 16];
         let mut notes: Vec<Vec<Note>> = vec![Vec::new(); 16];
+        let mut ctrl: Vec<Vec<(Controller, ControllerEvent)>> = vec![Vec::new(); 16];
         // Sounding notes by (channel, key): start tick and velocity.
         let mut open: HashMap<(u8, u8), (u64, u8)> = HashMap::new();
         let close = |notes: &mut Vec<Vec<Note>>, (ch, key): (u8, u8), (start, vel): (u64, u8), end: u64| {
@@ -219,7 +222,16 @@ fn parse(bytes: &[u8]) -> Result<Song> {
                                 close(&mut notes, (ch, key.as_int()), prev, tick);
                             }
                         }
-                        _ => {}
+                        message => {
+                            let (kind, raw) = match message {
+                                // Channel mode messages (all notes off, reset...) aren't controllers.
+                                MidiMessage::Controller { controller, value } if controller < 120 => (Controller::Cc(controller.as_int()), value.as_int() as u16),
+                                MidiMessage::PitchBend { bend } => (Controller::PitchBend, bend.0.as_int()),
+                                MidiMessage::ChannelAftertouch { vel } => (Controller::ChannelPressure, vel.as_int() as u16),
+                                _ => continue,
+                            };
+                            ctrl[ch as usize].push((kind, ControllerEvent { time_secs: clock.secs(tick), value: kind.from_raw(raw) }));
+                        }
                     }
                 }
                 _ => {}
@@ -247,7 +259,8 @@ fn parse(bytes: &[u8]) -> Result<Song> {
             };
             let part_notes = std::mem::take(&mut notes[ch as usize]);
             duration = part_notes.iter().map(|n| n.start_secs + n.length_secs).fold(duration, f64::max);
-            parts.push(Part { name: part_name, channel: ch, program, notes: part_notes });
+            let controllers = lanes(std::mem::take(&mut ctrl[ch as usize]));
+            parts.push(Part { name: part_name, channel: ch, program, notes: part_notes, controllers });
         }
     }
     let format = match smf.header.format {
@@ -256,6 +269,14 @@ fn parse(bytes: &[u8]) -> Result<Song> {
         Format::Sequential => 2,
     };
     Ok(Song { name: song_name, format, tempos, signatures, parts, duration })
+}
+
+/// Group controller events into lanes (by kind).
+fn lanes(events: Vec<(Controller, ControllerEvent)>) -> Vec<ControllerLane> {
+    let mut kinds: Vec<Controller> = events.iter().map(|e| e.0).collect();
+    kinds.sort();
+    kinds.dedup();
+    kinds.into_iter().map(|k| ControllerLane::new(k, events.iter().filter(|e| e.0 == k).map(|e| e.1).collect())).collect()
 }
 
 fn read(path: &Path) -> Result<Song> {
@@ -344,13 +365,10 @@ impl Engine {
                 e.project.tracks[index].instrument = Some(slot);
                 e.sync_instrument(index)?;
                 e.project.tracks[index].midi_clips.push(MidiClip {
-                    name: format!("{song_name} — {}", part.name),
-                    position_secs: start,
-                    length_secs: length,
-                    mute: false,
                     notes: super::midi::sorted(part.notes.clone()),
-                    tab: None,
                     tempos: marks.clone(),
+                    controllers: part.controllers.clone(),
+                    ..MidiClip::new(format!("{song_name} — {}", part.name), start, length)
                 });
                 e.resync_midi(index)?;
                 created.push(index);
@@ -360,8 +378,8 @@ impl Engine {
     }
 
     /// Write the project's MIDI regions to a Standard MIDI File (format 1): a tempo track
-    /// with the tempo map, then one track per instrument track with notes (drum kits on
-    /// channel 10). Muted regions are left out. Returns the number of note tracks written.
+    /// with the tempo map, then one track per instrument track with notes and controllers
+    /// (drum kits on channel 10). Muted regions are left out. Returns the number of note tracks written.
     pub fn export_midi_file(&self, path: &Path) -> Result<usize> {
         let (bytes, count) = smf_bytes(&self.project)?;
         if count == 0 {
@@ -413,12 +431,31 @@ fn smf_bytes(project: &Project) -> Result<(Vec<u8>, usize)> {
                 events.push((on, TrackEventKind::Midi { channel: ch, message: MidiMessage::NoteOn { key, vel: u7::new(n.velocity.clamp(1, 127)) } }));
                 events.push((off, TrackEventKind::Midi { channel: ch, message: MidiMessage::NoteOff { key, vel: u7::new(0) } }));
             }
+            for lane in &clip.controllers {
+                for e in lane.events.iter().filter(|e| e.time_secs < clip.length_secs) {
+                    let raw = lane.kind.raw(e.value);
+                    let message = match lane.kind {
+                        Controller::Cc(n) => MidiMessage::Controller { controller: u7::new(n & 0x7F), value: u7::new(raw as u8) },
+                        Controller::PitchBend => MidiMessage::PitchBend { bend: PitchBend(u14::new(raw)) },
+                        Controller::ChannelPressure => MidiMessage::ChannelAftertouch { vel: u7::new(raw as u8) },
+                    };
+                    events.push((tick(clip.position_secs + e.time_secs), TrackEventKind::Midi { channel: ch, message }));
+                }
+            }
         }
-        if events.is_empty() {
+        if !events.iter().any(|(_, k)| matches!(k, TrackEventKind::Midi { message: MidiMessage::NoteOn { .. }, .. })) {
             continue;
         }
-        // Note-offs before note-ons at the same tick, so repeated notes re-strike.
-        events.sort_by_key(|(t, k)| (*t, matches!(k, TrackEventKind::Midi { message: MidiMessage::NoteOn { .. }, .. })));
+        // Note-offs, then controllers, then note-ons at the same tick, so repeated notes
+        // re-strike and a bend applies to the note it starts with.
+        events.sort_by_key(|(t, k)| {
+            let rank = match k {
+                TrackEventKind::Midi { message: MidiMessage::NoteOff { .. }, .. } => 0,
+                TrackEventKind::Midi { message: MidiMessage::NoteOn { .. }, .. } => 2,
+                _ => 1,
+            };
+            (*t, rank)
+        });
         events.insert(0, (0, meta(MetaMessage::TrackName(track.name.as_bytes()))));
         tracks.push(events);
     }
@@ -621,6 +658,46 @@ mod tests {
             assert_eq!(times(a), times(b));
         }
         assert!(Engine::new().export_midi_file(&out).is_err(), "nothing to export");
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(out).ok();
+    }
+
+    #[test]
+    fn controllers_round_trip_through_a_file() {
+        let bend = |raw: u16| midi(0, MidiMessage::PitchBend { bend: PitchBend(u14::new(raw)) });
+        let cc = |n: u8, v: u8| midi(0, MidiMessage::Controller { controller: u7::new(n), value: u7::new(v) });
+        let track = vec![
+            (0, TrackEventKind::Meta(MetaMessage::Tempo(u24::new(500_000)))),
+            (0, cc(7, 100)),
+            (0, on(0, 60, 100)),
+            (240, bend(12288)),
+            (480, bend(8192)),
+            (480, cc(64, 127)),
+            (480, cc(123, 0)), // all notes off: not a controller
+            (720, midi(0, MidiMessage::ChannelAftertouch { vel: u7::new(80) })),
+            (960, off(0, 60)),
+            (960, cc(64, 0)),
+        ];
+        let song = parse(&smf(Format::SingleTrack, Timing::Metrical(u15::new(480)), vec![track])).unwrap();
+        let summary = |lanes: &[ControllerLane]| lanes.iter().map(|l| (l.kind, l.events.iter().map(|e| (e.time_secs, l.kind.raw(e.value))).collect::<Vec<_>>())).collect::<Vec<_>>();
+        let want = vec![
+            (Controller::PitchBend, vec![(0.25, 12288), (0.5, 8192)]),
+            (Controller::Cc(7), vec![(0.0, 100)]),
+            (Controller::SUSTAIN, vec![(0.5, 127), (1.0, 0)]),
+            (Controller::ChannelPressure, vec![(0.75, 80)]),
+        ];
+        assert_eq!(summary(&song.parts[0].controllers), want);
+
+        let path = write("cc.mid", &smf(Format::SingleTrack, Timing::Metrical(u15::new(480)), vec![vec![(0, on(0, 60, 100)), (240, bend(12288)), (480, cc(1, 64)), (960, off(0, 60))]]));
+        let mut e = Engine::new();
+        e.import_midi_file(&path, &MidiFileImport::default()).unwrap();
+        let clip = &e.project().tracks[0].midi_clips[0];
+        assert_eq!(clip.lane(Controller::PitchBend).map(|l| l.events.len()), Some(1));
+        e.set_midi_controllers(0, 0, Controller::ChannelPressure, vec![ControllerEvent { time_secs: 0.75, value: 1.0 }], true).unwrap();
+        let out = std::env::temp_dir().join(format!("opentake-midi-{}-cc-out.mid", std::process::id()));
+        e.export_midi_file(&out).unwrap();
+        let again = read(&out).unwrap();
+        assert_eq!(summary(&again.parts[0].controllers), summary(&e.project().tracks[0].midi_clips[0].controllers));
         std::fs::remove_file(path).ok();
         std::fs::remove_file(out).ok();
     }

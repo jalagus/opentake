@@ -243,6 +243,7 @@ fn midi_clip(clip: Node, map: &TempoMap) -> Option<MidiClip> {
         notes,
         tab: None,
         tempos: Vec::new(),
+        controllers: Vec::new(),
     })
 }
 
