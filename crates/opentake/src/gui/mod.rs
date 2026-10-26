@@ -176,6 +176,12 @@ pub(crate) enum Action {
     /// Play another take of a take folder, or delete one.
     SelectTake { track: usize, clip: usize, take: usize },
     DeleteTake { track: usize, clip: usize, take: usize },
+    /// A take folder's new comp (a swipe on a take lane; `merge` makes the swipe one step).
+    SetComp { track: usize, clip: usize, comp: Vec<opentake_engine::project::CompSegment>, merge: String },
+    ClearComp { track: usize, clip: usize },
+    FlattenComp { track: usize, clip: usize },
+    /// Open or close a take folder's take lanes.
+    ShowTakes { track: usize, clip: usize, show: bool },
     TrimRegion { region: RegionRef, start: Option<f64>, end: Option<f64> },
     /// Pitch-shift / time-stretch an audio region.
     PitchStretch { track: usize, clip: usize, ps: opentake_engine::PitchStretch },
@@ -441,10 +447,12 @@ impl DawApp {
             }
         }
         let mut waveforms = HashMap::new();
-        for clip in project.tracks.iter().flat_map(|t| &t.clips) {
-            if !waveforms.contains_key(&clip.file) {
-                if let Ok(w) = e.waveform(&clip.file) {
-                    waveforms.insert(clip.file.clone(), w);
+        // Every take of a folder too (take lanes and comps draw them).
+        let files = project.tracks.iter().flat_map(|t| &t.clips).flat_map(|c| std::iter::once(&c.file).chain(c.takes.iter().map(|t| &t.file)));
+        for file in files {
+            if !waveforms.contains_key(file) {
+                if let Ok(w) = e.waveform(file) {
+                    waveforms.insert(file.clone(), w);
                 }
             }
         }
@@ -667,6 +675,10 @@ impl DawApp {
             Action::DeleteTake { track, clip, take } => {
                 e.remove_take(track, clip, take)?;
             }
+            Action::SetComp { track, clip, comp, merge } => drop(e.set_comp(track, clip, comp, Some(merge))?),
+            Action::ClearComp { track, clip } => drop(e.clear_comp(track, clip)?),
+            Action::FlattenComp { track, clip } => drop(e.flatten_comp(track, clip)?),
+            Action::ShowTakes { track, clip, show } => e.set_takes_shown(track, clip, show)?,
             Action::SplitRegions { regions, at } => {
                 e.split_regions(&regions, at)?;
                 // Select the right-hand parts, like Logic. Splitting in index order shifts
@@ -2965,16 +2977,7 @@ mod tests {
     #[test]
     fn take_folder_badge_picks_the_take() {
         let (mut harness, engine, dir) = harness_with_region();
-        {
-            // Three takes of one cycle recording in the same file.
-            let mut e = engine.lock().unwrap();
-            let mut folder = e.remove_clip(0, 0).unwrap();
-            let file = folder.file.clone();
-            folder.length_secs = 1.0;
-            folder.push_take("Take 2".into(), file.clone(), 1.0);
-            folder.push_take("Take 3".into(), file, 2.0);
-            e.insert_clip(0, folder).unwrap();
-        }
+        take_folder(&engine);
         harness.state_mut().view.px_per_sec = 200.0;
         harness.step();
         harness.step();
@@ -2984,6 +2987,102 @@ mod tests {
         let c = &e.project().tracks[0].clips[0];
         assert_eq!((c.active_take, c.source_offset_secs), (0, 0.0));
         assert_eq!(e.history_info().undo.as_deref(), Some("Select Take"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The demo region as a 1 s take folder at 1.0 s: three takes of one cycle recording in
+    /// the same file, the last one playing.
+    fn take_folder(engine: &SharedEngine) {
+        let mut e = engine.lock().unwrap();
+        let mut folder = e.remove_clip(0, 0).unwrap();
+        let file = folder.file.clone();
+        folder.length_secs = 1.0;
+        folder.push_take("Take 2".into(), file.clone(), 1.0);
+        folder.push_take("Take 3".into(), file, 2.0);
+        e.insert_clip(0, folder).unwrap();
+    }
+
+    #[test]
+    fn take_lanes_swipe_a_comp_and_pick_a_whole_take() {
+        let (mut harness, engine, dir) = harness_with_region();
+        take_folder(&engine);
+        harness.state_mut().view.px_per_sec = 200.0;
+        harness.step();
+        harness.step();
+        click(&mut harness, "Show Takes riff");
+        let folder = |e: &SharedEngine| e.lock().unwrap().project().tracks[0].clips[0].clone();
+        assert!(folder(&engine).show_takes);
+        // Swipe across take 2's lane from 0.25 s to 0.75 s into the folder (snap is off).
+        let lane = harness.get_by_label("Take Take 2 riff").rect();
+        let x = |t: f64| lane.left() + (t * 200.0) as f32;
+        drag(&mut harness, egui::pos2(x(1.25), lane.center().y), egui::pos2(x(1.75), lane.center().y));
+        let c = folder(&engine);
+        assert_eq!(c.comp.len(), 1, "{:?}", c.comp);
+        assert!(c.comp[0].take == 1 && (c.comp[0].start_secs - 0.25).abs() < 1e-3 && (c.comp[0].end_secs - 0.75).abs() < 1e-3, "{:?}", c.comp);
+        {
+            // The swipe is one undo step.
+            let mut e = engine.lock().unwrap();
+            assert_eq!(e.history_info().undo.as_deref(), Some("Comp Take"));
+            e.undo().unwrap();
+            assert!(!e.project().tracks[0].clips[0].is_comped());
+            e.redo().unwrap();
+        }
+        harness.step();
+        assert!(harness.query_by_label("Take Lane riff Take 3").is_some());
+        // Clicking take 1's header plays it all through.
+        click(&mut harness, "Take Lane riff Take 1");
+        let c = folder(&engine);
+        assert_eq!((c.active_take, c.comp.len()), (0, 0));
+        // Collapsing hides the lanes again.
+        click(&mut harness, "Hide Takes riff");
+        assert!(harness.query_by_label("Take Take 2 riff").is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Renders an open, comped take folder to a PNG for visual review:
+    /// `OPENTAKE_SCREENSHOT=/tmp/takes.png cargo test -p opentake render_take_lanes -- --ignored`
+    #[test]
+    #[ignore = "renders with wgpu; run manually for visual checks"]
+    fn render_take_lanes() {
+        let out = std::env::var("OPENTAKE_SCREENSHOT").unwrap_or_else(|_| "opentake-takes.png".into());
+        let dir = std::env::temp_dir().join(format!("opentake-takes-shot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("Vocal.wav");
+        write_tone(&wav, 330.0, 12.0, 2.5);
+        let engine: SharedEngine = Arc::new(Mutex::new(Engine::new()));
+        {
+            let mut e = engine.lock().unwrap();
+            e.add_track("Vocal").unwrap();
+            e.add_clip(0, &wav, 0.0).unwrap();
+            let mut folder = e.remove_clip(0, 0).unwrap();
+            (folder.name, folder.position_secs, folder.length_secs, folder.show_takes) = ("Verse".into(), 1.0, 4.0, true);
+            for take in 2..=4 {
+                folder.push_take(format!("Take {take}"), wav.clone(), (take - 1) as f64 * 2.0);
+            }
+            e.insert_clip(0, folder).unwrap();
+            for (from, to, take) in [(0.0, 1.1, 0), (1.1, 2.0, 1), (2.6, 3.2, 2)] {
+                e.set_comp_segment(0, 0, from, to, take).unwrap();
+            }
+            e.add_track("Bass").unwrap();
+            e.add_clip(1, &wav, 0.5).unwrap();
+            e.seek(2.3).unwrap();
+        }
+        let app_engine = engine.clone();
+        let mut harness = Harness::builder()
+            .with_size([1100.0, 560.0])
+            .with_pixels_per_point(2.0)
+            .with_step_dt(1.0 / 60.0)
+            .wgpu()
+            .build_eframe(move |cc| {
+                theme::apply(&cc.egui_ctx);
+                DawApp::new(app_engine, None)
+            });
+        harness.state_mut().selection = vec![RegionRef::audio(0, 0)];
+        harness.state_mut().view.px_per_sec = 140.0;
+        for _ in 0..4 {
+            harness.step();
+        }
+        harness.render().expect("render").save(&out).expect("save png");
         std::fs::remove_dir_all(dir).ok();
     }
 

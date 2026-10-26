@@ -66,6 +66,8 @@ impl PitchStretch {
         (fade_in.secs, fade_out.secs) = (fade_in.secs * scale, fade_out.secs * scale);
         let mut out = Clip { pitch_semitones: semitones, pitch_cents: cents, stretch, length_secs, fade_in, fade_out, ..c.clone() };
         out.clamp_fades();
+        // So does the comp (it's in timeline seconds).
+        out.scale_comp(scale);
         Ok(out)
     }
 }
@@ -147,7 +149,9 @@ impl Engine {
     /// Drop renders no region uses any more (undo re-renders them if needed).
     fn prune_flexed(&mut self) {
         let sr = self.sample_rate();
-        let used: Vec<FlexKey> = self.project.tracks.iter().flat_map(|t| &t.clips).map(|c| key(c, sr)).collect();
+        // A comped folder's other takes are rendered too.
+        let clips = self.project.tracks.iter().flat_map(|t| &t.clips);
+        let used: Vec<FlexKey> = clips.clone().map(|c| key(c, sr)).chain(clips.flat_map(|c| c.played_parts(Default::default())).map(|(c, _)| key(&c, sr))).collect();
         self.flexed.retain(|k, _| used.contains(k));
     }
 }

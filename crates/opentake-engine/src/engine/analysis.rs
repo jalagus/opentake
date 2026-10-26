@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use opentake_project::automation::pos_to_gain;
-use opentake_project::{AutomationLane, AutomationTarget, Clip, Project, TempoMap, automated, effective_fades};
+use opentake_project::{AutomationLane, AutomationTarget, Clip, Project, TempoMap, automated, played_clips};
 use serde::Serialize;
 
 use super::Engine;
@@ -96,7 +96,8 @@ impl Engine {
         let sr = sample_rate.clamp(8_000.0, 384_000.0);
         let mut warnings = Vec::new();
         let mut media = Vec::new();
-        let clips: Vec<_> = self.project.tracks.iter().flat_map(|t| &t.clips).cloned().collect();
+        // What the regions play: a comped folder reads several takes.
+        let clips: Vec<Clip> = self.project.tracks.iter().flat_map(|t| played_clips(&t.clips)).map(|(c, _)| c).collect();
         for clip in clips {
             let key = flex::key(&clip, sr as u32);
             if media.iter().any(|(k, _)| *k == key) {
@@ -360,11 +361,11 @@ fn render_audio_regions(track: &opentake_project::Track, start: usize, sr: f64, 
 /// into `l`/`r`, which start at timeline sample `start`. `media` gives each region's audio.
 pub(super) fn render_clips(clips: &[Clip], start: usize, sr: f64, media: impl Fn(&Clip) -> Option<Arc<AudioData>>, l: &mut [f32], r: &mut [f32]) {
     let len = l.len();
-    for (clip, fades) in clips.iter().zip(effective_fades(clips)).filter(|(c, _)| !c.mute) {
+    for (clip, fades) in played_clips(clips).iter().filter(|(c, _)| !c.mute) {
         let Some(data) = media(clip) else { continue };
         let samples = |secs: f64| (secs.max(0.0) * sr).round() as u64;
         let (clip_start, clip_end) = (samples(clip.position_secs), samples(clip.position_secs + clip.length_secs));
-        let fades = ClipFades::new(clip_start, clip_end.max(clip_start), fades, sr);
+        let fades = ClipFades::new(clip_start, clip_end.max(clip_start), *fades, sr);
         // The processed audio is already stretched (offsets are in source seconds).
         let offset = (clip.source_offset_secs * clip.stretch * sr).round() as i64;
         let src_l = &data.channels[0];

@@ -8,6 +8,7 @@ mod analysis;
 mod au;
 mod automation;
 mod calibration;
+mod comp;
 mod export;
 mod fades;
 mod flex;
@@ -31,7 +32,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use opentake_project::{Clip, Fade, Project, TempoChange, Track, effective_fades};
+use opentake_project::{Clip, Fade, Project, TempoChange, Track, played_clips};
 use opentake_vst3::{Module, ScannedPlugin};
 use rtrb::{Consumer, Producer};
 use serde::Serialize;
@@ -510,14 +511,13 @@ impl Engine {
         })
     }
 
-    /// A track's audio clips, crossfaded where they overlap.
+    /// A track's audio clips, crossfaded where they overlap; comped take folders play one
+    /// clip per comp segment, crossfaded at the joins.
     fn build_clips(&mut self, index: usize, sr: u32) -> Vec<ClipRt> {
-        let clips = self.project.tracks[index].clips.clone();
-        let fades = effective_fades(&clips);
-        clips
+        let played = played_clips(&self.project.tracks[index].clips);
+        played
             .iter()
-            .zip(fades)
-            .filter_map(|(c, f)| match self.build_clip_with(c, f, sr) {
+            .filter_map(|(c, f)| match self.build_clip_with(c, *f, sr) {
                 Ok(rt) => Some(rt),
                 Err(e) => {
                     tracing::warn!("skipping clip '{}': {e:#}", c.name);
@@ -902,6 +902,8 @@ impl Engine {
             stretch: 1.0,
             fade_in: Fade::default(),
             fade_out: Fade::default(),
+            comp: Vec::new(),
+            show_takes: false,
         };
         self.record("Add Region", None, |e| {
             e.project.tracks[index].clips.push(clip.clone());
@@ -1013,6 +1015,7 @@ impl Engine {
         if end - start < Self::MIN_CLIP_SECS {
             bail!("trim would leave clip '{}' shorter than {} ms", c.name, Self::MIN_CLIP_SECS * 1000.0);
         }
+        let moved = start - c.position_secs;
         let mut trimmed = Clip {
             position_secs: start,
             length_secs: end - start,
@@ -1020,6 +1023,7 @@ impl Engine {
             ..c
         };
         trimmed.clamp_fades();
+        trimmed.crop_comp(moved);
         self.record("Trim Region", None, |e| {
             e.project.tracks[index].clips[clip] = trimmed.clone();
             e.resync_clips(index)?;

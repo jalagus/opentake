@@ -27,17 +27,20 @@ impl Engine {
     }
 
     /// Peak level (linear, before region gain) of what an audio region plays, including its
-    /// pitch/stretch processing.
+    /// pitch/stretch processing (every take a comp plays).
     pub fn clip_peak(&mut self, track: usize, clip: usize) -> Result<f32> {
         let index = self.clip_index(track, clip)?;
-        let c = self.project.tracks[index].clips[clip].clone();
         let sr = self.sample_rate();
-        let data = self.clip_media(&c, sr)?;
-        // The part of the (processed) audio the region spans; a negative offset is silence.
-        let frames = |secs: f64| (secs * sr as f64).round().max(0.0) as usize;
-        let from = frames(c.source_offset_secs * c.stretch).min(data.frames());
-        let to = frames(c.source_offset_secs * c.stretch + c.length_secs).min(data.frames());
-        Ok(data.channels.iter().flat_map(|ch| &ch[from..to]).fold(0.0f32, |a, s| a.max(s.abs())))
+        let mut peak = 0.0f32;
+        for (c, _) in self.project.tracks[index].clips[clip].played_parts(Default::default()) {
+            let data = self.clip_media(&c, sr)?;
+            // The part of the (processed) audio the region spans; a negative offset is silence.
+            let frames = |secs: f64| (secs * sr as f64).round().max(0.0) as usize;
+            let from = frames(c.source_offset_secs * c.stretch).min(data.frames());
+            let to = frames(c.source_offset_secs * c.stretch + c.length_secs).min(data.frames());
+            peak = data.channels.iter().flat_map(|ch| &ch[from..to]).fold(peak, |a, s| a.max(s.abs()));
+        }
+        Ok(peak)
     }
 
     /// Set an audio region's gain so its peak reaches `target_db` (dBFS). Returns the region.

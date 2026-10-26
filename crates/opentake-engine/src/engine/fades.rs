@@ -6,10 +6,11 @@
 //! against each other it first overlaps them by [`JOIN_SECS`] (or, without audio beyond
 //! their edges, fades both ends that short), so the join can't click.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use opentake_project::{Clip, Fade, FadeCurve};
+use opentake_project::{Clip, Fade, FadeCurve, played_clips};
 use serde::Deserialize;
 
 use super::Engine;
@@ -67,6 +68,7 @@ fn set_start(c: &mut Clip, at: f64) {
     c.position_secs = at;
     c.length_secs -= delta;
     c.source_offset_secs += delta / c.stretch;
+    c.crop_comp(delta);
 }
 
 /// Overlap `a` (earlier) and `b` by `secs`, centred on their boundary, trimming or extending
@@ -86,6 +88,7 @@ fn overlap(a: &mut Clip, b: &mut Clip, secs: f64, a_end: f64, b_start: f64) -> f
         return 0.0;
     }
     a.length_secs = to - a.position_secs;
+    a.crop_comp(0.0);
     set_start(b, from);
     a.clamp_fades();
     b.clamp_fades();
@@ -147,7 +150,7 @@ impl Engine {
 
     /// Merge (join) audio regions of one track into a single region playing a new file in
     /// the media folder: what they play — gain, fades, crossfades, pitch/stretch, the active
-    /// take — rendered over their combined span (gaps become silence). Butted regions are
+    /// take or comp — rendered over their combined span (gaps become silence). Butted regions are
     /// crossfaded over [`JOIN_SECS`] at the join. One undo step; the source files stay.
     /// Returns the new region's index and the region.
     pub fn merge_clips(&mut self, track: usize, clips: &[usize]) -> Result<(usize, Clip)> {
@@ -184,36 +187,12 @@ impl Engine {
             }
         }
 
-        let sr = self.sample_rate();
-        let mut media: Vec<(FlexKey, Arc<AudioData>)> = Vec::new();
-        for c in &parts {
-            let data = self.clip_media(c, sr)?;
-            media.push((flex::key(c, sr), data));
-        }
-        let start = (from * sr as f64).round() as usize;
-        let len = ((to * sr as f64).round() as usize).saturating_sub(start).max(1);
-        let (mut l, mut r) = (vec![0.0f32; len], vec![0.0f32; len]);
-        let lookup = |c: &Clip| media.iter().find(|(k, _)| *k == flex::key(c, sr)).map(|(_, d)| d.clone());
-        render_clips(&parts, start, sr as f64, lookup, &mut l, &mut r);
-        let stereo = parts.iter().filter(|c| !c.mute).any(|c| lookup(c).is_some_and(|d| d.channels.len() > 1));
-        let channels = if stereo { vec![l, r] } else { vec![l] };
-
-        // A new file next to the recordings, never overwriting one.
-        let dir = self.media_dir();
-        std::fs::create_dir_all(&dir)?;
-        let stem = super::sanitize(&parts[0].name);
-        let path = (1..)
-            .map(|n| dir.join(format!("{stem} merged{}.wav", if n == 1 { String::new() } else { format!(" {n}") })))
-            .find(|p| !p.exists())
-            .expect("an unused name");
-        write_wav(&path, &channels, sr)?;
-        self.media.insert((path.clone(), sr), Arc::new(AudioData { channels, sample_rate: sr }));
-
+        let (path, len) = self.bounce(&parts, from, to, "merged")?;
         let merged = Clip {
             name: parts[0].name.clone(),
             file: path,
             position_secs: from,
-            length_secs: len as f64 / sr as f64,
+            length_secs: len,
             source_offset_secs: 0.0,
             gain: 1.0,
             mute: false,
@@ -224,6 +203,8 @@ impl Engine {
             stretch: 1.0,
             fade_in: Fade::default(),
             fade_out: Fade::default(),
+            comp: Vec::new(),
+            show_takes: false,
         };
         self.record("Merge Regions", None, |e| {
             let list = &mut e.project.tracks[index].clips;
@@ -236,6 +217,39 @@ impl Engine {
             e.sync_song_end()?;
             Ok((at, merged))
         })
+    }
+
+    /// Render regions as they play (comps included) over `from..to` timeline seconds into a
+    /// new WAV in the media folder, "<first region's name> <what>.wav", never overwriting a
+    /// file. Returns the file and its length (seconds).
+    pub(super) fn bounce(&mut self, parts: &[Clip], from: f64, to: f64, what: &str) -> Result<(PathBuf, f64)> {
+        let sr = self.sample_rate();
+        // What the parts play (a comped take folder reads several takes).
+        let played: Vec<Clip> = played_clips(parts).into_iter().map(|(c, _)| c).collect();
+        let mut media: Vec<(FlexKey, Arc<AudioData>)> = Vec::new();
+        for c in &played {
+            let data = self.clip_media(c, sr)?;
+            media.push((flex::key(c, sr), data));
+        }
+        let start = (from * sr as f64).round() as usize;
+        let len = ((to * sr as f64).round() as usize).saturating_sub(start).max(1);
+        let (mut l, mut r) = (vec![0.0f32; len], vec![0.0f32; len]);
+        let lookup = |c: &Clip| media.iter().find(|(k, _)| *k == flex::key(c, sr)).map(|(_, d)| d.clone());
+        render_clips(parts, start, sr as f64, lookup, &mut l, &mut r);
+        let stereo = played.iter().filter(|c| !c.mute).any(|c| lookup(c).is_some_and(|d| d.channels.len() > 1));
+        let channels = if stereo { vec![l, r] } else { vec![l] };
+
+        // A new file next to the recordings, never overwriting one.
+        let dir = self.media_dir();
+        std::fs::create_dir_all(&dir)?;
+        let stem = super::sanitize(&parts[0].name);
+        let path = (1..)
+            .map(|n| dir.join(format!("{stem} {what}{}.wav", if n == 1 { String::new() } else { format!(" {n}") })))
+            .find(|p| !p.exists())
+            .expect("an unused name");
+        write_wav(&path, &channels, sr)?;
+        self.media.insert((path.clone(), sr), Arc::new(AudioData { channels, sample_rate: sr }));
+        Ok((path, len as f64 / sr as f64))
     }
 }
 

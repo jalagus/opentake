@@ -1,6 +1,8 @@
 //! Arrangement view: ruler, track headers, the region timeline (audio and MIDI) and the
 //! automation lanes shown under each track.
 
+mod takes;
+
 use std::sync::Arc;
 
 use opentake_engine::{AutomationParam, FadeUpdate, RegionData, TrackUpdate, Waveform};
@@ -98,6 +100,14 @@ impl<'a> RegionView<'a> {
         match self.content {
             Content::Audio(c) if !c.takes.is_empty() => Some((&c.takes, c.active_take)),
             _ => None,
+        }
+    }
+
+    /// The audio region, if it's one.
+    pub fn audio(&self) -> Option<&'a Clip> {
+        match self.content {
+            Content::Audio(c) => Some(c),
+            Content::Midi(_) => None,
         }
     }
 
@@ -246,6 +256,9 @@ pub struct View {
     pub auto_sel: Option<AutoSel>,
     auto_drag: Option<AutoDrag>,
     auto_context: Option<usize>,
+    /// A swipe across a take lane, and how many there have been (for undo merge keys).
+    swipe: Option<takes::Swipe>,
+    swipes: u64,
 }
 
 /// An automation point: whose lanes (a track, or `None` for the master), lane (index into
@@ -291,6 +304,8 @@ impl Default for View {
             auto_sel: None,
             auto_drag: None,
             auto_context: None,
+            swipe: None,
+            swipes: 0,
         }
     }
 }
@@ -567,6 +582,9 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
                 draw_playhead(&painter, rect, &app.view, playhead, false);
             });
             let mut span = row.response.rect.y_range();
+            if let Some(bottom) = takes::take_lanes(app, ui, ti, track, snap, &map, grid) {
+                span.max = bottom;
+            }
             if track.show_automation {
                 span.max = automation_rows(app, ui, LaneHost::track(ti, track), snap, &map, grid);
             }
@@ -810,7 +828,7 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
             _ => *fo = Fade { secs: d.fade, curve: c.fade_out.curve },
         }
     }
-    let painted = |start: f64, end: f64, mode: Option<DragMode>| Painted { view, start, end, mode, wf, fades: shown_fades };
+    let painted = |start: f64, end: f64, mode: Option<DragMode>| Painted { view, start, end, mode, wf, waveforms: &snap.waveforms, fades: shown_fades };
     if copying {
         let orig = Rect::from_min_max(pos2(app.view.x_of(view.position), rect.top()), pos2(app.view.x_of(view.end()), rect.bottom()));
         paint_region(painter, row, orig, painted(view.position, view.end(), None), color, &app.view, RegionLook::default());
@@ -848,15 +866,21 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
         }
     }
 
-    // A take folder's badge picks the take that plays.
-    if let (Some((takes, active)), Some(badge)) = (view.takes(), take_badge(rect, row)) {
+    // A take folder's badge picks the take that plays; the triangle opens its take lanes.
+    if let (Some((takes, active)), Some(badge), Some(c)) = (view.takes(), take_badge(rect, row), audio) {
         if drag.is_none() {
             let b = ui.interact(badge, ui.make_persistent_id(("takes", r)), Sense::click());
             widgets::label(&b, egui::Role::Button, &format!("Takes {}", view.name));
             if b.hovered() {
                 painter.rect_stroke(badge, 4.0, Stroke::new(1.0, Color32::from_rgb(16, 16, 18)), StrokeKind::Inside);
             }
-            egui::Popup::menu(&b).show(|ui| take_items(app, ui, r, takes, active));
+            egui::Popup::menu(&b).show(|ui| take_items(app, ui, r, c, takes, active));
+            let t = takes::toggle_rect(badge);
+            let open = ui.interact(t, ui.make_persistent_id(("takes_open", r)), Sense::click());
+            widgets::label(&open, egui::Role::Button, &format!("{} {}", if c.show_takes { "Hide Takes" } else { "Show Takes" }, view.name));
+            if open.on_hover_text(if c.show_takes { "Collapse the take lanes" } else { "Expand into take lanes to comp" }).clicked() {
+                app.act(Action::ShowTakes { track: r.track, clip: r.index, show: !c.show_takes });
+            }
         }
     }
 
@@ -1039,11 +1063,23 @@ fn region_context_menu(app: &mut DawApp, ui: &mut egui::Ui, view: RegionView, sn
         app.open_piano_roll(r);
         ui.close();
     }
-    if let (Some((takes, active)), false) = (view.takes(), many) {
+    if let (Some((takes, active)), Some(c), false) = (view.takes(), view.audio(), many) {
         widgets::section(ui, "Takes");
-        take_items(app, ui, r, takes, active);
+        if ui.button(if c.show_takes { "Collapse Takes" } else { "Expand Takes" }).clicked() {
+            app.act(Action::ShowTakes { track: r.track, clip: r.index, show: !c.show_takes });
+            ui.close();
+        }
+        take_items(app, ui, r, c, takes, active);
         if ui.button(format!("Delete {}", takes[active].name)).clicked() {
             app.act(Action::DeleteTake { track: r.track, clip: r.index, take: active });
+            ui.close();
+        }
+        if ui.button("Flatten Comp").on_hover_text("Render what the folder plays into one region").clicked() {
+            app.act(Action::FlattenComp { track: r.track, clip: r.index });
+            ui.close();
+        }
+        if ui.add_enabled(c.is_comped(), egui::Button::new("Clear Comp")).clicked() {
+            app.act(Action::ClearComp { track: r.track, clip: r.index });
             ui.close();
         }
         ui.separator();
@@ -1135,11 +1171,11 @@ fn region_context_menu(app: &mut DawApp, ui: &mut egui::Ui, view: RegionView, sn
     }
 }
 
-/// One entry per take; picking one makes it play.
-fn take_items(app: &mut DawApp, ui: &mut egui::Ui, r: RegionRef, takes: &[Take], active: usize) {
+/// One entry per take; picking one makes it play (all through: it clears a comp).
+fn take_items(app: &mut DawApp, ui: &mut egui::Ui, r: RegionRef, c: &Clip, takes: &[Take], active: usize) {
     for (i, take) in takes.iter().enumerate() {
-        if ui.add(egui::Button::selectable(i == active, &take.name)).clicked() {
-            if i != active {
+        if ui.add(egui::Button::selectable(i == active && !c.is_comped(), &take.name)).clicked() {
+            if i != active || c.is_comped() {
                 app.act(Action::SelectTake { track: r.track, clip: r.index, take: i });
             }
             ui.close();
@@ -1171,6 +1207,8 @@ struct Painted<'a> {
     end: f64,
     mode: Option<DragMode>,
     wf: Option<&'a Arc<Waveform>>,
+    /// Every file's waveform (a comp draws several takes).
+    waveforms: &'a std::collections::HashMap<std::path::PathBuf, Arc<Waveform>>,
     /// An audio region's effective (fade-in, fade-out).
     fades: Option<(Fade, Fade)>,
 }
@@ -1184,7 +1222,7 @@ fn paint_region(painter: &Painter, row: Rect, rect: Rect, p: Painted, color: Col
     let name_bar = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 15.0));
     painter.rect_filled(name_bar, egui::CornerRadius { nw: 5, ne: 5, sw: 0, se: 0 }, theme::shade(color, if look.selected { 1.0 } else { 0.85 }));
     let badge = p.view.takes().and_then(|t| Some((t, take_badge(rect, row)?)));
-    let name_clip = Rect::from_min_max(name_bar.min, pos2(badge.map_or(name_bar.right(), |(_, b)| b.left() - 2.0), name_bar.bottom()));
+    let name_clip = Rect::from_min_max(name_bar.min, pos2(badge.map_or(name_bar.right(), |(_, b)| takes::toggle_rect(b).left() - 2.0), name_bar.bottom()));
     // Pitch-shifted / stretched audio says so after its name.
     let name = match p.view.content {
         Content::Audio(c) if c.is_flexed() => {
@@ -1204,10 +1242,12 @@ fn paint_region(painter: &Painter, row: Rect, rect: Rect, p: Painted, color: Col
     if let Some(((takes, active), b)) = badge {
         painter.rect_filled(b, 4.0, theme::with_alpha(Color32::from_rgb(16, 16, 18), 70));
         let ink = Color32::from_rgb(16, 16, 18);
-        let text = format!("{}/{}", active + 1, takes.len());
+        let comped = p.view.audio().is_some_and(|c| c.is_comped());
+        let text = if comped { "Comp".to_string() } else { format!("{}/{}", active + 1, takes.len()) };
         painter.text(b.center() - vec2(4.0, 0.0), Align2::CENTER_CENTER, text, FontId::proportional(9.5), ink);
         let c = pos2(b.right() - 8.0, b.center().y + 1.0);
         painter.add(egui::Shape::convex_polygon(vec![c + vec2(-3.0, -2.0), c + vec2(3.0, -2.0), c + vec2(0.0, 1.5)], ink, Stroke::NONE));
+        takes::paint_toggle(painter, takes::toggle_rect(b), p.view.audio().is_some_and(|c| c.show_takes), ink);
     }
     let body = Rect::from_min_max(pos2(rect.left(), name_bar.bottom() + 1.0), pos2(rect.right(), rect.bottom() - 1.0));
     let ink = theme::shade(color, 0.22);
@@ -1219,11 +1259,21 @@ fn paint_region(painter: &Painter, row: Rect, rect: Rect, p: Painted, color: Col
                 shown.position_secs = p.start;
                 shown.length_secs = p.end - p.start;
                 match p.mode {
-                    Some(DragMode::TrimStart) => shown.source_offset_secs = c.source_offset_secs + (p.start - c.position_secs) / c.stretch,
-                    Some(DragMode::StretchEnd) => shown.stretch = c.stretch * shown.length_secs / c.length_secs,
-                    _ => {}
+                    Some(DragMode::TrimStart) => {
+                        shown.source_offset_secs = c.source_offset_secs + (p.start - c.position_secs) / c.stretch;
+                        shown.crop_comp(p.start - c.position_secs);
+                    }
+                    Some(DragMode::StretchEnd) => {
+                        shown.stretch = c.stretch * shown.length_secs / c.length_secs;
+                        shown.scale_comp(shown.length_secs / c.length_secs);
+                    }
+                    _ => shown.crop_comp(0.0),
                 }
-                draw_waveform(painter, body, row, view, &shown, wf, ink);
+                if shown.is_comped() {
+                    takes::draw_comp(painter, body, row, view, &shown, p.waveforms, color, ink);
+                } else {
+                    draw_waveform(painter, body, row, view, &shown, wf, ink);
+                }
             }
             // A fade longer than the region's own comes from an overlap: draw it as an X.
             if let Some((fi, fo)) = p.fades {
@@ -2023,7 +2073,7 @@ fn automation_rows(app: &mut DawApp, ui: &mut egui::Ui, host: LaneHost, snap: &S
     if lanes.is_empty() {
         let r = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-            let rect = lane_header_rect(app, ui);
+            let rect = lane_header_rect(app, ui, LANE_H);
             lane_header_frame(ui, rect, host.color);
             let at = Rect::from_min_size(pos2(rect.left() + 32.0, rect.center().y - 11.0), vec2(150.0, 22.0));
             let mut child = ui.new_child(UiBuilder::new().id_salt(("add_lane", host.key)).max_rect(at));
@@ -2049,10 +2099,10 @@ fn automation_rows(app: &mut DawApp, ui: &mut egui::Ui, host: LaneHost, snap: &S
 
 /// Room for a lane header: the lane area starts where the timeline does (as the region
 /// rows do), so lanes line up with the ruler.
-fn lane_header_rect(app: &DawApp, ui: &mut egui::Ui) -> Rect {
+fn lane_header_rect(app: &DawApp, ui: &mut egui::Ui, h: f32) -> Rect {
     let w = (app.view.lanes().min - ui.cursor().left()).clamp(0.0, HEADER_W);
-    let (rect, _) = ui.allocate_exact_size(vec2(w, LANE_H), Sense::hover());
-    Rect::from_min_size(rect.min, vec2(HEADER_W, LANE_H))
+    let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+    Rect::from_min_size(rect.min, vec2(HEADER_W, h))
 }
 
 fn lane_header_frame(ui: &egui::Ui, rect: Rect, color: Color32) {
@@ -2083,7 +2133,7 @@ fn mode_color(mode: AutomationMode) -> Color32 {
 /// Lane header: parameter picker, mode, the value at the playhead, add and remove.
 #[allow(clippy::too_many_arguments)]
 fn lane_header(app: &mut DawApp, ui: &mut egui::Ui, host: LaneHost, li: usize, lane: &AutomationLane, params: &[AutomationParam], playhead: f64) {
-    let rect = lane_header_rect(app, ui);
+    let rect = lane_header_rect(app, ui, LANE_H);
     lane_header_frame(ui, rect, host.color);
     let (owner, ti) = (host.owner, host.key);
     let content = Rect::from_min_max(pos2(rect.left() + 32.0, rect.top() + 4.0), pos2(rect.right() - 10.0, rect.bottom() - 4.0));

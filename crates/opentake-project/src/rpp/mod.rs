@@ -306,6 +306,8 @@ fn import_item(node: &Node, base_dir: &Path) -> Option<Clip> {
         stretch: 1.0 / rate,
         fade_in: import_fade(node, "FADEIN"),
         fade_out: import_fade(node, "FADEOUT"),
+        comp: Vec::new(),
+        show_takes: false,
     })
 }
 

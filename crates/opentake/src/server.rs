@@ -19,7 +19,9 @@ Controls OpenTake, a running digital audio workstation.
 Typical flow: list_audio_devices -> start_audio -> add_track -> update_track (armed, input_channel, \
 monitor_input) -> record -> stop (recordings become clips) -> save_project. With the cycle on \
 (set_loop), recording loops and each pass becomes a take in one take folder region; select_take \
-switches which take plays.
+switches which take plays, and comp_take plays another take over a time range (comping the best \
+parts together; get_project lists the clip's `comp`, where the rest plays `active_take`); \
+flatten_comp renders a comp into one plain region.
 
 Tracks, clips and plugin slots are addressed by zero-based index as shown by get_project. \
 Plugin parameters are normalized 0..1; list_plugin_params shows ids, current values and display strings. \
@@ -575,6 +577,18 @@ pub struct TakeArgs {
     pub track: usize,
     pub clip: usize,
     /// Zero-based index into the region's `takes`.
+    pub take: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CompTakeArgs {
+    pub track: usize,
+    pub clip: usize,
+    /// Start of the range in timeline seconds (absolute, like `split_clip`); clamped to the region.
+    pub from_secs: f64,
+    /// End of the range in timeline seconds.
+    pub to_secs: f64,
+    /// Zero-based index into the region's `takes`: the take that plays over the range.
     pub take: usize,
 }
 
@@ -1303,6 +1317,25 @@ impl DawServer {
     #[tool(description = "Choose which take of a take folder (a region with `takes`, from cycle recording) plays. Undoable.")]
     async fn select_take(&self, Parameters(a): Parameters<TakeArgs>) -> ToolResult {
         self.with_engine(move |e| e.select_take(a.track, a.clip, a.take)).await
+    }
+
+    #[tool(description = "Comp a take folder: play take `take` from `from_secs` to `to_secs` (timeline seconds), replacing what played there; the rest keeps playing. The region's `comp` lists the ranges (relative to the region start) that play a take other than `active_take`. Joins crossfade over 10 ms so they don't click. select_take clears the comp. Undoable.")]
+    async fn comp_take(&self, Parameters(a): Parameters<CompTakeArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let at = e.project().tracks.get(a.track).and_then(|t| t.clips.get(a.clip)).map_or(0.0, |c| c.position_secs);
+            e.set_comp_segment(a.track, a.clip, a.from_secs - at, a.to_secs - at, a.take)
+        })
+        .await
+    }
+
+    #[tool(description = "Clear a take folder's comp: its active take plays all through again. Undoable.")]
+    async fn clear_comp(&self, Parameters(a): Parameters<ClipArgs>) -> ToolResult {
+        self.with_engine(move |e| e.clear_comp(a.track, a.clip)).await
+    }
+
+    #[tool(description = "Flatten a take folder: render what it plays (its comp, or the active take) into a new WAV in the project's Audio folder and make it a plain region playing that file, keeping its position, gain and fades (pitch/stretch is rendered in). The take files stay on disk; one undo step.")]
+    async fn flatten_comp(&self, Parameters(a): Parameters<ClipArgs>) -> ToolResult {
+        self.with_engine(move |e| e.flatten_comp(a.track, a.clip)).await
     }
 
     #[tool(description = "Delete a take from a take folder (the audio file stays on disk). A folder left with one take becomes a plain region. Undoable.")]

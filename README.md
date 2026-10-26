@@ -24,11 +24,12 @@ you watch the changes appear live — and undo anything you don't like.
 - 📈 Automation of volume, pan, mute and any plug-in parameter, in lanes under each track, with Read, Touch and Latch modes
 - ⏱️ Project tempo map (tempo and time-signature changes), metronome with count-in
 - 🔁 Cycle recording: loop a section and record take after take, then pick the one that plays
+  or comp the best parts of several takes together (Logic-style quick swipe comping in take lanes)
 - ✂️ Region editing: select, move, copy, split, trim, snap, cycle/loop; region gain and normalize;
   fades, crossfades and click-free merging of regions
 - 🎚️ Full mixer, metronome, undo/redo for everything
 - 💾 Export the mix and stems to WAV or FLAC, faster than real time
-- 🤖 MCP server (stdio or HTTP) with 84 tools — the agent and you share one session
+- 🤖 MCP server (stdio or HTTP) with 87 tools — the agent and you share one session
 - 📂 Its own `.otp` project files (double-click to open), Reaper `.rpp` and DAWproject (Bitwig, Studio One, Cubase) projects
 - 🔀 Imports Ableton Live sets (`.als`), Ardour sessions, and Logic Pro projects exported as Final Cut Pro XML
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
@@ -169,7 +170,14 @@ agent.
   growing with the playhead while they record.
 - **Dynamics**: the compressor and limiter show a scrolling gain-reduction history.
 - **Takes**: record with the cycle on and each pass becomes a take in one region; its badge
-  (e.g. 3/5) picks the take that plays, and recording the same cycle again adds more.
+  (e.g. 3/5) picks the take that plays, and recording the same cycle again adds more (a new
+  pass plays whole, replacing the comp).
+- **Comping**: click the triangle in a take folder's name bar (or right-click → Expand Takes)
+  to open one lane per take under the track. Swipe (drag) across a take lane to play that take
+  over the range — snapped to the grid, ⌥ for free — and the folder plays the best parts of each
+  take, crossfaded over 10 ms at every join. The lit parts of each lane are what plays; click a
+  lane's header to play that take all through. Right-click the folder for Flatten Comp (render
+  the comp into one region) and Clear Comp. Moves, trims, splits and stretches keep the comp.
 - **Latency compensation**: recordings land where you played them. Audio Settings → Measure
   Latency checks the device's figure with a loopback (a cable, or speakers into a microphone).
 - **Pitch and stretch**: transpose an audio region (semitones and cents) and time-stretch it,
@@ -215,6 +223,7 @@ of the tool calls behind them):
 `get_project`, `get_midi_notes`, `analyze_mix`, `export_audio`, `new_project`, `load_project`, `save_project`, `set_tempo`, `set_tempo_map`, `get_tempo_map`, `convert_time`,
 `set_master_volume`, `set_metronome`, `set_auto_input_monitoring`, `set_count_in`, `set_loop`,
 `add_track`, `add_bus`, `add_send`, `update_send`, `remove_send`, `move_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `set_clip_gain`, `normalize_clip`, `set_clip_pitch_stretch`, `set_clip_fades`, `crossfade_clips`, `merge_clips`, `remove_clip`,
+`select_take`, `delete_take`, `comp_take`, `clear_comp`, `flatten_comp`,
 `play`, `stop`, `seek`, `record`,
 `scan_plugins`, `insert_plugin`, `remove_plugin`, `insert_master_plugin`, `remove_master_plugin`, `set_plugin_bypass`,
 `list_plugin_params`, `set_plugin_param`, `set_sidechain` (`"eq"` inserts the built-in EQ; `master: true` addresses the master bus),
@@ -305,8 +314,8 @@ automation other than tempo, sends/returns and fades aren't imported.
   as parallel tracks); program changes only pick names, and CC, pitch bend and lyrics are skipped.
 - MIDI: no MIDI input / recording yet, no CC/pitch-bend; notes are in seconds, so changing
   the tempo map doesn't stretch existing regions (they keep their real-time positions).
-- Takes: one plays at a time (no comping from parts of several takes yet), and a take folder
-  doesn't expand into take lanes.
+- Takes: one comp per folder (no alternative comps to switch between), and a new cycle pass
+  replaces it; a region fade longer than the first or last comp segment is shortened to it.
 - Tempo map: steps only (no gradual tempo ramps); Reaper ramps are imported as steps.
 - Pitch/stretch: one ratio per region (no Flex markers, no varispeed mode), formants are not
   preserved, and stretch is limited to 0.25–4×. Each new setting renders the region first:

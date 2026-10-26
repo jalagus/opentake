@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::automation::{AutomationLane, AutomationTarget};
+use crate::comp::CompSegment;
 use crate::fade::Fade;
 use crate::tempo::{TempoChange, TempoMap};
 
@@ -517,6 +518,12 @@ pub struct Clip {
     pub fade_in: Fade,
     #[serde(default, skip_serializing_if = "Fade::is_none")]
     pub fade_out: Fade,
+    /// A take folder's comp: where takes other than the active one play (see `comp.rs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comp: Vec<CompSegment>,
+    /// The folder's take lanes are open under its track (a view setting).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub show_takes: bool,
 }
 
 fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
@@ -553,7 +560,7 @@ impl Clip {
     }
 
     /// Split `cut` timeline seconds after the region start into (left, right).
-    /// Each part keeps the fade at its outer end.
+    /// Each part keeps the fade at its outer end, and its part of the comp.
     pub fn split(&self, cut: f64) -> (Clip, Clip) {
         let mut left = Clip { length_secs: cut, fade_out: Fade::default(), ..self.clone() };
         let mut right = Clip {
@@ -565,6 +572,8 @@ impl Clip {
         };
         left.clamp_fades();
         right.clamp_fades();
+        left.crop_comp(0.0);
+        right.crop_comp(cut);
         (left, right)
     }
 
@@ -575,8 +584,18 @@ impl Clip {
         self.fade_out.secs = self.fade_out.secs.clamp(0.0, len - self.fade_in.secs);
     }
 
-    /// Make take `index` the one that plays. Returns false if there's no such take.
+    /// Make take `index` the one that plays, all through the region (the comp goes).
+    /// Returns false if there's no such take.
     pub fn select_take(&mut self, index: usize) -> bool {
+        let ok = self.switch_take(index);
+        if ok {
+            self.comp.clear();
+        }
+        ok
+    }
+
+    /// Make take `index` the active one (what plays outside the comp).
+    fn switch_take(&mut self, index: usize) -> bool {
         let Some(take) = self.takes.get(index) else { return false };
         let (delta, file) = (take.offset_secs, take.file.clone());
         for t in &mut self.takes {
@@ -588,8 +607,9 @@ impl Clip {
         true
     }
 
-    /// Add a take (by its absolute source offset) and make it the one that plays. A plain
-    /// region becomes a take folder whose first take is what it played so far.
+    /// Add a take (by its absolute source offset) and make it the one that plays (all
+    /// through: a new pass replaces the comp, like a fresh take in Logic). A plain region
+    /// becomes a take folder whose first take is what it played so far.
     pub fn push_take(&mut self, name: String, file: PathBuf, source_offset_secs: f64) {
         if self.takes.is_empty() {
             self.takes.push(Take { name: "Take 1".into(), file: self.file.clone(), offset_secs: 0.0 });
@@ -600,23 +620,30 @@ impl Clip {
     }
 
     /// Remove a take; the next one (or the previous, for the last) plays if it was active.
-    /// A folder left with one take becomes a plain region. Returns false if there's no such take.
+    /// Comp segments of the removed take fall back to the active take. A folder left with
+    /// one take becomes a plain region. Returns false if there's no such take.
     pub fn remove_take(&mut self, index: usize) -> bool {
         if index >= self.takes.len() || self.takes.len() < 2 {
             return false;
         }
         let active = self.active_take;
         if index == active {
-            self.select_take(if index + 1 < self.takes.len() { index + 1 } else { index - 1 });
+            self.switch_take(if index + 1 < self.takes.len() { index + 1 } else { index - 1 });
         }
         self.takes.remove(index);
         if self.active_take > index {
             self.active_take -= 1;
         }
+        self.comp.retain(|s| s.take != index);
+        for s in &mut self.comp {
+            s.take -= (s.take > index) as usize;
+        }
         if self.takes.len() == 1 {
             self.takes.clear();
             self.active_take = 0;
+            self.show_takes = false;
         }
+        self.normalize_comp();
         true
     }
 }
@@ -666,7 +693,7 @@ mod tests {
     use super::*;
 
     fn clip(file: &str, offset: f64) -> Clip {
-        Clip { name: "c".into(), file: file.into(), position_secs: 4.0, length_secs: 2.0, source_offset_secs: offset, gain: 1.0, mute: false, takes: Vec::new(), active_take: 0, pitch_semitones: 0, pitch_cents: 0, stretch: 1.0, fade_in: Fade::default(), fade_out: Fade::default() }
+        Clip { name: "c".into(), file: file.into(), position_secs: 4.0, length_secs: 2.0, source_offset_secs: offset, gain: 1.0, mute: false, takes: Vec::new(), active_take: 0, pitch_semitones: 0, pitch_cents: 0, stretch: 1.0, fade_in: Fade::default(), fade_out: Fade::default(), comp: Vec::new(), show_takes: false }
     }
 
     #[test]
