@@ -168,6 +168,7 @@ unsafe impl Sync for Instance {}
 
 impl Drop for Instance {
     fn drop(&mut self) {
+        let _turn = crate::lifecycle();
         unsafe {
             if self.setup.get_mut().is_ok_and(|s| s.is_some()) {
                 AudioUnitUninitialize(self.unit);
@@ -182,6 +183,7 @@ impl Instance {
     /// it matches. Returns the channel count: stereo, or mono for mono-only units.
     fn configure(&self, sample_rate: f64, max_block: usize) -> Result<usize> {
         let mut setup = self.setup.lock().unwrap_or_else(|p| p.into_inner());
+        let _turn = crate::lifecycle();
         if let Some(s) = *setup {
             if s.sample_rate == sample_rate && s.max_block == max_block {
                 return Ok(s.channels);
@@ -629,6 +631,7 @@ unsafe extern "C-unwind" fn transport_state2(
 /// here for the result (never call this on a thread the completion needs, e.g. while
 /// blocking a main thread the extension calls back on — the wait times out then).
 unsafe fn instantiate(comp: AudioComponent) -> Result<AudioUnit> {
+    let _turn = crate::lifecycle();
     let mut desc: AudioComponentDescription = unsafe { std::mem::zeroed() };
     unsafe { AudioComponentGetDescription(comp, NonNull::from(&mut desc)) };
     if desc.componentFlags & AudioComponentFlags::RequiresAsyncInstantiation.bits() == 0 {

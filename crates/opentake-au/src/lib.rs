@@ -68,8 +68,18 @@ impl ComponentInfo {
     }
 }
 
+/// Held around AudioToolbox calls that create, initialize, tear down or look up units.
+/// Doing those on several threads at once can crash inside CoreAudio (seen disposing one
+/// unit while another thread's first lookup ran the component registry's set-up), so they
+/// take turns; none of them happen on the audio thread.
+pub(crate) fn lifecycle() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Every installed effect and instrument, sorted by name. Nothing is loaded.
 pub fn scan() -> Vec<ComponentInfo> {
+    let _turn = lifecycle();
     let mut list = Vec::new();
     for ty in TYPES {
         let mut desc = AudioComponentDescription { componentType: ty, componentSubType: 0, componentManufacturer: 0, componentFlags: 0, componentFlagsMask: 0 };
@@ -96,6 +106,7 @@ pub fn find(id: &str) -> Option<ComponentInfo> {
 }
 
 fn find_component(id: &str) -> Option<AudioComponent> {
+    let _turn = lifecycle();
     let probe = ComponentInfo { name: String::new(), manufacturer: String::new(), id: id.into(), instrument: false, v3: false };
     let mut desc = probe.description()?;
     let comp = unsafe { AudioComponentFindNext(std::ptr::null_mut(), NonNull::from(&mut desc)) };
