@@ -17,6 +17,7 @@ mod gain;
 mod guitarpro;
 mod history;
 mod live_midi;
+mod markers;
 mod midi;
 mod midi_file;
 mod plugins;
@@ -57,6 +58,7 @@ pub use flex::{FlexJob, FlexRender, MAX_SEMITONES, PitchStretch, STRETCH_RANGE};
 pub use gain::CLIP_GAIN_DB;
 pub use history::HistoryInfo;
 pub use live_midi::{MidiInputs, RecordedMidi};
+pub use markers::MarkerUpdate;
 pub use midi::MidiClipUpdate;
 pub use midi_file::{MidiFileImport, MidiFileSummary, MidiFileTrackInfo, gm_program_name, inspect as inspect_midi_file, is_midi_file_path};
 pub use plugins::SlotRef;
@@ -1237,6 +1239,7 @@ impl Engine {
         project.assign_slot_ids();
         project.assign_send_ids();
         project.prune_automation();
+        project.tidy_markers();
 
         if guitarpro::upgrade_song_tempo(&mut project) {
             warnings.push("The imported song's tempo changes were added to the project's tempo map".into());

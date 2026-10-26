@@ -206,6 +206,12 @@ pub(crate) enum Action {
     /// Paste the clipboard with its top-most track at `track`, starting at `position`.
     Paste { track: usize, position: f64 },
     SetLoop { enabled: Option<bool>, start: Option<f64>, end: Option<f64> },
+    /// Markers, by id: a new one at a time ("Marker N" without a name), an edit (`merge`
+    /// makes a drag one step), deleting one, and cycling its section.
+    AddMarker { time: f64, name: Option<String> },
+    UpdateMarker { id: u32, update: opentake_engine::MarkerUpdate, merge: Option<String> },
+    RemoveMarker(u32),
+    CycleMarker(u32),
     ImportGuitarPro { path: PathBuf, options: opentake_engine::GuitarProImport },
     ImportMidiFile { path: PathBuf, options: opentake_engine::MidiFileImport },
     ExportMidiFile(PathBuf),
@@ -865,6 +871,16 @@ impl DawApp {
                 }
             }
             Action::SetLoop { enabled, start, end } => e.set_loop(enabled, start, end)?,
+            Action::AddMarker { time, name } => self.view.marker_sel = Some(e.add_marker(time, name, None)?.id),
+            Action::UpdateMarker { id, update, merge } => {
+                e.update_marker(id, update, merge)?;
+            }
+            Action::RemoveMarker(id) => {
+                e.remove_marker(id)?;
+            }
+            Action::CycleMarker(id) => {
+                e.cycle_marker(id)?;
+            }
             Action::ImportGuitarPro { path, options } => {
                 let created = e.import_guitar_pro(&path, &options)?;
                 self.selection.clear();
@@ -1128,6 +1144,14 @@ impl DawApp {
         if automation {
             self.toggle_automation(snap);
         }
+        // Markers: M creates one at the playhead, ⌥← / ⌥→ jump between them.
+        let marker_keys = ui.input(|i| {
+            let alt = |k| i.key_pressed(k) && i.modifiers.alt && !i.modifiers.command && !i.modifiers.shift;
+            [(plain(i, egui::Key::M), MenuCommand::CreateMarker), (alt(egui::Key::ArrowLeft), MenuCommand::PreviousMarker), (alt(egui::Key::ArrowRight), MenuCommand::NextMarker)]
+        });
+        for (_, cmd) in marker_keys.into_iter().filter(|k| k.0) {
+            self.run_marker_command(cmd, snap);
+        }
         if zoom_fit {
             self.zoom_to_fit(snap);
         }
@@ -1143,6 +1167,7 @@ impl DawApp {
         }
         if escape {
             self.tool = timeline::Tool::Pointer;
+            self.view.marker_sel = None;
             self.selection.clear();
             self.piano.selected.clear();
         }
@@ -1184,6 +1209,10 @@ impl DawApp {
     /// Delete: a selected automation point, then a selected controller event or notes in the
     /// open piano roll, take priority over the selected region.
     fn delete_selection(&mut self, snap: &Snapshot) {
+        if let Some(id) = self.view.marker_sel.take().filter(|&id| snap.project.marker_index(id).is_some()) {
+            self.act(Action::RemoveMarker(id));
+            return;
+        }
         if let Some(s) = self.view.auto_sel.take() {
             self.act(Action::DeletePoints { owner: s.owner, lane: s.lane, indices: vec![s.point] });
             return;
@@ -1452,6 +1481,52 @@ impl DawApp {
             undo: snap.history.undo.clone(),
             redo: snap.history.redo.clone(),
             recent: self.recent_labels(),
+            has_markers: !snap.project.markers.is_empty(),
+            marker_to_delete: self.marker_to_delete(snap).is_some(),
+        }
+    }
+
+    /// The marker Delete Marker removes: the selected one, else one at the playhead.
+    fn marker_to_delete(&self, snap: &Snapshot) -> Option<u32> {
+        let p = &snap.project;
+        let at_playhead = || p.markers.iter().find(|m| (m.time_secs - snap.status.position_secs).abs() < 0.01).map(|m| m.id);
+        self.view.marker_sel.filter(|&id| p.marker_index(id).is_some()).or_else(at_playhead)
+    }
+
+    /// Marker commands (the menus, the keys and the marker track's "+").
+    pub(crate) fn run_marker_command(&mut self, cmd: MenuCommand, snap: &Snapshot) {
+        let p = &snap.project;
+        let pos = snap.status.position_secs;
+        match cmd {
+            MenuCommand::CreateMarker => {
+                // At the playhead; with snapping on, at the nearest bar (as Logic rounds it).
+                let map = p.tempo_map();
+                let bar = map.bar_at(pos);
+                let next = map.secs_of(bar.index + 2, 1.0);
+                let t = match self.snap_mode {
+                    timeline::SnapMode::Off => pos,
+                    _ if pos - bar.secs <= next - pos => bar.secs,
+                    _ => next,
+                };
+                match p.markers.iter().find(|m| (m.time_secs - t).abs() < 1e-3) {
+                    Some(m) => self.view.marker_sel = Some(m.id),
+                    None => self.act(Action::AddMarker { time: t, name: None }),
+                }
+            }
+            MenuCommand::DeleteMarker => {
+                if let Some(id) = self.marker_to_delete(snap) {
+                    self.view.marker_sel = None;
+                    self.act(Action::RemoveMarker(id));
+                }
+            }
+            MenuCommand::PreviousMarker | MenuCommand::NextMarker => {
+                let m = if cmd == MenuCommand::NextMarker { p.next_marker(pos) } else { p.previous_marker(pos) };
+                if let Some(m) = m {
+                    self.view.marker_sel = Some(m.id);
+                    self.act(Action::Seek(m.time_secs));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1684,6 +1759,7 @@ impl DawApp {
             MenuCommand::PlayStop => self.act(if snap.status.playing { Action::Stop } else { Action::Play }),
             MenuCommand::Record => self.act(if snap.status.recording { Action::Stop } else { Action::Record }),
             MenuCommand::GoToStart => self.act(Action::Seek(0.0)),
+            MenuCommand::CreateMarker | MenuCommand::DeleteMarker | MenuCommand::PreviousMarker | MenuCommand::NextMarker => self.run_marker_command(cmd, snap),
             MenuCommand::ToggleMetronome => {
                 self.act(Action::SetMetronome { enabled: Some(!snap.project.metronome_enabled), volume: None })
             }
@@ -4009,6 +4085,114 @@ mod tests {
         let (x0, x1) = (harness.state().view.x(2.0), harness.state().view.x(6.0));
         assert!(x0 >= lanes.min && x1 <= lanes.max && x1 - x0 > lanes.span() * 0.9, "{x0}..{x1} in {lanes:?}");
         check(&harness);
+    }
+
+    #[test]
+    fn marker_track_creates_moves_renames_and_navigates_markers() {
+        let (mut harness, engine) = harness_with_track();
+        harness.state_mut().snap_mode = timeline::SnapMode::Bar;
+        engine.lock().unwrap().seek(4.3).unwrap();
+        harness.step();
+        // M: a marker at the playhead, rounded to the nearest bar (bar 3 = 4 s at 120 BPM).
+        harness.key_press(egui::Key::M);
+        harness.step();
+        harness.step();
+        let markers = |e: &SharedEngine| e.lock().unwrap().project().markers.iter().map(|m| (m.time_secs, m.name.clone())).collect::<Vec<_>>();
+        assert_eq!(markers(&engine), vec![(4.0, "Marker 1".to_string())]);
+        let row = harness.get_by_label("Marker Track").rect();
+
+        // Drag its flag to bar 5 (8 s): snapped, one undo step.
+        let from = egui::pos2(harness.state().view.x(4.0) + 10.0, row.center().y);
+        let to = from + egui::vec2(harness.state().view.x(8.1) - harness.state().view.x(4.0), 0.0);
+        press_drag(&mut harness, from, to, egui::Modifiers::NONE);
+        assert_eq!(markers(&engine)[0].0, 8.0);
+        assert_eq!(engine.lock().unwrap().history_info().undo_steps[..2], ["Move Marker", "Create Marker"]);
+
+        // Double-click to rename in place: the name is selected, typing replaces it.
+        let flag = egui::pos2(harness.state().view.x(8.0) + 10.0, row.center().y);
+        double_click_at(&mut harness, flag);
+        harness.event(egui::Event::Text("Verse".into()));
+        harness.key_press(egui::Key::Enter);
+        harness.step();
+        harness.step();
+        assert_eq!(markers(&engine)[0].1, "Verse");
+
+        // Clicking a marker moves the playhead there; ⌥← / ⌥→ step between markers.
+        engine.lock().unwrap().add_marker(2.0, Some("Intro".into()), None).unwrap();
+        engine.lock().unwrap().seek(0.0).unwrap();
+        click_at(&mut harness, flag);
+        assert_eq!(engine.lock().unwrap().status().position_secs, 8.0);
+        harness.key_press_modifiers(egui::Modifiers::ALT, egui::Key::ArrowLeft);
+        harness.step();
+        harness.step();
+        assert_eq!(engine.lock().unwrap().status().position_secs, 2.0);
+        harness.key_press_modifiers(egui::Modifiers::ALT, egui::Key::ArrowRight);
+        harness.step();
+        harness.step();
+        assert_eq!(engine.lock().unwrap().status().position_secs, 8.0);
+
+        // Right-click: cycle the marker's section (Intro runs to Verse).
+        let intro = egui::pos2(harness.state().view.x(2.0) + 10.0, row.center().y);
+        harness.hover_at(intro);
+        harness.step();
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton { pos: intro, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE });
+        }
+        harness.step();
+        harness.step();
+        click(&mut harness, "Set Cycle to Marker");
+        {
+            let e = engine.lock().unwrap();
+            let p = e.project();
+            assert!(p.loop_enabled && (p.loop_start_secs, p.loop_end_secs) == (2.0, 8.0));
+        }
+
+        // ⌫ deletes the selected marker (not the selected track).
+        click_at(&mut harness, intro);
+        harness.key_press(egui::Key::Backspace);
+        harness.step();
+        harness.step();
+        assert_eq!(markers(&engine), vec![(8.0, "Verse".to_string())]);
+        assert_eq!(engine.lock().unwrap().project().tracks.len(), 1);
+        // Double-clicking empty marker track space adds one there.
+        let empty = egui::pos2(harness.state().view.x(12.2), row.center().y);
+        double_click_at(&mut harness, empty);
+        assert_eq!(markers(&engine).last().cloned(), Some((12.0, "Marker 1".to_string())), "Marker 1 was renamed, so the name is free");
+    }
+
+    #[test]
+    #[ignore = "renders with wgpu; run manually for visual checks"]
+    fn render_marker_track() {
+        let out = std::env::var("OPENTAKE_SCREENSHOT").unwrap_or_else(|_| "opentake-markers.png".into());
+        let engine: SharedEngine = Arc::new(Mutex::new(Engine::new()));
+        {
+            let mut e = engine.lock().unwrap();
+            e.add_track("Guitar").unwrap();
+            e.add_track("Bass").unwrap();
+            e.add_midi_clip(1, 0.0, 16.0, None).ok();
+            for (t, name, color) in [(0.0, "Intro", None), (4.0, "Verse", Some([96, 190, 100])), (8.0, "Pre-Chorus", Some([86, 140, 230])), (8.5, "Hit", None), (12.0, "Chorus", Some([226, 84, 84]))] {
+                e.add_marker(t, Some(name.into()), color).unwrap();
+            }
+            let pre = e.project().markers[2].id;
+            e.cycle_marker(pre).unwrap();
+            e.seek(9.0).unwrap();
+        }
+        let app_engine = engine.clone();
+        let mut harness = Harness::builder()
+            .with_size([1100.0, 420.0])
+            .with_pixels_per_point(2.0)
+            .with_step_dt(1.0 / 60.0)
+            .wgpu()
+            .build_eframe(move |cc| {
+                theme::apply(&cc.egui_ctx);
+                DawApp::new(app_engine, None)
+            });
+        harness.state_mut().view.px_per_sec = 50.0;
+        harness.state_mut().view.marker_sel = engine.lock().unwrap().project().markers.get(1).map(|m| m.id);
+        for _ in 0..4 {
+            harness.step();
+        }
+        harness.render().expect("render").save(&out).expect("save png");
     }
 
     #[test]

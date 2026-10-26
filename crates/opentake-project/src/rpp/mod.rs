@@ -6,7 +6,7 @@
 //! opaque state), buses (as receives; folders import as buses), sends (receives with their
 //! volume, mute and pre/post-fader mode) and volume, pan and mute
 //! automation (`VOLENV2`/`PANENV2`/`MUTEENV`; volume envelopes in Reaper's fader scaling
-//! are skipped). Plug-in parameter envelopes (`PARMENV`) aren't carried over: Reaper
+//! are skipped) and markers (`MARKER`; a region imports as a marker at its start). Plug-in parameter envelopes (`PARMENV`) aren't carried over: Reaper
 //! numbers parameters by position, which needs the plug-in loaded. Everything else in the
 //! file is ignored on import.
 
@@ -18,6 +18,7 @@ use thiserror::Error;
 
 use crate::automation::{AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, Curve, gain_to_pos, pos_to_gain};
 use crate::fade::{Fade, FadeCurve};
+use crate::marker::Marker;
 use crate::model::{Clip, PluginFormat, PluginSlot, Project, Track};
 use crate::sends::AuxSend;
 use tree::{Entry, Node};
@@ -98,10 +99,38 @@ pub fn from_str(text: &str, base_dir: &Path) -> Result<Project, RppError> {
     if let (Some(a), Some(b)) = (root.value::<f64>("SELECTION", 0), root.value::<f64>("SELECTION", 1)) {
         (project.loop_start_secs, project.loop_end_secs) = (a.min(b), a.max(b));
     }
+    project.markers = import_markers(&root);
+    project.tidy_markers();
     let nodes: Vec<&Node> = root.chunks("TRACK").collect();
     project.tracks = nodes.iter().map(|t| import_track(t, base_dir)).collect();
     import_routing(&nodes, &mut project.tracks);
     Ok(project)
+}
+
+/// Reaper's colours are the OS's native 0xBBGGRR with this flag set (0 = default colour).
+const COLOR_SET: u32 = 0x100_0000;
+
+/// `MARKER id pos "name" isrgn color ...`. A region is two lines with the same id, its
+/// start (named) and its end; only the start is kept.
+fn import_markers(root: &Node) -> Vec<Marker> {
+    let mut seen_regions = Vec::new();
+    let mut markers = Vec::new();
+    for line in root.lines().filter(|l| l.key() == "MARKER") {
+        let t = line.tokens();
+        let (Some(id), Some(pos)) = (t.get(1).and_then(|v| v.parse::<i64>().ok()), t.get(2).and_then(|v| v.parse::<f64>().ok())) else { continue };
+        let region = t.get(4).and_then(|v| v.parse::<u32>().ok()).is_some_and(|f| f & 1 != 0);
+        if region {
+            if seen_regions.contains(&id) {
+                continue; // the region's end
+            }
+            seen_regions.push(id);
+        }
+        let color = t.get(5).and_then(|v| v.parse::<u32>().ok()).filter(|c| c & COLOR_SET != 0).map(|c| [c as u8, (c >> 8) as u8, (c >> 16) as u8]);
+        let name = t.get(3).cloned().filter(|n| !n.is_empty()).unwrap_or_else(|| id.to_string());
+        // Reaper's marker number is our id (regions are numbered apart; clashes get new ids).
+        markers.push(Marker { id: u32::try_from(id).unwrap_or(0), color, ..Marker::new(pos, name) });
+    }
+    markers
 }
 
 /// Buses: a track without items or instrument that receives (`AUXRECV`) from tracks whose
@@ -368,6 +397,10 @@ pub fn to_string(project: &Project, base_dir: &Path) -> String {
         }
         root.push_chunk(env);
     }
+    for m in &project.markers {
+        let color = m.color.map_or(0, |[r, g, b]| r as u32 | (g as u32) << 8 | (b as u32) << 16 | COLOR_SET);
+        root.push_line(&["MARKER".to_string(), m.id.to_string(), fmt_f64(m.time_secs), m.name.clone(), "0".into(), color.to_string(), "1".into()]);
+    }
     for (i, track) in project.tracks.iter().enumerate() {
         // Outputs are post-fader receives at unity; sends keep their level, mute and mode.
         let outputs = project.tracks.iter().enumerate().filter(|(_, s)| s.output == Some(i as u64)).map(|(s, _)| (s, AuxSend::new(i as u64)));
@@ -571,6 +604,19 @@ mod tests {
         let back = from_str(&text, Path::new("/proj")).unwrap();
         assert_eq!(back.tempo_bpm, 120.0);
         assert_eq!(back.tempo_changes, p.tempo_changes);
+    }
+
+    #[test]
+    fn markers_round_trip_and_regions_import_as_markers() {
+        let mut p = Project { markers: vec![Marker { color: Some([255, 128, 0]), ..Marker::new(8.0, "Chorus 1") }, Marker::new(2.5, "Verse")], ..Project::default() };
+        p.tidy_markers();
+        let text = to_string(&p, Path::new("/proj"));
+        assert!(text.contains("MARKER 2 2.5 Verse 0 0 1") && text.contains(r#"MARKER 1 8 "Chorus 1" 0 16810239 1"#), "{text}");
+        assert_eq!(from_str(&text, Path::new("/proj")).unwrap().markers, p.markers);
+
+        let reaper = "<REAPER_PROJECT 0.1\n  MARKER 1 4 \"Bridge\" 1 0 1 R {GUID} 0\n  MARKER 1 12 \"\" 1\n  MARKER 2 1 \"\" 0 0 1 B {GUID} 0\n>\n";
+        let m = from_str(reaper, Path::new("/proj")).unwrap().markers;
+        assert_eq!(m.iter().map(|m| (m.time_secs, m.name.as_str())).collect::<Vec<_>>(), vec![(1.0, "2"), (4.0, "Bridge")], "unnamed markers show their number");
     }
 
     #[test]

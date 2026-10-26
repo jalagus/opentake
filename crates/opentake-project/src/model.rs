@@ -8,6 +8,7 @@ use crate::automation::{AutomationLane, AutomationTarget};
 use crate::comp::CompSegment;
 use crate::controller::{Controller, ControllerLane};
 use crate::fade::Fade;
+use crate::marker::Marker;
 use crate::tempo::{TempoChange, TempoMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -35,6 +36,9 @@ pub struct Project {
     /// the opening values).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tempo_changes: Vec<TempoChange>,
+    /// Named points along the timeline, sorted by time (see `marker.rs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<Marker>,
     /// Bars of metronome count-in before recording (0 = off).
     #[serde(default)]
     pub count_in_bars: u32,
@@ -83,6 +87,7 @@ impl Default for Project {
             loop_start_secs: 0.0,
             loop_end_secs: 0.0,
             tempo_changes: Vec::new(),
+            markers: Vec::new(),
             count_in_bars: 0,
             count_in_on_play: false,
             auto_input_monitoring: true,

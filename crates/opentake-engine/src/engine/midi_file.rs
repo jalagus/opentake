@@ -1,6 +1,6 @@
 //! Standard MIDI Files: import as instrument tracks with MIDI regions (like the Guitar Pro
 //! import), and export the project's MIDI regions. Notes, control changes (except channel
-//! mode messages), pitch bend and channel pressure are carried both ways.
+//! mode messages), pitch bend, channel pressure and markers are carried both ways.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -8,7 +8,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use midly::num::{u4, u7, u14, u15, u24, u28};
 use midly::{Format, Header, MetaMessage, MidiMessage, PitchBend, Smf, Timing, TrackEvent, TrackEventKind};
-use opentake_project::{Controller, ControllerEvent, ControllerLane, MidiClip, Note, Project, TempoMark};
+use opentake_project::{Controller, ControllerEvent, ControllerLane, Marker, MidiClip, Note, Project, TempoMark};
 use serde::Serialize;
 
 use super::Engine;
@@ -91,6 +91,8 @@ struct Song {
     /// (seconds, signature) in order.
     signatures: Vec<(f64, (u32, u32))>,
     parts: Vec<Part>,
+    /// Marker meta events: (seconds, name).
+    markers: Vec<(f64, String)>,
     duration: f64,
 }
 
@@ -183,6 +185,16 @@ fn parse(bytes: &[u8]) -> Result<Song> {
         }
     }
 
+    let mut markers: Vec<(f64, String)> = tracks
+        .iter()
+        .flatten()
+        .filter_map(|&(tick, kind)| match kind {
+            TrackEventKind::Meta(MetaMessage::Marker(n)) => Some((clock.secs(tick), String::from_utf8_lossy(n).trim().to_string())),
+            _ => None,
+        })
+        .collect();
+    markers.sort_by(|a, b| a.0.total_cmp(&b.0));
+
     let mut song_name = String::new();
     let mut parts = Vec::new();
     let mut duration: f64 = 0.0;
@@ -268,7 +280,7 @@ fn parse(bytes: &[u8]) -> Result<Song> {
         Format::Parallel => 1,
         Format::Sequential => 2,
     };
-    Ok(Song { name: song_name, format, tempos, signatures, parts, duration })
+    Ok(Song { name: song_name, format, tempos, signatures, parts, markers, duration })
 }
 
 /// Group controller events into lanes (by kind).
@@ -358,6 +370,8 @@ impl Engine {
                 let cmd = e.tempo_command();
                 e.send(cmd)?;
             }
+            // The song's markers, once however many of its parts come in.
+            e.project.merge_markers(song.markers.iter().map(|(t, name)| Marker::new(start + t, if name.is_empty() { "Marker" } else { name })));
             let mut created = Vec::new();
             for (&i, slot) in wanted.iter().zip(slots) {
                 let part = &song.parts[i];
@@ -408,6 +422,8 @@ fn smf_bytes(project: &Project) -> Result<(Vec<u8>, usize)> {
             prev_sig = Some(seg.sig);
         }
     }
+    tempo_events.extend(project.markers.iter().map(|m| (tick(m.time_secs), meta(MetaMessage::Marker(m.name.as_bytes())))));
+    tempo_events.sort_by_key(|e| e.0);
     let mut tracks = vec![tempo_events];
 
     let mut next_channel = 0u8;
@@ -540,6 +556,8 @@ mod tests {
             (0, TrackEventKind::Meta(MetaMessage::TrackName(b"Test Song"))),
             (0, tempo(120.0)),
             (0, TrackEventKind::Meta(MetaMessage::TimeSignature(4, 2, 24, 8))),
+            (0, TrackEventKind::Meta(MetaMessage::Marker(b"Intro"))),
+            (1920, TrackEventKind::Meta(MetaMessage::Marker(b"Verse"))),
             (1920, tempo(60.0)),
             (1920, TrackEventKind::Meta(MetaMessage::TimeSignature(3, 2, 24, 8))),
         ];
@@ -624,6 +642,7 @@ mod tests {
         assert_eq!(clip.notes.len(), 4);
         assert_eq!(p.tracks[2].instrument.as_ref().map(|s| s.name.as_str()), Some(crate::drums::NAME), "channel 10 gets the drum kit");
         assert!(!e.song_tempo_differs());
+        assert_eq!(p.markers.iter().map(|m| (m.time_secs, m.name.as_str())).collect::<Vec<_>>(), vec![(0.0, "Intro"), (2.0, "Verse")]);
         assert_eq!(e.history_info().undo.as_deref(), Some("Import MIDI File"));
         e.undo().unwrap();
         assert_eq!(e.project().tracks.len(), 1, "undo removes every imported track");
@@ -635,6 +654,9 @@ mod tests {
         assert_eq!(e.project().tracks[created[0]].name, "Drums");
         assert_eq!(e.project().tracks[created[0]].midi_clips[0].position_secs, 4.0);
         assert!(e.project().tempo_changes.is_empty());
+        assert_eq!(e.project().markers.iter().map(|m| m.time_secs).collect::<Vec<_>>(), vec![4.0, 6.0], "markers move with the song");
+        e.import_midi_file(&path, &opts).unwrap();
+        assert_eq!(e.project().markers.len(), 2, "importing another part doesn't repeat them");
         let bad = MidiFileImport { tracks: Some(vec![5]), ..Default::default() };
         assert!(e.import_midi_file(&path, &bad).is_err());
         assert!(inspect(&write("junk.mid", b"not midi")).is_err());
@@ -651,6 +673,7 @@ mod tests {
         let again = read(&out).unwrap();
         assert_eq!(again.tempos, vec![(0.0, 120.0), (2.0, 60.0)]);
         assert_eq!(again.signatures, vec![(0.0, (4, 4)), (2.0, (3, 4))]);
+        assert_eq!(again.markers, vec![(0.0, "Intro".to_string()), (2.0, "Verse".to_string())]);
         let original = parse(&song()).unwrap();
         for (a, b) in again.parts.iter().zip(&original.parts) {
             assert_eq!((a.name.as_str(), a.channel == DRUM_CHANNEL), (b.name.as_str(), b.channel == DRUM_CHANNEL));

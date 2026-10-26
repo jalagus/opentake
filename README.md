@@ -25,6 +25,7 @@ you watch the changes appear live — and undo anything you don't like.
 - 🔑 Side-chain inputs for dynamics: key a compressor, gate, limiter, multiband or de-esser (or a side-chain-capable VST3 / AU) from another track, e.g. a kick pumping a pad
 - 📈 Automation of volume, pan, mute and any plug-in parameter, in lanes under each track, with Read, Touch and Latch modes
 - ⏱️ Project tempo map (tempo and time-signature changes), metronome with count-in
+- 🚩 Marker track: named, coloured markers to jump between and cycle; imported from Guitar Pro sections, MIDI files, Reaper, DAWproject and Ableton
 - 🔁 Cycle recording: loop a section and record take after take, then pick the one that plays
   or comp the best parts of several takes together (Logic-style quick swipe comping in take lanes)
 - 🎹 MIDI input and MIDI recording from any keyboard or controller (CoreMIDI, Windows MIDI, ALSA),
@@ -33,7 +34,7 @@ you watch the changes appear live — and undo anything you don't like.
   fades, crossfades and click-free merging of regions
 - 🎚️ Full mixer, metronome, undo/redo for everything
 - 💾 Export the mix and stems to WAV or FLAC, faster than real time
-- 🤖 MCP server (stdio or HTTP) with 92 tools — the agent and you share one session
+- 🤖 MCP server (stdio or HTTP) with 98 tools — the agent and you share one session
 - 📂 Its own `.otp` project files (double-click to open), Reaper `.rpp` and DAWproject (Bitwig, Studio One, Cubase) projects
 - 🔀 Imports Ableton Live sets (`.als`), Ardour sessions, and Logic Pro projects exported as Final Cut Pro XML
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
@@ -117,6 +118,14 @@ agent.
 
 - **Record and arrange**: audio and instrument tracks; move, trim, split, copy and loop regions
   with snapping; tempo and time-signature changes; a metronome with count-in.
+- **Markers**: the Marker track under the ruler shows named, coloured flags (and faint lines
+  through the arrangement). **M** (Transport → Create Marker, or the track's **+**) adds one at
+  the playhead — at the nearest bar when snapping — and double-clicking empty marker space adds
+  one there. Click a marker to move the playhead to it, drag it to move it (snapped),
+  double-click to rename it, ⌫ to delete the selected one; right-click for Rename, Color, Delete
+  and **Set Cycle to Marker** (from it to the next marker). **⌥←** / **⌥→** go to the previous /
+  next marker. Guitar Pro sections and MIDI file markers become markers on import; Reaper
+  (`MARKER`; regions as a marker at their start), DAWproject markers and Ableton locators too.
 - **MIDI**: a built-in synth and drum kit or any VST3 / Audio Unit instrument, edited in the piano roll.
 - **Controllers (MIDI Draw)**: the piano roll's **MIDI Draw** button opens a lane under the notes
   for pitch bend, mod wheel (CC1), volume (CC7), expression (CC11), sustain (CC64), pan (CC10),
@@ -255,6 +264,7 @@ of the tool calls behind them):
 `get_status`, `list_audio_devices`, `start_audio`, `stop_audio`, `undo`, `redo`, `get_history`,
 `get_project`, `get_midi_notes`, `analyze_mix`, `export_audio`, `new_project`, `load_project`, `save_project`, `set_tempo`, `set_tempo_map`, `get_tempo_map`, `convert_time`,
 `set_master_volume`, `set_metronome`, `set_auto_input_monitoring`, `set_count_in`, `set_loop`,
+`list_markers`, `add_marker`, `update_marker`, `remove_marker`, `goto_marker`, `cycle_marker`,
 `add_track`, `add_bus`, `add_send`, `update_send`, `remove_send`, `move_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `set_clip_gain`, `normalize_clip`, `set_clip_pitch_stretch`, `set_clip_fades`, `crossfade_clips`, `merge_clips`, `remove_clip`,
 `select_take`, `delete_take`, `comp_take`, `clear_comp`, `flatten_comp`,
 `play`, `stop`, `seek`, `record`, `list_midi_inputs`, `set_midi_inputs`,
@@ -282,6 +292,10 @@ faders, pans, master) and reports, per track and for the master, the peak, integ
 An agent can balance a mix by numbers — adjust `update_track` / EQs, re-analyze, repeat —
 keeping the master peak under -1 dBFS and the phone drop similar across tracks.
 
+Markers: `add_marker` takes seconds or a bar/beat, a name and a colour (`#rrggbb` or red,
+orange, yellow, green, teal, blue, purple, pink); the others find a marker by `index` (in time
+order, as `list_markers` shows) or `marker_name`. `cycle_marker` loops from a marker to the next.
+
 Recording: arm a track (`update_track` with `armed: true` and `input_channel`), call
 `record`, then `stop`. Each armed track gets a mono 32-bit float WAV in
 `<project dir>/Audio/`, and it's added to the track as a clip. Armed instrument tracks record
@@ -296,8 +310,8 @@ Supported: tempo/time signature and the tempo map (tempo envelope), sample rate,
 record-arm/input/monitoring, audio items (position, length, source offset, gain, mute,
 play rate / pitch, fades (`FADEIN`/`FADEOUT`, shapes mapped to the nearest), media file), FX chain references, buses (written as receives; folders and receives
 from tracks with the master send off import as buses), sends (receives with their volume, mute
-and mode: post-fader, or pre-fader; Reaper's pre-FX loads as pre-fader), and volume/pan/mute envelopes
-(`VOLENV2`/`PANENV2`/`MUTEENV`). VST3 plugins in a Reaper project are matched by
+and mode: post-fader, or pre-fader; Reaper's pre-FX loads as pre-fader), volume/pan/mute envelopes
+(`VOLENV2`/`PANENV2`/`MUTEENV`) and markers (`MARKER`; a region comes in as a marker at its start). VST3 plugins in a Reaper project are matched by
 bundle file name and class id/name and loaded if installed; Audio Units by their
 type/subtype/manufacturer codes or name.
 
@@ -314,10 +328,10 @@ original file is never overwritten.
 
 - **DAWproject** (`.dawproject`; Bitwig Studio, Studio One, Cubase 14+): tracks, volume/pan/
   mute/solo, audio clips (embedded audio is extracted to `<name> Media/` next to the file),
-  MIDI clips, clip loops, tempo and time-signature automation, plug-in references. Also
+  MIDI clips, clip loops, tempo and time-signature automation, arrangement markers, plug-in references. Also
   **exported** (Save As → DAWproject) with the audio embedded, to take a project into those DAWs.
 - **Ableton Live** (`.als`, Live 9–12): audio and MIDI tracks, arrangement clips with
-  start/loop markers, mixer, tempo automation, plug-in references. Live's own devices become
+  start/loop markers, mixer, tempo automation, locators (as markers), plug-in references. Live's own devices become
   the built-in synth/drums or are skipped; session-view clips aren't imported.
 - **Logic Pro**: `.logicx` is a closed format and can't be opened. In Logic choose
   File → Export → Project to Final Cut Pro XML and open the `.fcpxml`: audio regions arrive on

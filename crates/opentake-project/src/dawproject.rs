@@ -6,7 +6,7 @@
 //! flattened; the master channel sets the master volume), volume/pan/mute/solo, plug-in
 //! references (by name and id; their states aren't applied), audio clips (embedded audio
 //! is extracted next to the project; warped clips play at their original speed), MIDI
-//! clips with notes, clip loops, nested clip timelines. Not imported: other automation,
+//! clips with notes, clip loops, nested clip timelines, arrangement markers. Not imported: other automation,
 //! sends/returns, fades, built-in devices of the other DAW, the clip launcher.
 
 use std::collections::HashMap;
@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use roxmltree::Node;
 
 use crate::import::{ImportError, Imported, QuarterTempo, audio_clip, db_to_gain, find_media, named_plugin, resolve_path, synth_slot};
+use crate::marker::Marker;
 use crate::model::{MidiClip, Note, PluginFormat, PluginSlot, Project, Track};
 use crate::tempo::TempoMap;
 
@@ -108,6 +109,18 @@ pub fn parse(xml: &str, media: &mut dyn FnMut(Node) -> Result<PathBuf, String>) 
         }
     }
     tempo.apply(&mut project);
+
+    if let Some(markers) = arrangement.and_then(|a| child(a, "Markers")) {
+        let map = project.tempo_map();
+        let in_secs = seconds || markers.attribute("timeUnit") == Some("seconds");
+        let imported = markers.children().filter(|n| n.has_tag_name("Marker")).filter_map(|m| {
+            let t = attr_f64(m, "time")?;
+            let color = m.attribute("color").and_then(hex_color);
+            Some(Marker { color, ..Marker::new(if in_secs { t } else { map.secs_at(t) }, m.attribute("name").unwrap_or("Marker")) })
+        });
+        project.markers = imported.collect();
+        project.tidy_markers();
+    }
 
     let mut ctx = Ctx { map: project.tempo_map(), tracks: Vec::new(), ids: HashMap::new(), warnings, media, plugin_states: false };
     if let Some(structure) = child(root, "Structure") {
@@ -392,6 +405,13 @@ fn attr_f64(node: Node, name: &str) -> Option<f64> {
     node.attribute(name)?.trim().parse().ok().filter(|v: &f64| v.is_finite())
 }
 
+/// "#rrggbb" (alpha, if any, ignored).
+fn hex_color(s: &str) -> Option<[u8; 3]> {
+    let h = s.trim().trim_start_matches('#');
+    let byte = |i: usize| h.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok());
+    Some([byte(0)?, byte(2)?, byte(4)?])
+}
+
 fn signature(node: Node) -> Option<(u32, u32)> {
     Some((node.attribute("numerator")?.parse().ok()?, node.attribute("denominator")?.parse().ok()?))
 }
@@ -576,6 +596,14 @@ pub fn project_xml(project: &Project, files: &HashMap<PathBuf, String>) -> Strin
             }
             x.push_str("    </TimeSignatureAutomation>\n");
         }
+    }
+    if !project.markers.is_empty() {
+        let _ = writeln!(x, "    <Markers timeUnit=\"beats\" id=\"{}\">", next());
+        for m in &project.markers {
+            let color = m.color.map(|[r, g, b]| format!(" color=\"#{r:02x}{g:02x}{b:02x}\"")).unwrap_or_default();
+            let _ = writeln!(x, "      <Marker time=\"{}\" name=\"{}\"{color}/>", q(m.time_secs), esc(&m.name));
+        }
+        x.push_str("    </Markers>\n");
     }
     x.push_str("  </Arrangement>\n  <Scenes/>\n</Project>\n");
     x
@@ -798,6 +826,8 @@ mod tests {
             controllers: Vec::new(),
         });
         p.tracks = vec![audio, keys];
+        p.markers = vec![Marker::new(2.0, "Verse & Co"), Marker { color: Some([255, 0, 128]), ..Marker::new(10.0, "Chorus") }];
+        p.tidy_markers();
 
         let file = dir.join("Song.dawproject");
         let warnings = save(&p, &file).unwrap();
@@ -817,6 +847,9 @@ mod tests {
         let n = m.notes[0];
         assert!((n.start_secs - 0.5).abs() < 1e-9 && (n.length_secs - 7.0).abs() < 1e-9 && n.pitch == 60 && n.velocity == 100);
         assert!(!back.warnings.iter().any(|w| w.contains("original speed")), "{:?}", back.warnings);
+        // Markers, in beats in the file, come back at their times (across the tempo change).
+        let markers: Vec<_> = q.markers.iter().map(|m| ((m.time_secs * 1e6).round() / 1e6, m.name.as_str(), m.color)).collect();
+        assert_eq!(markers, vec![(2.0, "Verse & Co", None), (10.0, "Chorus", Some([255, 0, 128]))]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

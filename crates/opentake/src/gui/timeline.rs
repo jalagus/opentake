@@ -1,6 +1,7 @@
 //! Arrangement view: ruler, track headers, the region timeline (audio and MIDI) and the
 //! automation lanes shown under each track.
 
+mod markers;
 mod takes;
 
 use std::sync::Arc;
@@ -259,6 +260,12 @@ pub struct View {
     /// A swipe across a take lane, and how many there have been (for undo merge keys).
     swipe: Option<takes::Swipe>,
     swipes: u64,
+    /// The marker track: a marker being dragged, the selected marker (⌫ deletes it), one
+    /// being renamed in place, and where the last right-click was (time, marker there).
+    marker_drag: Option<markers::MarkerDrag>,
+    pub marker_sel: Option<u32>,
+    marker_edit: Option<markers::MarkerEdit>,
+    marker_context: (f64, Option<u32>),
 }
 
 /// An automation point: whose lanes (a track, or `None` for the master), lane (index into
@@ -306,6 +313,10 @@ impl Default for View {
             auto_context: None,
             swipe: None,
             swipes: 0,
+            marker_drag: None,
+            marker_sel: None,
+            marker_edit: None,
+            marker_context: (0.0, None),
         }
     }
 }
@@ -433,9 +444,9 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
     let playhead = snap.status.position_secs;
     ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
 
-    // Ruler row: tools on the left, bar ruler and tempo track on the right.
+    // Ruler row: tools on the left, bar ruler, marker track and tempo track on the right.
     let map = project.tempo_map();
-    let ruler_h = RULER_H + TEMPO_ROW_H;
+    let ruler_h = RULER_H + markers::MARKER_ROW_H + TEMPO_ROW_H;
     ui.horizontal(|ui| {
         let (bar, _) = ui.allocate_exact_size(vec2(HEADER_W, ruler_h), Sense::hover());
         ui.painter().rect_filled(bar, 0.0, theme::BG_HEADER);
@@ -445,6 +456,8 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
             toolbar(app, ui, snap);
         });
         ui.painter().text(pos2(bar.right() - 10.0, bar.bottom() - TEMPO_ROW_H / 2.0), Align2::RIGHT_CENTER, "Tempo", FontId::proportional(10.0), theme::TEXT_FAINT);
+        let marker_row = Rect::from_min_size(pos2(bar.left(), bar.top() + RULER_H), vec2(bar.width(), markers::MARKER_ROW_H));
+        markers::marker_header(app, ui, marker_row, snap);
         // An imported song with its own tempo the project doesn't follow: offer to adopt it.
         if snap.song_tempo_differs {
             let at = Rect::from_min_size(pos2(bar.left() + 8.0, bar.bottom() - TEMPO_ROW_H + 1.0), vec2(118.0, TEMPO_ROW_H - 2.0));
@@ -463,7 +476,9 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
         let rect = Rect::from_min_size(full_rect.min, vec2(full_rect.width(), RULER_H));
         app.view.x_range = rect.x_range();
         draw_ruler(&painter, rect, &app.view, &map);
-        tempo_track(app, ui, &painter, Rect::from_min_max(pos2(rect.left(), rect.bottom()), full_rect.max), project, &map, playhead);
+        let marker_rect = Rect::from_min_size(pos2(rect.left(), rect.bottom()), vec2(rect.width(), markers::MARKER_ROW_H));
+        markers::marker_track(app, ui, &painter, marker_rect, project, playhead);
+        tempo_track(app, ui, &painter, Rect::from_min_max(pos2(rect.left(), marker_rect.bottom()), full_rect.max), project, &map, playhead);
         let cycle_rect = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + CYCLE_H));
         cycle_strip(app, ui, &painter, cycle_rect, project);
         let seek_rect = Rect::from_min_max(pos2(rect.left(), cycle_rect.bottom()), rect.max);
@@ -515,6 +530,7 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
                 painter.rect_filled(rect, 0.0, bg);
                 draw_grid(&painter, rect, &app.view, &map, grid);
                 draw_loop_tint(&painter, rect, &app.view, project);
+                markers::draw_marker_lines(&painter, rect, &app.view, project);
                 painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
                 // A bus has no regions: a tinted lane that names what it sums.
                 if track.bus {
@@ -607,6 +623,7 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
             let (resp, painter) = ui.allocate_painter(vec2(ui.available_width(), height), Sense::click());
             draw_grid(&painter, resp.rect, &app.view, &map, grid);
             draw_loop_tint(&painter, resp.rect, &app.view, project);
+            markers::draw_marker_lines(&painter, resp.rect, &app.view, project);
             draw_playhead(&painter, resp.rect, &app.view, playhead, false);
             painter.text(
                 resp.rect.center_top() + vec2(0.0, 36.0),

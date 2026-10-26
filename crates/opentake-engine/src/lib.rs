@@ -29,4 +29,4 @@ pub use engine::{AudioFormat, ExportOptions, ExportReport, ExportedFile, LevelRe
 pub use engine::{CLIP_GAIN_DB, CROSSFADE_SECS, FadeUpdate, JOIN_SECS, FlexJob, FlexRender, MAX_SEMITONES, PitchStretch, STRETCH_RANGE};
 pub use engine::{MidiInputs, Recorded, RecordedMidi, RecordingStarted};
 pub use engine::{Engine, EngineStatus, HistoryInfo, MidiClipUpdate, ParamView, RegionData, RegionKind, RegionRef, SendUpdate, SlotRef, TrackUpdate, Waveform};
-pub use engine::{AudioUnitInfo, AutomationParam, LaneOwner, PluginEditor};
+pub use engine::{AudioUnitInfo, AutomationParam, LaneOwner, MarkerUpdate, PluginEditor};

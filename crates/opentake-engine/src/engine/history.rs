@@ -88,6 +88,7 @@ impl Engine {
             self.project.assign_slot_ids();
             self.project.assign_send_ids();
             self.project.prune_automation();
+            self.project.tidy_markers();
         }
         // Bus tracks only mix: whatever path an edit took, it can't give one regions or input.
         if let (Ok(_), Some(bus)) = (&result, self.project.tracks.iter().find(|t| t.bus && (!t.clips.is_empty() || !t.midi_clips.is_empty() || t.instrument.is_some() || t.armed || t.monitor_input))) {

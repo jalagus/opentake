@@ -47,7 +47,9 @@ instrument tracks; export_midi_file writes the MIDI regions back out.
 
 Tempo: set_tempo sets the opening tempo/signature; set_tempo_map adds tempo and time-signature changes. \
 Region and note times are always seconds; get_tempo_map and convert_time translate between seconds and \
-bars/beats. Effects: insert_plugin with \"eq\", \"comp\", \"multiband\", \"limiter\", \"delay\", \"reverb\", \"gate\", \"deesser\", \"chorus\" or \"phaser\" adds a built-in effect to a track (a reverb usually goes on a bus at 100% wet); \
+bars/beats. Markers: list_markers, add_marker (seconds or bar/beat; sections like \"Verse\"), update_marker, \
+remove_marker; goto_marker moves the playhead to one and cycle_marker loops its section (to the next marker). \
+Guitar Pro sections, MIDI file markers and the other DAWs' markers come in as markers. Effects: insert_plugin with \"eq\", \"comp\", \"multiband\", \"limiter\", \"delay\", \"reverb\", \"gate\", \"deesser\", \"chorus\" or \"phaser\" adds a built-in effect to a track (a reverb usually goes on a bus at 100% wet); \
 insert_master_plugin puts effects on the master bus (address them with master: true); VST3 and, on macOS, Audio Unit plug-ins work too (scan_plugins lists them). Plug-in delay \
 (e.g. the limiter's look-ahead) is compensated automatically. Buses: add_bus (with tracks to group them) \
 creates a bus track; update_track output routes a track to a bus index or \"master\"; effects on the bus \
@@ -493,6 +495,104 @@ pub struct LoopArgs {
     pub start_secs: Option<f64>,
     /// Loop end in seconds; omit to keep.
     pub end_secs: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MarkerRefArgs {
+    /// Zero-based marker index (markers are in time order, as list_markers shows them).
+    pub index: Option<usize>,
+    /// Or the marker's name (case-insensitive; the first one by time).
+    pub marker_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MarkerTimeArgs {
+    /// Position in seconds...
+    pub time_secs: Option<f64>,
+    /// ...or 1-based bar (and beat) on the tempo map.
+    pub bar: Option<i64>,
+    /// 1-based beat (fractions allowed); defaults to 1.
+    pub beat: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AddMarkerArgs {
+    #[serde(flatten)]
+    pub at: MarkerTimeArgs,
+    /// Defaults to "Marker N".
+    pub name: Option<String>,
+    /// "#rrggbb" or red, orange, yellow, green, teal, blue, purple, pink.
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateMarkerArgs {
+    #[serde(flatten)]
+    pub marker: MarkerRefArgs,
+    /// Move it (seconds, or bar/beat).
+    #[serde(flatten)]
+    pub at: MarkerTimeArgs,
+    /// New name.
+    pub name: Option<String>,
+    /// "#rrggbb", a colour name, or "none" for the default colour.
+    pub color: Option<String>,
+}
+
+impl MarkerTimeArgs {
+    /// The time given, in seconds (`None` when neither secs nor bar is).
+    fn secs(&self, e: &Engine) -> Option<f64> {
+        self.time_secs.or_else(|| Some(e.project().tempo_map().secs_of(self.bar?.max(1), self.beat.unwrap_or(1.0))))
+    }
+}
+
+/// The id of the marker an agent names (by index or name).
+fn find_marker(e: &Engine, r: &MarkerRefArgs) -> anyhow::Result<u32> {
+    let markers = &e.project().markers;
+    let found = match (r.index, r.marker_name.as_deref()) {
+        (Some(i), _) => markers.get(i).ok_or_else(|| anyhow::anyhow!("no marker {i} (there are {})", markers.len()))?,
+        (None, Some(name)) => markers.iter().find(|m| m.name.eq_ignore_ascii_case(name.trim())).ok_or_else(|| anyhow::anyhow!("no marker named '{name}'"))?,
+        _ => anyhow::bail!("give the marker's index or marker_name"),
+    };
+    Ok(found.id)
+}
+
+/// A colour by name or "#rrggbb"; `Ok(None)` for "none"/"default".
+fn parse_marker_color(s: &str) -> anyhow::Result<Option<[u8; 3]>> {
+    let s = s.trim().to_lowercase();
+    if matches!(s.as_str(), "" | "none" | "default") {
+        return Ok(None);
+    }
+    if let Some((_, rgb)) = opentake_engine::project::MARKER_COLORS.iter().find(|(n, _)| *n == s) {
+        return Ok(Some(*rgb));
+    }
+    let hex = s.trim_start_matches('#');
+    let byte = |i: usize| hex.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok());
+    match (hex.len(), byte(0), byte(2), byte(4)) {
+        (6, Some(r), Some(g), Some(b)) => Ok(Some([r, g, b])),
+        _ => anyhow::bail!("color must be #rrggbb, none, or one of red, orange, yellow, green, teal, blue, purple, pink"),
+    }
+}
+
+fn markers_json(e: &Engine) -> serde_json::Value {
+    let p = e.project();
+    let map = p.tempo_map();
+    let list: Vec<_> = p
+        .markers
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let pos = map.position(m.time_secs);
+            let mut v = json!({ "index": i, "name": m.name, "time_secs": (m.time_secs * 1e4).round() / 1e4, "bar": pos.bar, "beat": ((pos.beat as f64 + pos.fraction) * 1e3).round() / 1e3 });
+            if let Some((_, end)) = p.marker_range(i) {
+                v["end_secs"] = json!((end * 1e4).round() / 1e4);
+            }
+            if let Some([r, g, b]) = m.color {
+                v["color"] = json!(format!("#{r:02x}{g:02x}{b:02x}"));
+            }
+            v
+        })
+        .collect();
+    json!(list)
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1310,6 +1410,67 @@ impl DawServer {
         .await
     }
 
+    #[tool(description = "List the markers in time order: index, name, time (seconds and bar/beat), end_secs (where its section ends: the next marker, or the song end) and colour.")]
+    async fn list_markers(&self) -> ToolResult {
+        self.with_engine(|e| Ok(markers_json(e))).await
+    }
+
+    #[tool(description = "Add a marker (a named point on the marker track, e.g. \"Verse\") at time_secs or bar/beat, or at the playhead. Undoable. Returns the markers.")]
+    async fn add_marker(&self, Parameters(a): Parameters<AddMarkerArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let color = a.color.as_deref().map(parse_marker_color).transpose()?.flatten();
+            let at = match a.at.secs(e) {
+                Some(t) => t,
+                None => e.status().position_secs,
+            };
+            e.add_marker(at, a.name, color)?;
+            Ok(markers_json(e))
+        })
+        .await
+    }
+
+    #[tool(description = "Rename, move (time_secs or bar/beat) or recolour a marker, found by index or marker_name. Undoable. Returns the markers.")]
+    async fn update_marker(&self, Parameters(a): Parameters<UpdateMarkerArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let id = find_marker(e, &a.marker)?;
+            let color = a.color.as_deref().map(parse_marker_color).transpose()?;
+            e.update_marker(id, opentake_engine::MarkerUpdate { time_secs: a.at.secs(e), name: a.name, color }, None)?;
+            Ok(markers_json(e))
+        })
+        .await
+    }
+
+    #[tool(description = "Delete a marker (by index or marker_name). Undoable.")]
+    async fn remove_marker(&self, Parameters(a): Parameters<MarkerRefArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let id = find_marker(e, &a)?;
+            e.remove_marker(id)?;
+            Ok(markers_json(e))
+        })
+        .await
+    }
+
+    #[tool(description = "Move the playhead to a marker (by index or marker_name).")]
+    async fn goto_marker(&self, Parameters(a): Parameters<MarkerRefArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let id = find_marker(e, &a)?;
+            let m = e.project().markers.iter().find(|m| m.id == id).cloned().ok_or_else(|| anyhow::anyhow!("no such marker"))?;
+            e.seek(m.time_secs)?;
+            Ok(json!({ "name": m.name, "position_secs": m.time_secs }))
+        })
+        .await
+    }
+
+    #[tool(description = "Set the cycle (loop) to a marker's section, from the marker to the next one (the song end for the last), and turn cycling on.")]
+    async fn cycle_marker(&self, Parameters(a): Parameters<MarkerRefArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let id = find_marker(e, &a)?;
+            let (start, end) = e.cycle_marker(id)?;
+            Ok(json!({ "enabled": true, "start_secs": start, "end_secs": end }))
+        })
+        .await
+    }
+
     #[tool(description = "Read a Guitar Pro 7/8 file (.gp) and list its tracks, tempo and length, without importing.")]
     async fn inspect_guitar_pro(&self, Parameters(a): Parameters<GuitarProPathArgs>) -> ToolResult {
         let path = PathBuf::from(a.path);
@@ -1903,6 +2064,23 @@ impl ServerHandler for DawServer {
 mod compact_tests {
     use super::*;
     use opentake_engine::project::{MidiClip, Project, Track};
+
+    #[test]
+    fn markers_are_found_by_index_or_name_and_colours_parse() {
+        let mut e = Engine::new();
+        e.add_marker(4.0, Some("Verse".into()), None).unwrap();
+        e.add_marker(0.0, Some("Intro".into()), Some([255, 0, 0])).unwrap();
+        let by = |index: Option<usize>, name: Option<&str>| find_marker(&e, &MarkerRefArgs { index, marker_name: name.map(Into::into) });
+        assert_eq!(by(Some(1), None).unwrap(), by(None, Some("verse")).unwrap(), "index in time order, names case-insensitive");
+        assert!(by(Some(2), None).is_err() && by(None, Some("Bridge")).is_err() && by(None, None).is_err());
+        assert_eq!(parse_marker_color("Blue").unwrap(), Some([86, 140, 230]));
+        assert_eq!(parse_marker_color("#0a0B0c").unwrap(), Some([10, 11, 12]));
+        assert_eq!(parse_marker_color("none").unwrap(), None);
+        assert!(parse_marker_color("#12345").is_err());
+        let list = markers_json(&e);
+        assert_eq!((list[0]["name"].as_str(), list[0]["color"].as_str(), list[0]["end_secs"].as_f64()), (Some("Intro"), Some("#ff0000"), Some(4.0)));
+        assert_eq!((list[1]["bar"].as_i64(), list[1]["beat"].as_f64()), (Some(3), Some(1.0)));
+    }
 
     #[test]
     fn project_json_replaces_notes_with_counts_unless_asked() {

@@ -2,7 +2,8 @@
 //!
 //! Imported: tempo, time signature and tempo automation (as steps), audio and MIDI tracks
 //! (name, volume, pan, track on/off, solo), arrangement audio clips (sample, position,
-//! start/loop markers, gain, disabled) and MIDI clips with notes, plug-in references.
+//! start/loop markers, gain, disabled) and MIDI clips with notes, plug-in references,
+//! arrangement locators (as markers).
 //! Warped clips play at their original speed. Not imported: session-view clips, group and
 //! return tracks (tracks inside groups come in flat), Live's own devices and automation.
 
@@ -12,6 +13,7 @@ use std::path::{Path, PathBuf};
 use roxmltree::Node;
 
 use crate::import::{ImportError, Imported, QuarterTempo, audio_clip, drums_slot, find_media, named_plugin, synth_slot};
+use crate::marker::Marker;
 use crate::model::{MidiClip, Note, PluginFormat, Project, Track};
 use crate::tempo::TempoMap;
 
@@ -73,6 +75,10 @@ pub fn from_str(xml: &str, project_dir: &Path) -> Result<Imported, ImportError> 
     }
 
     let map = project.tempo_map();
+    // Locators (Live's markers): <Locators><Locators><Locator><Time/><Name/>, times in beats.
+    let locators = at(set, &["Locators", "Locators"]).into_iter().flat_map(|l| l.children()).filter(|n| n.has_tag_name("Locator"));
+    project.markers = locators.filter_map(|l| Some(Marker::new(map.secs_at(num(l, &["Time"])?.max(0.0)), value(l, &["Name"]).unwrap_or_default()))).collect();
+    project.tidy_markers();
     let mut skipped = Vec::new();
     for node in child(set, "Tracks").into_iter().flat_map(|t| t.children()).filter(Node::is_element) {
         let name = value(node, &["Name", "EffectiveName"]).filter(|n| !n.is_empty()).or_else(|| value(node, &["Name", "UserName"])).unwrap_or("Track").to_string();
@@ -459,6 +465,10 @@ mod tests {
         </Mixer>
       </DeviceChain>
     </MasterTrack>
+    <Locators><Locators>
+      <Locator Id="1"><LomId Value="0" /><Time Value="24" /><Name Value="Outro" /><Annotation Value="" /><IsSongStart Value="false" /></Locator>
+      <Locator Id="0"><LomId Value="0" /><Time Value="8" /><Name Value="Verse" /><Annotation Value="" /><IsSongStart Value="false" /></Locator>
+    </Locators></Locators>
   </LiveSet>
 </Ableton>"#;
 
@@ -499,6 +509,8 @@ mod tests {
         assert_eq!(notes, vec![(0.0, 0.5, 60, 100), (1.5, 0.5, 60, 90)]);
         assert_eq!(p.tracks[2].instrument.as_ref().map(|i| i.path.as_str()), Some("drums"));
 
+        // Locators: beat 8 = 4 s; beat 24 is 8 beats past the drop to 60 bpm at beat 16 = 16 s.
+        assert_eq!(p.markers.iter().map(|m| (m.time_secs, m.name.as_str())).collect::<Vec<_>>(), vec![(4.0, "Verse"), (16.0, "Outro")]);
         assert!(warnings.iter().any(|w| w.contains("Eq8")), "{warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("A-Reverb")), "{warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("session view")), "{warnings:?}");

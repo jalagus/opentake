@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use opentake_project::guitarpro::{self, Score, TrackKind, timeline};
-use opentake_project::{Controller, ControllerEvent, ControllerLane, MidiClip, Note, PluginFormat, PluginSlot, TabBar, TabLayout, TabPos, TempoChange, TempoMark};
+use opentake_project::{Controller, ControllerEvent, ControllerLane, Marker, MidiClip, Note, PluginFormat, PluginSlot, TabBar, TabLayout, TabPos, TempoChange, TempoMark};
 use serde::Serialize;
 
 use super::Engine;
@@ -292,6 +292,9 @@ impl Engine {
                 let cmd = e.tempo_command();
                 e.send(cmd)?;
             }
+            // Sections ("A Intro", "B Verse"...) become markers, on every pass through them;
+            // once however many of the song's tracks come in.
+            e.project.merge_markers(tab_bars.iter().filter_map(|b| Some(Marker::new(start + b.start_secs, b.section.clone()?))));
             let mut created = Vec::new();
             for (&gp_track, mut slot) in wanted.iter().zip(slots) {
                 let gp = &score.tracks[gp_track];
@@ -376,6 +379,8 @@ mod tests {
         assert_eq!(tab.tuning, vec![40, 45, 50, 55, 59, 64]);
         assert_eq!(tab.bars.iter().map(|b| (b.number, b.start_secs)).collect::<Vec<_>>(), vec![(1, 0.0), (2, 2.0), (1, 4.0), (3, 6.0), (4, 8.0)]);
         assert_eq!(tab.bars[0].section.as_deref(), Some("A Intro"));
+        // Sections are markers, at each pass through the repeat.
+        assert_eq!(p.markers.iter().map(|m| (m.time_secs, m.name.as_str())).collect::<Vec<_>>(), vec![(0.0, "A Intro"), (4.0, "A Intro")]);
         assert_eq!(clip.notes.iter().find(|n| n.pitch == 45).and_then(|n| n.tab), Some(TabPos { string: 0, fret: 5 }));
         assert!(p.tracks[2].midi_clips[0].tab.is_none());
         // The bend (a whole tone, bar 3 beat 4) and the wide vibrato play as pitch bend, in
@@ -444,6 +449,10 @@ mod tests {
         assert_eq!(created.len(), 1);
         assert_eq!(e.project().tracks[0].name, "Drums");
         assert_eq!(e.project().tracks[0].midi_clips[0].position_secs, 4.0);
+        assert_eq!(e.project().markers.iter().map(|m| m.time_secs).collect::<Vec<_>>(), vec![4.0, 8.0], "sections move with the song");
+        // Importing the song's other track doesn't add its sections again.
+        e.import_guitar_pro(Path::new(FIXTURE), &GuitarProImport { tracks: Some(vec![0]), ..opts }).unwrap();
+        assert_eq!(e.project().markers.len(), 2);
         let bad = GuitarProImport { tracks: Some(vec![7]), ..Default::default() };
         assert!(e.import_guitar_pro(Path::new(FIXTURE), &bad).is_err());
     }

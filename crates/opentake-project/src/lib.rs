@@ -11,6 +11,7 @@ pub mod fade;
 pub mod fcpxml;
 pub mod guitarpro;
 pub mod import;
+pub mod marker;
 pub mod model;
 pub mod rpp;
 pub mod sends;
@@ -21,6 +22,7 @@ pub use automation::{AutomationLane, AutomationMode, AutomationPoint, Automation
 pub use comp::{COMP_JOIN_SECS, CompSegment, played_clips};
 pub use controller::{BEND_CENTRE, CONTROLLER_SLOTS, Controller, ControllerEvent, ControllerLane};
 pub use fade::{Fade, FadeCurve, effective_fades};
+pub use marker::{MARKER_COLORS, Marker};
 pub use model::*;
 pub use sends::{AuxSend, MAX_SEND_GAIN};
 pub use sidechain::SideChain;
