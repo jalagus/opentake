@@ -64,13 +64,14 @@ impl Engine {
 
     /// Render what a take folder plays (its comp, crossfades at the joins, pitch/stretch) into
     /// a new file and make the folder a plain region playing it, keeping its place, gain and
-    /// fades. One undo step; the take files stay on disk.
+    /// fades (a looped folder renders its content and keeps looping it). One undo step; the
+    /// take files stay on disk.
     pub fn flatten_comp(&mut self, track: usize, clip: usize) -> Result<Clip> {
         let (index, c) = self.folder(track, clip)?;
         let c = c.clone();
         // Gain and fades stay on the region, so render without them.
-        let bare = Clip { gain: 1.0, mute: false, fade_in: Fade::default(), fade_out: Fade::default(), ..c.clone() };
-        let (file, _) = self.bounce(&[bare], c.position_secs, c.position_secs + c.length_secs, "comp")?;
+        let bare = Clip { gain: 1.0, mute: false, fade_in: Fade::default(), fade_out: Fade::default(), length_secs: c.content_secs(), looped: None, ..c.clone() };
+        let (file, _) = self.bounce(&[bare], c.position_secs, c.position_secs + c.content_secs(), "comp")?;
         let flat = Clip {
             file,
             source_offset_secs: 0.0,

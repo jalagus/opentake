@@ -73,7 +73,7 @@ impl Engine {
         data.ok_or_else(|| anyhow::anyhow!("track {} has no {:?} region at index {}", r.track, r.kind, r.index))
     }
 
-    fn resync_tracks(&mut self, tracks: BTreeSet<usize>) -> Result<()> {
+    pub(super) fn resync_tracks(&mut self, tracks: BTreeSet<usize>) -> Result<()> {
         for t in tracks {
             self.resync_clips(t)?;
             self.resync_midi(t)?;
@@ -82,7 +82,7 @@ impl Engine {
     }
 
     /// Remove regions (in an order that keeps the remaining indices valid).
-    fn remove_regions_impl(&mut self, regions: &[RegionRef]) {
+    pub(super) fn remove_regions_impl(&mut self, regions: &[RegionRef]) {
         let mut sorted: Vec<RegionRef> = regions.to_vec();
         sorted.sort();
         sorted.dedup();
@@ -95,7 +95,7 @@ impl Engine {
         }
     }
 
-    fn insert_region_impl(&mut self, track: usize, data: RegionData) -> Result<RegionRef> {
+    pub(super) fn insert_region_impl(&mut self, track: usize, data: RegionData) -> Result<RegionRef> {
         let t = &mut self.project.tracks[track];
         Ok(match data {
             RegionData::Audio(c) => {

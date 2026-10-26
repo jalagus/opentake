@@ -32,9 +32,11 @@ you watch the changes appear live — and undo anything you don't like.
   with sustain pedal, latency-compensated note placement and cycle overdub
 - ✂️ Region editing: select, move, copy, split, trim, snap, cycle/loop; region gain and normalize;
   fades, crossfades and click-free merging of regions
+- 🔂 Region looping (Logic's loop handle): drag a region's upper-right corner and its audio or
+  MIDI repeats, sample-exact, up to there; L loops up to the next region
 - 🎚️ Full mixer, metronome, undo/redo for everything
 - 💾 Export the mix and stems to WAV or FLAC, faster than real time
-- 🤖 MCP server (stdio or HTTP) with 98 tools — the agent and you share one session
+- 🤖 MCP server (stdio or HTTP) with 99 tools — the agent and you share one session
 - 📂 Its own `.otp` project files (double-click to open), Reaper `.rpp` and DAWproject (Bitwig, Studio One, Cubase) projects
 - 🔀 Imports Ableton Live sets (`.als`), Ardour sessions, and Logic Pro projects exported as Final Cut Pro XML
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
@@ -220,6 +222,13 @@ agent.
   take, crossfaded over 10 ms at every join. The lit parts of each lane are what plays; click a
   lane's header to play that take all through. Right-click the folder for Flatten Comp (render
   the comp into one region) and Clear Comp. Moves, trims, splits and stretches keep the comp.
+- **Looping**: hover a region's upper-right corner (the end of its name bar) for the loop
+  handle and drag it right: the region's content repeats up to there (snapped), drawn as
+  fainter copies with notches at each loop boundary. Right-click → Loop (or L, or the
+  inspector's Loop box) loops it up to the next region on the track, and off again. Dragging
+  the end edge changes how many repeats play; trimming the start shortens the loop; splitting
+  keeps both parts looping as they sounded. Convert Loops to Regions turns the repeats into
+  real regions. The piano roll edits the first pass and shows the repeats as ghost notes.
 - **Latency compensation**: recordings land where you played them. Audio Settings → Measure
   Latency checks the device's figure with a loopback (a cable, or speakers into a microphone).
 - **Pitch and stretch**: transpose an audio region (semitones and cents) and time-stretch it,
@@ -265,7 +274,7 @@ of the tool calls behind them):
 `get_project`, `get_midi_notes`, `analyze_mix`, `export_audio`, `new_project`, `load_project`, `save_project`, `set_tempo`, `set_tempo_map`, `get_tempo_map`, `convert_time`,
 `set_master_volume`, `set_metronome`, `set_auto_input_monitoring`, `set_count_in`, `set_loop`,
 `list_markers`, `add_marker`, `update_marker`, `remove_marker`, `goto_marker`, `cycle_marker`,
-`add_track`, `add_bus`, `add_send`, `update_send`, `remove_send`, `move_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `set_clip_gain`, `normalize_clip`, `set_clip_pitch_stretch`, `set_clip_fades`, `crossfade_clips`, `merge_clips`, `remove_clip`,
+`add_track`, `add_bus`, `add_send`, `update_send`, `remove_send`, `move_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `set_clip_gain`, `normalize_clip`, `set_clip_pitch_stretch`, `set_clip_fades`, `crossfade_clips`, `merge_clips`, `set_clip_loop`, `remove_clip`,
 `select_take`, `delete_take`, `comp_take`, `clear_comp`, `flatten_comp`,
 `play`, `stop`, `seek`, `record`, `list_midi_inputs`, `set_midi_inputs`,
 `scan_plugins`, `insert_plugin`, `remove_plugin`, `insert_master_plugin`, `remove_master_plugin`, `set_plugin_bypass`, `open_plugin_editor`,
@@ -308,7 +317,8 @@ returns the new MIDI regions too.
 `.json` files from earlier versions still open).
 Supported: tempo/time signature and the tempo map (tempo envelope), sample rate, master volume, loop range (`LOOP`/`SELECTION`), track name/volume/pan/mute/solo/
 record-arm/input/monitoring, audio items (position, length, source offset, gain, mute,
-play rate / pitch, fades (`FADEIN`/`FADEOUT`, shapes mapped to the nearest), media file), FX chain references, buses (written as receives; folders and receives
+play rate / pitch, fades (`FADEIN`/`FADEOUT`, shapes mapped to the nearest), media file,
+item looping (`LOOP 1`: the whole source loops; exported as one item per pass)), FX chain references, buses (written as receives; folders and receives
 from tracks with the master send off import as buses), sends (receives with their volume, mute
 and mode: post-fader, or pre-fader; Reaper's pre-FX loads as pre-fader), volume/pan/mute envelopes
 (`VOLENV2`/`PANENV2`/`MUTEENV`) and markers (`MARKER`; a region comes in as a marker at its start). VST3 plugins in a Reaper project are matched by
@@ -394,6 +404,10 @@ automation other than tempo, sends/returns and fades aren't imported.
 - Regions: automatic crossfades only cover partial overlaps (a region lying inside another just
   adds to it), and merged regions bake their fades in. Fade curves are mapped to Reaper's
   nearest shapes, and fades aren't imported from other DAWs.
+- Region loops: no crossfades at the loop joins (as in Logic; loop lengths are whole samples,
+  so passes butt without gaps); at most 1024 passes per region. Reaper loops a whole source
+  file, so `.rpp` and DAWproject export write a looped region as one item per pass. The tab view
+  shows a looped region's first pass only.
 - Buses: stems export what reaches the master: a bus is one stem with its sources and what
   sends bring to it inside, and a track's stem is its dry signal. Pre-fader sends ignore the
   fader and pan but not the track's mute; sends can't be reordered.

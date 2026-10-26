@@ -394,6 +394,7 @@ fn render_midi(track: &opentake_project::Track, inst: &mut dyn Processor, lanes:
     let total = start + len;
     let mut events: Vec<(usize, MidiData)> = Vec::new();
     for c in track.midi_clips.iter().filter(|c| !c.mute) {
+        let c = c.unrolled();
         for n in c.notes.iter().filter(|n| n.start_secs < c.length_secs) {
             let on = ((c.position_secs + n.start_secs) * sr) as usize;
             let off = ((c.position_secs + (n.start_secs + n.length_secs).min(c.length_secs)) * sr) as usize;

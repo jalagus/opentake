@@ -192,6 +192,9 @@ pub(crate) enum Action {
     /// Open or close a take folder's take lanes.
     ShowTakes { track: usize, clip: usize, show: bool },
     TrimRegion { region: RegionRef, start: Option<f64>, end: Option<f64> },
+    /// Loop regions (or stop looping them), and turn looped regions' repeats into regions.
+    LoopRegions { regions: Vec<RegionRef>, to: opentake_engine::LoopTo },
+    ConvertLoops(Vec<RegionRef>),
     /// Pitch-shift / time-stretch an audio region.
     PitchStretch { track: usize, clip: usize, ps: opentake_engine::PitchStretch },
     MoveTrack { from: usize, to: usize },
@@ -832,6 +835,11 @@ impl DawApp {
                     }
                 }
             },
+            Action::LoopRegions { regions, to } => e.set_region_loop(&regions, to)?,
+            Action::ConvertLoops(regions) => {
+                // The passes are selected (other indices on their tracks shifted).
+                self.selection = e.convert_loops(&regions)?;
+            }
             Action::PitchStretch { track, clip, ps } => self.apply_pitch_stretch(e, track, clip, ps)?,
             Action::MoveTrack { from, to } => {
                 e.move_track(from, to)?;
@@ -1198,6 +1206,7 @@ impl DawApp {
         if tab {
             self.toggle_bottom(BottomTab::Tab);
         }
+        self.loop_shortcut(ui, snap);
     }
 
     /// Show automation under every track, or hide it if any track shows it (Logic's "A").
@@ -2241,6 +2250,7 @@ impl DawApp {
             }
         }
         self.region_inspector(ui, snap);
+        self.loop_inspector(ui, snap);
         ui.add_space(6.0);
         ui.separator();
 

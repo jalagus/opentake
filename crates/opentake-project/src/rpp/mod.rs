@@ -20,6 +20,7 @@ use crate::automation::{AutomationLane, AutomationMode, AutomationPoint, Automat
 use crate::fade::{Fade, FadeCurve};
 use crate::marker::Marker;
 use crate::model::{Clip, PluginFormat, PluginSlot, Project, Track};
+use crate::region_loop::RegionLoop;
 use crate::sends::AuxSend;
 use tree::{Entry, Node};
 
@@ -337,6 +338,9 @@ fn import_item(node: &Node, base_dir: &Path) -> Option<Clip> {
         fade_out: import_fade(node, "FADEOUT"),
         comp: Vec::new(),
         show_takes: false,
+        // Reaper loops the whole source; how long that is is known once it's read (see
+        // `Clip::loop_whole_source`).
+        looped: (node.value::<u8>("LOOP", 0).unwrap_or(0) != 0).then_some(RegionLoop { len_secs: 0.0, phase_secs: 0.0 }),
     })
 }
 
@@ -475,7 +479,10 @@ fn export_track(track: &Track, base_dir: &Path, receives: &[(usize, AuxSend)]) -
         }
     }
 
-    for clip in &track.clips {
+    // A looped region's content needn't be its whole source, which is what Reaper loops: one
+    // item per pass plays the same.
+    for clip in track.clips.iter().flat_map(Clip::loop_regions) {
+        let clip = &clip;
         let mut item = Node::new("ITEM");
         item.push_line(&["POSITION", &fmt_f64(clip.position_secs)]);
         item.push_line(&["LENGTH", &fmt_f64(clip.length_secs)]);
@@ -775,5 +782,28 @@ mod tests {
         let back = from_str(&text, base).unwrap();
         assert_eq!(back.tracks[0].instrument, p.tracks[0].instrument);
         assert_eq!(back.tracks[0].plugins, p.tracks[0].plugins);
+    }
+
+    #[test]
+    fn looped_items_import_as_source_loops_and_export_as_passes() {
+        let base = Path::new("/proj");
+        let p = from_str(&SAMPLE.replace("LOOP 0", "LOOP 1"), base).unwrap();
+        // How long the source is (what Reaper loops) is known once the file is read.
+        assert_eq!(p.tracks[0].clips[0].looped, Some(RegionLoop { len_secs: 0.0, phase_secs: 0.0 }));
+        let mut c = p.tracks[0].clips[0].clone();
+        c.loop_whole_source(4.0);
+        assert_eq!((c.source_offset_secs, c.looped), (0.0, Some(RegionLoop { len_secs: 4.0, phase_secs: 1.25 })));
+        let mut short = p.tracks[0].clips[0].clone();
+        short.loop_whole_source(20.0);
+        assert!(short.looped.is_none() && short.source_offset_secs == 1.25, "never wraps: plain");
+
+        // Exported, one item per pass: 2.75 s to the source's end, then 4 s, then the rest.
+        let mut q = Project::default();
+        let mut t = Track::new("Loop");
+        t.clips.push(c);
+        q.tracks.push(t);
+        let back = from_str(&to_string(&q, base), base).unwrap();
+        let items: Vec<_> = back.tracks[0].clips.iter().map(|c| (c.position_secs, c.length_secs, c.source_offset_secs, c.looped)).collect();
+        assert_eq!(items, [(2.5, 2.75, 1.25, None), (5.25, 4.0, 0.0, None), (9.25, 3.25, 0.0, None)]);
     }
 }

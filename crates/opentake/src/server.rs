@@ -61,7 +61,9 @@ set_sidechain keys an effect's detector from another track or bus (a kick duckin
 
 Regions: set_clip_fades gives an audio region fade-in/out curves; overlapping regions on a track \
 crossfade automatically, and crossfade_clips makes a short crossfade between two neighbours. \
-merge_clips joins regions into one new audio file without clicks at the joins.
+merge_clips joins regions into one new audio file without clicks at the joins. set_clip_loop loops \
+an audio or MIDI region: its content repeats until a time, for a number of passes, or up to the next \
+region (get_project shows each looped region's loop length and passes).
 
 Automation: list_automation_params shows what a track (or master: true) can automate — volume, \
 pan, mute, send levels and every plug-in parameter; add_automation_lane makes a lane, set_automation_points \
@@ -195,10 +197,28 @@ fn project_json(project: &opentake_engine::project::Project, include_notes: bool
                 t["sends"] = json!((0..track.sends.len()).map(|k| send_json(project, i, k)).collect::<Vec<_>>());
             }
             keys_json(project, Some(i), t.get_mut("plugins"));
+            loops_json(t, track);
         }
     }
     keys_json(project, None, v.get_mut("master_plugins"));
     v
+}
+
+/// Looped regions say how long the loop is and how many passes play.
+fn loops_json(t: &mut serde_json::Value, track: &opentake_engine::project::Track) {
+    let audio = track.clips.iter().map(|c| (c.looped, c.loop_passes().len()));
+    let midi = track.midi_clips.iter().map(|c| (c.looped, c.loop_passes().len()));
+    for (list, info) in [("clips", audio.collect::<Vec<_>>()), ("midi_clips", midi.collect())] {
+        for (c, (looped, passes)) in t.get_mut(list).and_then(|c| c.as_array_mut()).into_iter().flatten().zip(info) {
+            let (Some(l), Some(o)) = (looped, c.as_object_mut()) else { continue };
+            o.remove("looped");
+            let mut info = json!({ "loop_length_secs": l.len_secs, "passes": passes });
+            if l.phase_secs != 0.0 {
+                info["starts_into_loop_secs"] = json!(l.phase_secs);
+            }
+            o.insert("loop".into(), info);
+        }
+    }
 }
 
 /// Side chains by track index (the model stores session ids); a key from a gone track goes.
@@ -753,6 +773,24 @@ pub struct TrimClipArgs {
     pub start_secs: Option<f64>,
     /// New end on the timeline (seconds); omit to keep.
     pub end_secs: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ClipLoopArgs {
+    pub track: usize,
+    /// Region index within the track's audio clips or MIDI regions (see kind).
+    pub clip: usize,
+    /// "audio" (default) or "midi".
+    pub kind: Option<String>,
+    /// true (default) loops the region; false stops looping (it becomes its first pass).
+    pub enabled: Option<bool>,
+    /// Loop until this timeline time (seconds).
+    pub until_secs: Option<f64>,
+    /// Or this many passes in all (the content plus its repeats).
+    pub passes: Option<usize>,
+    /// Instead: turn the repeats of a looped region into separate regions.
+    #[serde(default)]
+    pub convert_to_regions: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1669,6 +1707,36 @@ impl DawServer {
         self.with_engine(move |e| e.trim_clip(a.track, a.clip, a.start_secs, a.end_secs)).await
     }
 
+    #[tool(description = "Loop a region (Logic's loop handle): its content — the region as it is, or its current loop — repeats until until_secs, for passes passes in all, or (neither given) until the next region on the track. enabled false stops looping; convert_to_regions turns the repeats into separate regions. Works for audio and MIDI regions (kind). A looped region's end (trim_clip) sets how many repeats play; get_project shows each looped region's loop length and passes. Undoable.")]
+    async fn set_clip_loop(&self, Parameters(a): Parameters<ClipLoopArgs>) -> ToolResult {
+        use opentake_engine::{LoopTo, RegionKind, RegionRef};
+        self.with_engine(move |e| {
+            let kind = match a.kind.as_deref().map(str::to_lowercase).as_deref() {
+                None | Some("audio") => RegionKind::Audio,
+                Some("midi") => RegionKind::Midi,
+                Some(other) => anyhow::bail!("unknown kind '{other}' (use audio or midi)"),
+            };
+            let r = RegionRef { track: a.track, kind, index: a.clip };
+            if a.convert_to_regions {
+                let made = e.convert_loops(&[r])?;
+                return Ok(json!({ "regions": made.iter().map(|m| m.index).collect::<Vec<_>>() }));
+            }
+            let to = match (a.enabled.unwrap_or(true), a.until_secs, a.passes) {
+                (false, ..) => LoopTo::Off,
+                (true, Some(t), None) => LoopTo::Until(t),
+                (true, None, Some(n)) => LoopTo::Passes(n),
+                (true, None, None) => LoopTo::Fill,
+                (true, Some(_), Some(_)) => anyhow::bail!("give until_secs or passes, not both"),
+            };
+            e.set_region_loop(&[r], to)?;
+            Ok(json!({ "region": e.region_data(r).map(|d| match d {
+                opentake_engine::RegionData::Audio(c) => json!({ "position_secs": c.position_secs, "length_secs": c.length_secs, "looped": c.looped, "passes": c.loop_passes().len() }),
+                opentake_engine::RegionData::Midi(c) => json!({ "position_secs": c.position_secs, "length_secs": c.length_secs, "looped": c.looped, "passes": c.loop_passes().len() }),
+            })? }))
+        })
+        .await
+    }
+
     #[tool(description = "Set an audio region's gain in dB (before the track fader; 0 = unchanged, -60..+24). Undoable.")]
     async fn set_clip_gain(&self, Parameters(a): Parameters<ClipGainArgs>) -> ToolResult {
         self.with_engine(move |e| e.set_clip_gain(a.track, a.clip, a.gain_db)).await
@@ -2083,6 +2151,20 @@ mod compact_tests {
     }
 
     #[test]
+    fn project_json_shows_loops() {
+        let mut p = Project::default();
+        let mut t = Track::new("Keys");
+        let mut c = MidiClip::new("r", 0.0, 2.5);
+        c.looped = Some(opentake_engine::project::RegionLoop::new(1.0));
+        t.midi_clips.push(c);
+        t.midi_clips.push(MidiClip::new("plain", 4.0, 1.0));
+        p.tracks.push(t);
+        let v = project_json(&p, false);
+        assert_eq!(v["tracks"][0]["midi_clips"][0]["loop"], json!({ "loop_length_secs": 1.0, "passes": 3 }));
+        assert!(v["tracks"][0]["midi_clips"][0].get("looped").is_none() && v["tracks"][0]["midi_clips"][1].get("loop").is_none());
+    }
+
+    #[test]
     fn project_json_replaces_notes_with_counts_unless_asked() {
         let mut p = Project::default();
         let mut t = Track::new("Keys");
@@ -2095,6 +2177,7 @@ mod compact_tests {
             tab: None,
             tempos: Vec::new(),
             controllers: Vec::new(),
+            looped: None,
         });
         p.tracks.push(t);
         let compact = project_json(&p, false);

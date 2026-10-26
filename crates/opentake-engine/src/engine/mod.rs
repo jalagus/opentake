@@ -22,6 +22,7 @@ mod midi;
 mod midi_file;
 mod plugins;
 mod recording;
+mod region_loop;
 mod regions;
 mod routing;
 mod sends;
@@ -35,7 +36,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use opentake_project::{Clip, Fade, Project, TempoChange, Track, played_clips};
+use opentake_project::{Clip, Fade, MAX_LOOP_PASSES, MIN_LOOP_SECS, Project, TempoChange, Track, played_clips};
 use opentake_vst3::{Module, ScannedPlugin};
 use rtrb::{Consumer, Producer};
 use serde::Serialize;
@@ -62,6 +63,7 @@ pub use markers::MarkerUpdate;
 pub use midi::MidiClipUpdate;
 pub use midi_file::{MidiFileImport, MidiFileSummary, MidiFileTrackInfo, gm_program_name, inspect as inspect_midi_file, is_midi_file_path};
 pub use plugins::SlotRef;
+pub use region_loop::LoopTo;
 pub use regions::{RegionData, RegionKind, RegionRef};
 pub use sends::SendUpdate;
 
@@ -584,9 +586,11 @@ impl Engine {
         let offset = clip.source_offset_secs * clip.stretch;
         let lead = (-offset).max(0.0).min(clip.length_secs);
         let (start, end) = (secs(clip.position_secs), secs(clip.position_secs + clip.length_secs));
+        // Both ends rounded where they are, so butted regions (a loop's passes) butt exactly.
+        let from = secs(clip.position_secs + lead);
         Ok(ClipRt {
-            start: secs(clip.position_secs + lead),
-            len: secs(clip.length_secs - lead),
+            start: from,
+            len: end.saturating_sub(from),
             offset: secs(offset),
             gain: clip.gain,
             mute: clip.mute,
@@ -1013,6 +1017,7 @@ impl Engine {
             fade_out: Fade::default(),
             comp: Vec::new(),
             show_takes: false,
+            looped: None,
         };
         self.record("Add Region", None, |e| {
             e.project.tracks[index].clips.push(clip.clone());
@@ -1110,7 +1115,8 @@ impl Engine {
     }
 
     /// Move a clip's start and/or end edge (timeline seconds) without moving its audio.
-    /// Edges are clamped to the source file and a minimum length.
+    /// Edges are clamped to the source file and a minimum length. A looped region's end
+    /// changes how many repeats play; its start shifts into the loop (see `region_loop.rs`).
     pub fn trim_clip(&mut self, track: usize, clip: usize, start_secs: Option<f64>, end_secs: Option<f64>) -> Result<Clip> {
         let index = self.clip_index(track, clip)?;
         let c = self.project.tracks[index].clips[clip].clone();
@@ -1119,20 +1125,24 @@ impl Engine {
         // source seconds; the timeline plays them `stretch` times as long).
         let source_start = c.position_secs - c.source_offset_secs * c.stretch;
         let source_end = source_start + source * c.stretch;
-        let end = end_secs.unwrap_or(c.position_secs + c.length_secs).min(source_end);
-        let start = start_secs.unwrap_or(c.position_secs).max(source_start).max(0.0);
+        let end = end_secs.unwrap_or(c.position_secs + c.length_secs);
+        let end = match c.looped {
+            Some(l) => end.min(c.position_secs + l.len_secs * MAX_LOOP_PASSES as f64),
+            None => end.min(source_end),
+        };
+        let mut start = start_secs.unwrap_or(c.position_secs).max(source_start).max(0.0);
+        if let Some(l) = c.looped {
+            // The loop can't shrink to nothing.
+            start = start.min(c.position_secs + l.len_secs - MIN_LOOP_SECS);
+        }
         if end - start < Self::MIN_CLIP_SECS {
             bail!("trim would leave clip '{}' shorter than {} ms", c.name, Self::MIN_CLIP_SECS * 1000.0);
         }
-        let moved = start - c.position_secs;
-        let mut trimmed = Clip {
-            position_secs: start,
-            length_secs: end - start,
-            source_offset_secs: (start - source_start) / c.stretch,
-            ..c
-        };
+        let mut trimmed = c.clone();
+        trimmed.move_start(start - c.position_secs);
+        trimmed.length_secs = end - start;
         trimmed.clamp_fades();
-        trimmed.crop_comp(moved);
+        trimmed.crop_comp(0.0);
         self.record("Trim Region", None, |e| {
             e.project.tracks[index].clips[clip] = trimmed.clone();
             e.resync_clips(index)?;
@@ -1235,6 +1245,7 @@ impl Engine {
                 }
             }
         }
+        self.resolve_source_loops(&mut project);
         project.outputs_from_indices();
         project.assign_slot_ids();
         project.assign_send_ids();

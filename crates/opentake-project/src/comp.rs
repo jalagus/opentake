@@ -46,7 +46,7 @@ impl Clip {
     /// What plays where, covering the whole region: the comp with the gaps filled by the
     /// active take (one segment for an uncomped region).
     pub fn comp_segments(&self) -> Vec<CompSegment> {
-        let len = self.length_secs.max(0.0);
+        let len = self.content_secs().min(self.length_secs).max(0.0);
         let mut out: Vec<CompSegment> = Vec::with_capacity(2 * self.comp.len() + 1);
         let mut push = |start_secs: f64, end_secs: f64, take: usize| match out.last_mut() {
             Some(last) if last.take == take => last.end_secs = end_secs,
@@ -74,7 +74,7 @@ impl Clip {
         if take >= self.takes.len() {
             return false;
         }
-        let (from, to) = (from.min(to).max(0.0), from.max(to).min(self.length_secs));
+        let (from, to) = (from.min(to).max(0.0), from.max(to).min(self.content_secs()));
         if to <= from {
             return true;
         }
@@ -101,7 +101,7 @@ impl Clip {
     /// Keep the comp tidy: within the region, sorted, neighbours of one take merged, and
     /// nothing that plays the active take (or no take) or is too short to hear.
     pub fn normalize_comp(&mut self) {
-        let (len, active, takes) = (self.length_secs, self.active_take, self.takes.len());
+        let (len, active, takes) = (self.content_secs(), self.active_take, self.takes.len());
         for s in &mut self.comp {
             (s.start_secs, s.end_secs) = (s.start_secs.max(0.0), s.end_secs.min(len));
         }
@@ -165,6 +165,7 @@ impl Clip {
                     active_take: 0,
                     comp: Vec::new(),
                     show_takes: false,
+                    looped: None,
                     // The outer fades within what the joins leave.
                     fade_in: if k == 0 { Fade { secs: fades.0.secs.min(s.len() - half[1]), ..fades.0 } } else { join(half[k]) },
                     fade_out: if k + 1 == n { Fade { secs: fades.1.secs.min(s.len() - half[k]), ..fades.1 } } else { join(half[k + 1]) },
@@ -179,9 +180,10 @@ impl Clip {
 }
 
 /// What a track's audio regions play: every region with its effective fades (crossfades
-/// over overlaps, see [`effective_fades`]), comped take folders as their parts.
+/// over overlaps, see [`effective_fades`]), looped regions as their passes, comped take
+/// folders as their parts.
 pub fn played_clips(clips: &[Clip]) -> Vec<(Clip, (Fade, Fade))> {
-    clips.iter().zip(effective_fades(clips)).flat_map(|(c, f)| c.played_parts(f)).collect()
+    clips.iter().zip(effective_fades(clips)).flat_map(|(c, f)| c.loop_regions_with(f)).flat_map(|(c, f)| c.played_parts(f)).collect()
 }
 
 #[cfg(test)]

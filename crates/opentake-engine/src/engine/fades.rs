@@ -56,19 +56,16 @@ impl FadeUpdate {
     }
 }
 
-/// Timeline span of a region's source audio (where the file starts and ends).
+/// Timeline span of a region's source audio (where the file starts and ends). A looped
+/// region's end can go on repeating.
 fn source_span(c: &Clip, source_secs: f64) -> (f64, f64) {
     let start = c.position_secs - c.source_offset_secs * c.stretch;
-    (start, start + source_secs * c.stretch)
+    (start, if c.looped.is_some() { f64::INFINITY } else { start + source_secs * c.stretch })
 }
 
 /// Move `c`'s start to `at` (timeline seconds), keeping its audio in place.
 fn set_start(c: &mut Clip, at: f64) {
-    let delta = at - c.position_secs;
-    c.position_secs = at;
-    c.length_secs -= delta;
-    c.source_offset_secs += delta / c.stretch;
-    c.crop_comp(delta);
+    c.move_start(at - c.position_secs);
 }
 
 /// Overlap `a` (earlier) and `b` by `secs`, centred on their boundary, trimming or extending
@@ -164,7 +161,8 @@ impl Engine {
         for &c in &picked {
             self.clip_index(track, c)?;
         }
-        let mut parts: Vec<Clip> = picked.iter().map(|&c| self.project.tracks[index].clips[c].clone()).collect();
+        // Looped regions join as their passes.
+        let mut parts: Vec<Clip> = picked.iter().flat_map(|&c| self.project.tracks[index].clips[c].loop_regions()).collect();
         parts.sort_by(|a, b| a.position_secs.total_cmp(&b.position_secs));
         let from = parts[0].position_secs;
         let to = parts.iter().map(|c| c.position_secs + c.length_secs).fold(from, f64::max);
@@ -205,6 +203,7 @@ impl Engine {
             fade_out: Fade::default(),
             comp: Vec::new(),
             show_takes: false,
+            looped: None,
         };
         self.record("Merge Regions", None, |e| {
             let list = &mut e.project.tracks[index].clips;

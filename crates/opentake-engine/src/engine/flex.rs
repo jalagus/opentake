@@ -66,7 +66,10 @@ impl PitchStretch {
         (fade_in.secs, fade_out.secs) = (fade_in.secs * scale, fade_out.secs * scale);
         let mut out = Clip { pitch_semitones: semitones, pitch_cents: cents, stretch, length_secs, fade_in, fade_out, ..c.clone() };
         out.clamp_fades();
-        // So does the comp (it's in timeline seconds).
+        // So do the comp and the loop (timeline seconds).
+        if let Some(l) = &mut out.looped {
+            (l.len_secs, l.phase_secs) = (l.len_secs * scale, l.phase_secs * scale);
+        }
         out.scale_comp(scale);
         Ok(out)
     }

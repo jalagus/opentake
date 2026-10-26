@@ -1,5 +1,7 @@
 //! MIDI regions and notes on instrument tracks.
 
+use std::borrow::Cow;
+
 use anyhow::{Result, anyhow, bail};
 use opentake_project::{Controller, ControllerEvent, ControllerLane, MidiClip, Note};
 
@@ -46,12 +48,21 @@ pub(super) fn sorted(mut notes: Vec<Note>) -> Vec<Note> {
 
 impl Engine {
     /// Regions for the audio thread, in absolute samples with notes clipped to their region.
+    /// A looped region plays one region per pass (so the feed only scans the pass playing).
     pub(super) fn build_midi(&self, index: usize, sr: u32) -> Vec<MidiClipRt> {
         let s = |secs: f64| (secs.max(0.0) * sr as f64).round() as u64;
+        fn passes(c: &MidiClip) -> Vec<Cow<'_, MidiClip>> {
+            match c.looped {
+                None => vec![Cow::Borrowed(c)],
+                Some(_) => c.loop_regions().into_iter().map(Cow::Owned).collect(),
+            }
+        }
         self.project.tracks[index]
             .midi_clips
             .iter()
+            .flat_map(passes)
             .map(|c| {
+                let c: &MidiClip = &c;
                 let (start, end) = (s(c.position_secs), s(c.position_secs + c.length_secs));
                 let mut notes: Vec<NoteRt> = c
                     .notes
@@ -110,7 +121,7 @@ impl Engine {
             bail!("region length must be positive");
         }
         let name = name.map(str::to_string).unwrap_or_else(|| self.project.tracks[index].name.clone());
-        let clip = MidiClip { name, position_secs: position_secs.max(0.0), length_secs, mute: false, notes: Vec::new(), tab: None, tempos: Vec::new(), controllers: Vec::new() };
+        let clip = MidiClip { name, position_secs: position_secs.max(0.0), length_secs, mute: false, notes: Vec::new(), tab: None, tempos: Vec::new(), controllers: Vec::new(), looped: None };
         self.record("Create MIDI Region", None, |e| e.insert_midi_impl(index, clip))
     }
 

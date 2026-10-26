@@ -13,6 +13,7 @@ pub mod guitarpro;
 pub mod import;
 pub mod marker;
 pub mod model;
+pub mod region_loop;
 pub mod rpp;
 pub mod sends;
 pub mod sidechain;
@@ -24,6 +25,7 @@ pub use controller::{BEND_CENTRE, CONTROLLER_SLOTS, Controller, ControllerEvent,
 pub use fade::{Fade, FadeCurve, effective_fades};
 pub use marker::{MARKER_COLORS, Marker};
 pub use model::*;
+pub use region_loop::{LoopPass, MAX_LOOP_PASSES, MIN_LOOP_SECS, RegionLoop};
 pub use sends::{AuxSend, MAX_SEND_GAIN};
 pub use sidechain::SideChain;
 pub use tempo::{BarLine, Grid, MusicalPos, TempoChange, TempoMap, TempoSegment};

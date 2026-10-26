@@ -133,6 +133,7 @@ impl Engine {
                 fade_out: Default::default(),
                 comp: Vec::new(),
                 show_takes: false,
+                looped: None,
             };
             let clips = &mut self.project.tracks[index].clips;
             if let Some(p) = &layout.plain {

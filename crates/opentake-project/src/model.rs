@@ -9,6 +9,7 @@ use crate::comp::CompSegment;
 use crate::controller::{Controller, ControllerLane};
 use crate::fade::Fade;
 use crate::marker::Marker;
+use crate::region_loop::RegionLoop;
 use crate::tempo::{TempoChange, TempoMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -395,6 +396,9 @@ pub struct MidiClip {
     /// Pitch bend, CC and channel-pressure events, one lane per controller.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controllers: Vec<ControllerLane>,
+    /// Looping: the content repeats until the region's end (see `region_loop.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub looped: Option<RegionLoop>,
 }
 
 /// A tempo change inside a region, relative to the region start.
@@ -408,7 +412,7 @@ pub struct TempoMark {
 impl MidiClip {
     /// An empty region.
     pub fn new(name: impl Into<String>, position_secs: f64, length_secs: f64) -> Self {
-        Self { name: name.into(), position_secs, length_secs, mute: false, notes: Vec::new(), tab: None, tempos: Vec::new(), controllers: Vec::new() }
+        Self { name: name.into(), position_secs, length_secs, mute: false, notes: Vec::new(), tab: None, tempos: Vec::new(), controllers: Vec::new(), looped: None }
     }
 
     pub fn lane(&self, kind: Controller) -> Option<&ControllerLane> {
@@ -426,8 +430,14 @@ impl MidiClip {
 
     /// Split at `cut` seconds into the region: notes crossing it are shortened on the left,
     /// later ones move to the right part; tab bars, tempo marks and controllers are split
-    /// too (the right part starts with every controller's value at the cut).
+    /// too (the right part starts with every controller's value at the cut). A looped
+    /// region's parts both keep looping (see `region_loop.rs`).
     pub fn split(&self, cut: f64) -> (MidiClip, MidiClip) {
+        if let Some(l) = self.looped {
+            let left = MidiClip { length_secs: cut, ..self.clone() };
+            let right = MidiClip { position_secs: self.position_secs + cut, length_secs: self.length_secs - cut, ..self.rotated((l.phase_secs + cut).rem_euclid(l.len_secs)) };
+            return (left, right);
+        }
         let left_notes = self.notes.iter().filter(|n| n.start_secs < cut).map(|n| Note { length_secs: n.length_secs.min(cut - n.start_secs), ..*n }).collect();
         let right_notes = self.notes.iter().filter(|n| n.start_secs >= cut).map(|n| Note { start_secs: n.start_secs - cut, ..*n }).collect();
         let mut left_tab = self.tab.clone();
@@ -568,6 +578,9 @@ pub struct Clip {
     /// The folder's take lanes are open under its track (a view setting).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub show_takes: bool,
+    /// Looping: the content repeats until the region's end (see `region_loop.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub looped: Option<RegionLoop>,
 }
 
 fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
@@ -604,8 +617,17 @@ impl Clip {
     }
 
     /// Split `cut` timeline seconds after the region start into (left, right).
-    /// Each part keeps the fade at its outer end, and its part of the comp.
+    /// Each part keeps the fade at its outer end, and its part of the comp. A looped region's
+    /// parts keep looping the same content, the right one from where the cut fell in it.
     pub fn split(&self, cut: f64) -> (Clip, Clip) {
+        if let Some(l) = self.looped {
+            let mut left = Clip { length_secs: cut, fade_out: Fade::default(), ..self.clone() };
+            let looped = Some(RegionLoop { phase_secs: (l.phase_secs + cut).rem_euclid(l.len_secs), ..l });
+            let mut right = Clip { position_secs: self.position_secs + cut, length_secs: self.length_secs - cut, fade_in: Fade::default(), looped, ..self.clone() };
+            left.clamp_fades();
+            right.clamp_fades();
+            return (left, right);
+        }
         let mut left = Clip { length_secs: cut, fade_out: Fade::default(), ..self.clone() };
         let mut right = Clip {
             position_secs: self.position_secs + cut,
@@ -737,7 +759,7 @@ mod tests {
     use super::*;
 
     fn clip(file: &str, offset: f64) -> Clip {
-        Clip { name: "c".into(), file: file.into(), position_secs: 4.0, length_secs: 2.0, source_offset_secs: offset, gain: 1.0, mute: false, takes: Vec::new(), active_take: 0, pitch_semitones: 0, pitch_cents: 0, stretch: 1.0, fade_in: Fade::default(), fade_out: Fade::default(), comp: Vec::new(), show_takes: false }
+        Clip { name: "c".into(), file: file.into(), position_secs: 4.0, length_secs: 2.0, source_offset_secs: offset, gain: 1.0, mute: false, takes: Vec::new(), active_take: 0, pitch_semitones: 0, pitch_cents: 0, stretch: 1.0, fade_in: Fade::default(), fade_out: Fade::default(), comp: Vec::new(), show_takes: false, looped: None }
     }
 
     #[test]

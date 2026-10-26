@@ -32,7 +32,10 @@ impl Engine {
         let index = self.clip_index(track, clip)?;
         let sr = self.sample_rate();
         let mut peak = 0.0f32;
-        for (c, _) in self.project.tracks[index].clips[clip].played_parts(Default::default()) {
+        // One pass is all a looped region plays (passes may start part-way into it).
+        let c = &self.project.tracks[index].clips[clip];
+        let content = Clip { length_secs: c.content_secs(), looped: None, ..c.clone() };
+        for (c, _) in content.played_parts(Default::default()) {
             let data = self.clip_media(&c, sr)?;
             // The part of the (processed) audio the region spans; a negative offset is silence.
             let frames = |secs: f64| (secs * sr as f64).round().max(0.0) as usize;

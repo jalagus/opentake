@@ -388,6 +388,20 @@ fn draw_background(ui: &egui::Ui, geo: &Geo, clip: &MidiClip, project: &Project,
     let mid = app.view.start + ((g.center().x - g.left()) / app.view.px_per_sec) as f64;
     let grid = grid_at(app.snap_mode, &map, mid, geo.px_per_sec);
     timeline::draw_grid(&p, g, &app.view, &map, grid);
+    // A looped region's repeats: shaded, with their notes as ghosts (edit the first pass).
+    if let Some(l) = clip.looped {
+        let loop_x = geo.x_of(l.len_secs.min(clip.length_secs));
+        p.rect_filled(Rect::from_min_max(pos2(loop_x, g.top()), pos2(geo.x_of(clip.length_secs), g.bottom())), 0.0, Color32::from_black_alpha(40));
+        let ghost = theme::with_alpha(theme::track_color(app.piano.region.map_or(0, |(t, _)| t)), 70);
+        for pass in l.passes(clip.length_secs).iter().filter(|p| p.at >= l.len_secs - 1e-9) {
+            let to = pass.from + pass.len;
+            for n in clip.notes.iter().filter(|n| n.start_secs >= pass.from - 1e-9 && n.start_secs < to - 1e-9) {
+                let shifted = Note { start_secs: n.start_secs - pass.from + pass.at, length_secs: n.length_secs.min(to - n.start_secs), ..*n };
+                p.rect_filled(geo.note_rect(&shifted), 2.0, ghost);
+            }
+            p.vline(geo.x_of(pass.at), g.y_range(), Stroke::new(1.0, theme::with_alpha(theme::TEXT_FAINT, 120)));
+        }
+    }
     // Shade outside the region.
     let end_x = geo.x_of(clip.length_secs);
     if end_x < g.right() {
@@ -435,12 +449,12 @@ fn notes_interaction(
     if resp.double_clicked() {
         if let Some(p) = pointer.filter(|p| hit(*p).is_none()) {
             let t = snap(app, ui, geo.t_of(p.x)).max(0.0);
-            if t < clip.length_secs {
+            if t < clip.content_secs() {
                 let map = project.tempo_map();
                 let at = clip.position_secs + t;
                 let len = grid_at(app.snap_mode, &map, at, geo.px_per_sec).map_or(map.beat_secs_at(at) / 4.0, |g| grid_step_secs(g, &map, at));
                 let pitch = geo.pitch_at(p.y).clamp(0, 127) as u8;
-                let note = Note { start_secs: t, length_secs: len.min(clip.length_secs - t).max(0.01), pitch, velocity: app.piano.velocity, tab: None };
+                let note = Note { start_secs: t, length_secs: len.min(clip.content_secs() - t).max(0.01), pitch, velocity: app.piano.velocity, tab: None };
                 let mut notes = clip.notes.clone();
                 notes.push(note);
                 app.piano.selected = vec![note];
@@ -530,11 +544,11 @@ fn notes_interaction(
         app.piano.marquee = None;
         if let Some(d) = app.piano.drag.take() {
             if d.dt != 0.0 || d.dpitch != 0 {
-                let moved: Vec<Note> = dragged_notes(&app.piano.selected, &app.piano.selected, &d, clip.length_secs);
+                let moved: Vec<Note> = dragged_notes(&app.piano.selected, &app.piano.selected, &d, clip.content_secs());
                 let notes = if d.copy {
                     clip.notes.iter().copied().chain(moved.iter().copied()).collect()
                 } else {
-                    dragged_notes(&clip.notes, &app.piano.selected, &d, clip.length_secs)
+                    dragged_notes(&clip.notes, &app.piano.selected, &d, clip.content_secs())
                 };
                 app.piano.selected = moved;
                 app.act(Action::SetNotes { track, clip: ci, notes });
@@ -545,12 +559,12 @@ fn notes_interaction(
     // Draw notes (with the drag preview applied).
     let shown = match &app.piano.drag {
         // Copying: originals stay, copies follow the pointer.
-        Some(d) if d.copy => clip.notes.iter().copied().chain(dragged_notes(&app.piano.selected, &app.piano.selected, d, clip.length_secs)).collect(),
-        Some(d) => dragged_notes(&clip.notes, &app.piano.selected, d, clip.length_secs),
+        Some(d) if d.copy => clip.notes.iter().copied().chain(dragged_notes(&app.piano.selected, &app.piano.selected, d, clip.content_secs())).collect(),
+        Some(d) => dragged_notes(&clip.notes, &app.piano.selected, d, clip.content_secs()),
         None => clip.notes.clone(),
     };
     let preview_selected = match &app.piano.drag {
-        Some(d) => dragged_notes(&app.piano.selected, &app.piano.selected, d, clip.length_secs),
+        Some(d) => dragged_notes(&app.piano.selected, &app.piano.selected, d, clip.content_secs()),
         None => app.piano.selected.clone(),
     };
     let p = ui.painter().with_clip_rect(geo.grid);
@@ -634,7 +648,7 @@ fn controller_lane(app: &mut DawApp, ui: &egui::Ui, geo: &Geo, keys: Rect, track
     let stored: Vec<ControllerEvent> = clip.lane(kind).map(|l| l.events.clone()).unwrap_or_default();
     let resp = ui.interact(rect, ui.make_persistent_id(("piano_ctrl_lane", track, ci)), Sense::click_and_drag());
     widgets::label(&resp, egui::Role::Group, "Controller Lane");
-    let max_t = clip.length_secs;
+    let max_t = clip.content_secs();
     let point = |p: Pos2| (geo.t_of(p.x).clamp(0.0, max_t), lane_value(kind, rect, p.y));
     let shown = |app: &DawApp| app.piano.ctrl_drag.as_ref().map_or(stored.clone(), |d| d.events.clone());
     let hit = |events: &[ControllerEvent], p: Pos2| {

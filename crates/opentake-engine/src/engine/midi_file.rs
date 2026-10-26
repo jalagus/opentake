@@ -439,6 +439,8 @@ fn smf_bytes(project: &Project) -> Result<(Vec<u8>, usize)> {
         let ch = u4::new(channel);
         let mut events: Vec<(u64, TrackEventKind)> = Vec::new();
         for clip in track.midi_clips.iter().filter(|c| !c.mute) {
+            // Loops written out as their repeats.
+            let clip = clip.unrolled();
             for n in clip.notes.iter().filter(|n| n.start_secs < clip.length_secs) {
                 let on = tick(clip.position_secs + n.start_secs);
                 let end = n.start_secs + n.length_secs.min(clip.length_secs - n.start_secs);

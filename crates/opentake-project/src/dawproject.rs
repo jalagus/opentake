@@ -17,7 +17,7 @@ use roxmltree::Node;
 
 use crate::import::{ImportError, Imported, QuarterTempo, audio_clip, db_to_gain, find_media, named_plugin, resolve_path, synth_slot};
 use crate::marker::Marker;
-use crate::model::{MidiClip, Note, PluginFormat, PluginSlot, Project, Track};
+use crate::model::{Clip, MidiClip, Note, PluginFormat, PluginSlot, Project, Track};
 use crate::tempo::TempoMap;
 
 pub fn load(path: &Path) -> Result<Imported, ImportError> {
@@ -345,7 +345,7 @@ impl Ctx<'_> {
                 let end = if span.1.is_finite() { span.1 } else { notes.iter().map(|n| n.start_secs + n.length_secs).fold(start, f64::max) };
                 notes.iter_mut().for_each(|n| n.start_secs -= start);
                 notes.sort_by(|a, b| a.start_secs.total_cmp(&b.start_secs));
-                let clip = MidiClip { name: name.unwrap_or_default().to_string(), position_secs: start, length_secs: end - start, mute: false, notes, tab: None, tempos: Vec::new(), controllers: Vec::new() };
+                let clip = MidiClip { name: name.unwrap_or_default().to_string(), position_secs: start, length_secs: end - start, mute: false, notes, tab: None, tempos: Vec::new(), controllers: Vec::new(), looped: None };
                 self.tracks[t].midi_clips.push(clip);
             }
             _ => {
@@ -541,7 +541,9 @@ pub fn project_xml(project: &Project, files: &HashMap<PathBuf, String>) -> Strin
     let _ = writeln!(x, "  <Arrangement id=\"{}\">\n    <Lanes timeUnit=\"beats\" id=\"{}\">", next(), next());
     for (t, tid) in project.tracks.iter().zip(&track_ids) {
         let _ = writeln!(x, "      <Lanes track=\"{tid}\" id=\"{}\">\n        <Clips id=\"{}\">", next(), next());
-        for c in &t.clips {
+        // Looped regions are written out as their passes.
+        for c in t.clips.iter().flat_map(Clip::loop_regions) {
+            let c = &c;
             let (start, end) = (q(c.position_secs), q(c.position_secs + c.length_secs));
             let _ = writeln!(x, "          <Clip time=\"{start}\" duration=\"{}\" playStart=\"0\" name=\"{}\"{}>", end - start, esc(&c.name), if c.mute { " enable=\"false\"" } else { "" });
             let _ = writeln!(x, "            <Warps contentTimeUnit=\"seconds\" timeUnit=\"beats\" id=\"{}\">", next());
@@ -562,7 +564,7 @@ pub fn project_xml(project: &Project, files: &HashMap<PathBuf, String>) -> Strin
             }
             x.push_str("            </Warps>\n          </Clip>\n");
         }
-        for m in &t.midi_clips {
+        for m in t.midi_clips.iter().map(MidiClip::unrolled) {
             let (start, end) = (q(m.position_secs), q(m.position_secs + m.length_secs));
             let _ = writeln!(x, "          <Clip time=\"{start}\" duration=\"{}\" playStart=\"0\" name=\"{}\"{}>", end - start, esc(&m.name), if m.mute { " enable=\"false\"" } else { "" });
             let _ = writeln!(x, "            <Notes id=\"{}\">", next());
@@ -824,6 +826,7 @@ mod tests {
             tab: None,
             tempos: Vec::new(),
             controllers: Vec::new(),
+            looped: None,
         });
         p.tracks = vec![audio, keys];
         p.markers = vec![Marker::new(2.0, "Verse & Co"), Marker { color: Some([255, 0, 128]), ..Marker::new(10.0, "Chorus") }];

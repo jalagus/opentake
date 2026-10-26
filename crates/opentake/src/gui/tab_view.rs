@@ -322,7 +322,7 @@ fn draw_tab(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], rec
         }
 
         // Fret numbers on their strings, with a faint line for how long they ring.
-        for n in clip.notes.iter().filter(|n| n.start_secs < clip.length_secs) {
+        for n in clip.notes.iter().filter(|n| n.start_secs < clip.content_secs()) {
             let t = start + n.start_secs;
             let note_end = (t + n.length_secs).min(end);
             let (nx, nx_end) = (ctx.x(t), ctx.x(note_end));
@@ -643,7 +643,7 @@ impl Staff<'_> {
 
 /// Lay out a region's chords (notes starting together share a stem) around the visible area.
 fn chords_of(ctx: &Ctx, clip: &MidiClip, layout: &TabLayout, content: Rect) -> Vec<Chord> {
-    let notes: Vec<&Note> = clip.notes.iter().filter(|n| n.start_secs < clip.length_secs).collect();
+    let notes: Vec<&Note> = clip.notes.iter().filter(|n| n.start_secs < clip.content_secs()).collect();
     let start = clip.position_secs;
     let mut out = Vec::new();
     let mut i = 0;
