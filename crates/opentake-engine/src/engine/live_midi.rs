@@ -453,7 +453,9 @@ mod tests {
         let n = c.notes[0];
         assert!((n.start_secs - 0.995).abs() < MS && (n.length_secs - 0.5).abs() < MS, "{n:?}");
         let held = c.notes[1];
-        assert!((held.start_secs - 1.495).abs() < MS && (c.length_secs - 1.995).abs() < MS, "{held:?} {c:?}");
+        // The stop lands wherever the "device" thread was when it arrived: a callback or two
+        // after 3.0 s on a slow machine.
+        assert!((held.start_secs - 1.495).abs() < MS && (1.995 - MS..1.995 + 0.03).contains(&c.length_secs), "{held:?} {c:?}");
         assert!((held.start_secs + held.length_secs - c.length_secs).abs() < 1e-9, "the held note ends at the stop");
         assert_eq!(e.project().tracks[1].midi_clips[0].notes, c.notes);
 
