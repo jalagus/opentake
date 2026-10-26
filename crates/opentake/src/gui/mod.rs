@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use opentake_engine::project::{AutomationLane, AutomationMode, AutomationTarget, Curve, Note, Project};
 use opentake_engine::midi_input::MidiSelection;
-use opentake_engine::{AudioConfig, AutomationParam, DeviceList, Engine, EngineStatus, HistoryInfo, LaneOwner, MidiInputs, ParamView, RegionData, SendUpdate, SlotRef, TrackUpdate, Waveform};
+use opentake_engine::{AudioConfig, AutomationParam, DeviceList, Engine, EngineStatus, HistoryInfo, LaneOwner, MidiInputs, ParamView, PluginEditor, RegionData, SendUpdate, SlotRef, TrackUpdate, Waveform};
 use opentake_vst3::ScannedPlugin;
 use eframe::egui;
 use egui::{Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
@@ -104,6 +104,8 @@ pub(crate) struct Snapshot {
     pub multiband: HashMap<(usize, SlotRef), Arc<opentake_engine::multiband::MultibandMeter>>,
     /// Open plug-in windows whose plug-in takes a side chain.
     pub side_chain_inputs: std::collections::HashSet<(usize, SlotRef)>,
+    /// Open plug-in windows whose plug-in has an editor of its own.
+    pub native_editors: std::collections::HashSet<(usize, SlotRef)>,
     /// What can be automated, per track index, for tracks showing their automation.
     pub auto_params: HashMap<usize, Vec<AutomationParam>>,
     /// The chosen MIDI inputs, and while recording the notes played so far (timeline seconds).
@@ -221,6 +223,9 @@ pub(crate) enum Action {
     /// Key a slot from a track (index; `None` = no side chain), tapped pre-fader or not.
     SetSideChain(usize, SlotRef, Option<usize>, bool),
     SetParam(usize, SlotRef, u32, f64),
+    /// Open a plug-in's own editor window (OpenTake's window for built-ins, and when the
+    /// plug-in has none).
+    OpenEditor(usize, SlotRef),
     /// Show or hide automation under a track (`None` = every track).
     ShowAutomation { track: Option<usize>, show: bool },
     /// Show or hide the master bus's automation lanes.
@@ -266,6 +271,8 @@ pub(crate) struct DawApp {
     pub tab_paper: bool,
     pub piano: piano_roll::PianoRoll,
     pub open_plugins: Vec<(usize, SlotRef)>,
+    /// Plug-ins' own editor windows (native, outside egui).
+    editors: Vec<NativeEditor>,
     /// Track being dragged to a new place (lane headers or mixer strips).
     pub track_drag: Option<usize>,
     devices: Option<DeviceList>,
@@ -322,8 +329,34 @@ pub(crate) fn short_plugin_name(full: &str) -> &str {
     rest.rsplit_once(" (").map_or(rest, |(n, _)| n)
 }
 
+/// A track's (or with `MASTER_UI`, the master's) plug-in slot.
+fn slot_at(project: &Project, t: usize, s: SlotRef) -> Option<&opentake_engine::project::PluginSlot> {
+    match s {
+        SlotRef::Master(i) => project.master_plugins.get(i),
+        SlotRef::Instrument => project.tracks.get(t).and_then(|tr| tr.instrument.as_ref()),
+        SlotRef::Effect(i) => project.tracks.get(t).and_then(|tr| tr.plugins.get(i)),
+    }
+}
+
+/// "Track — Plug-in", the title of a plug-in's windows.
+fn plugin_title(project: &Project, t: usize, s: SlotRef) -> Option<String> {
+    let slot = slot_at(project, t, s)?;
+    let owner = if matches!(s, SlotRef::Master(_)) { "Stereo Out" } else { project.tracks.get(t)?.name.as_str() };
+    Some(format!("{owner} — {}", short_plugin_name(&slot.name)))
+}
+
+/// An open plug-in editor window, by the instance it edits (slots move; instances don't).
+struct NativeEditor {
+    instance: u64,
+    editor: PluginEditor,
+    title: String,
+    /// OpenTake's window for the slot was open: it comes back when this one is closed.
+    restore: bool,
+}
+
 impl DawApp {
     fn new(engine: SharedEngine, mcp_url: Option<String>) -> Self {
+        engine.lock().unwrap_or_else(|p| p.into_inner()).set_editor_host(true);
         Self {
             engine,
             mcp_url,
@@ -341,6 +374,7 @@ impl DawApp {
             tab_paper: false,
             piano: piano_roll::PianoRoll::default(),
             open_plugins: Vec::new(),
+            editors: Vec::new(),
             track_drag: None,
             devices: None,
             midi_ports: None,
@@ -438,7 +472,58 @@ impl DawApp {
         }
     }
 
+    /// Apply edits made in plug-ins' own editors; close editors whose window was closed or
+    /// whose plug-in left the project (removed, undone, another project loaded); keep the
+    /// rest titled, sized and showing automation.
+    fn poll_editors(&mut self) {
+        let engine = self.engine.clone();
+        let mut e = engine.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(err) = e.apply_editor_edits() {
+            tracing::warn!("plug-in editor: {err:#}");
+        }
+        // Editors asked for over MCP open here, on the main thread.
+        for (t, s) in e.take_editor_requests() {
+            let t = if matches!(s, SlotRef::Master(_)) { MASTER_UI } else { t };
+            self.act(Action::OpenEditor(t, s));
+        }
+        if self.editors.is_empty() {
+            return;
+        }
+        let (mut reopen, mut closed) = (Vec::new(), Vec::new());
+        self.editors.retain_mut(|ed| {
+            let Some((t, s)) = e.slot_of_instance(ed.instance) else { return false };
+            let t = if matches!(s, SlotRef::Master(_)) { MASTER_UI } else { t };
+            if !ed.editor.is_open() {
+                if ed.restore {
+                    reopen.push((t, s));
+                }
+                closed.push(ed.instance);
+                return false;
+            }
+            let title = plugin_title(e.project(), t, s).unwrap_or_default();
+            if title != ed.title {
+                ed.editor.set_title(&title);
+                ed.title = title;
+            }
+            ed.editor.idle();
+            true
+        });
+        for w in reopen {
+            if !self.open_plugins.contains(&w) {
+                self.open_plugins.push(w);
+            }
+        }
+        for instance in closed {
+            if let Err(err) = e.editor_closed(instance) {
+                tracing::warn!("plug-in editor: {err:#}");
+            }
+        }
+        let open: Vec<u64> = self.editors.iter().map(|ed| ed.instance).collect();
+        e.sync_editors(&open);
+    }
+
     fn snapshot(&mut self) -> Snapshot {
+        self.poll_editors();
         let open = self.open_plugins.clone();
         let mut cache = std::mem::take(&mut self.auto_params);
         let mut e = self.lock();
@@ -479,6 +564,7 @@ impl DawApp {
         let meters = open.iter().filter_map(|&(t, s)| Some(((t, s), e.fx_meter(t, s)?))).collect();
         let multiband = open.iter().filter_map(|&(t, s)| Some(((t, s), e.multiband_meter(t, s)?))).collect();
         let side_chain_inputs = open.iter().copied().filter(|&(t, s)| e.supports_side_chain(t, s)).collect();
+        let native_editors = open.iter().copied().filter(|&(t, s)| e.has_editor(t, s)).collect();
         let params = open.into_iter().filter_map(|(t, s)| Some(((t, s), e.slot_params(t, s).ok()?))).collect();
         let status = e.status();
         let snap = Snapshot {
@@ -499,6 +585,7 @@ impl DawApp {
             meters,
             multiband,
             side_chain_inputs,
+            native_editors,
             auto_params,
             project,
         };
@@ -848,6 +935,34 @@ impl DawApp {
                 let target = e.param_target(owner, s, id)?;
                 if !e.control_automation(owner, target, v as f32)? {
                     e.set_slot_param(t, s, id, v)?;
+                }
+            }
+            Action::OpenEditor(t, s) => {
+                let generic = self.open_plugins.contains(&(t, s));
+                if !e.has_editor(t, s) {
+                    if !generic {
+                        self.open_plugins.push((t, s));
+                    }
+                    return Ok(());
+                }
+                let instance = slot_at(e.project(), t, s).map(|slot| slot.instance);
+                if let Some(ed) = self.editors.iter().find(|ed| Some(ed.instance) == instance) {
+                    ed.editor.bring_to_front();
+                    return Ok(());
+                }
+                let title = plugin_title(e.project(), t, s).unwrap_or_default();
+                match e.open_editor(t, s, &title) {
+                    Ok((instance, editor)) => {
+                        // The plug-in's editor replaces the generic one (back when it closes).
+                        self.open_plugins.retain(|&x| x != (t, s));
+                        self.editors.push(NativeEditor { instance, editor, title, restore: generic });
+                    }
+                    Err(err) => {
+                        if !generic {
+                            self.open_plugins.push((t, s));
+                        }
+                        return Err(err.context("showing its generic controls"));
+                    }
                 }
             }
             Action::ShowAutomation { track, show } => e.set_automation_shown(track, show)?,
@@ -2059,21 +2174,16 @@ impl DawApp {
 
     fn plugin_windows(&mut self, ui: &egui::Ui, snap: &Snapshot) {
         let project = &snap.project;
-        let slot_of = |t: usize, s: SlotRef| match s {
-            SlotRef::Master(i) => project.master_plugins.get(i),
-            SlotRef::Instrument => project.tracks.get(t).and_then(|tr| tr.instrument.as_ref()),
-            SlotRef::Effect(i) => project.tracks.get(t).and_then(|tr| tr.plugins.get(i)),
-        };
-        self.open_plugins.retain(|&(t, s)| slot_of(t, s).is_some());
+        self.open_plugins.retain(|&(t, s)| slot_at(project, t, s).is_some());
         for (n, (t, s)) in self.open_plugins.clone().into_iter().enumerate() {
-            let Some(slot) = slot_of(t, s) else { continue };
+            let Some(slot) = slot_at(project, t, s) else { continue };
             let name = short_plugin_name(&slot.name).to_string();
-            let owner = if matches!(s, SlotRef::Master(_)) { "Stereo Out".to_string() } else { project.tracks[t].name.clone() };
+            let title = plugin_title(project, t, s).unwrap_or_default();
             let builtin = slot.format == opentake_engine::project::PluginFormat::Builtin;
             let is_eq = builtin && slot.path == opentake_engine::eq::PATH;
             let fx = if builtin { fx_view::Kind::of(&slot.path) } else { None };
             let mut open = true;
-            egui::Window::new(format!("{owner} — {name}"))
+            egui::Window::new(title)
                 .id(ui.make_persistent_id(("plugin_window", t, s)))
                 .open(&mut open)
                 .default_size(if is_eq {
@@ -2091,8 +2201,19 @@ impl DawApp {
                         if s == SlotRef::Instrument {
                             ui.label(RichText::new("Instrument").size(10.5).color(theme::TEXT_FAINT));
                         }
-                        if snap.side_chain_inputs.contains(&(t, s)) {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| fx_view::side_chain_menu(self, ui, project, t, s));
+                        let native = snap.native_editors.contains(&(t, s));
+                        if native || snap.side_chain_inputs.contains(&(t, s)) {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if native {
+                                    let b = egui::Button::new(RichText::new("Open Editor").size(11.0)).min_size(vec2(0.0, 20.0));
+                                    if ui.add(b).on_hover_text("Open the plug-in's own editor window").clicked() {
+                                        self.act(Action::OpenEditor(t, s));
+                                    }
+                                }
+                                if snap.side_chain_inputs.contains(&(t, s)) {
+                                    fx_view::side_chain_menu(self, ui, project, t, s);
+                                }
+                            });
                         }
                     });
                     ui.add_space(6.0);
@@ -3093,6 +3214,40 @@ mod tests {
         assert!(value(&engine, opentake_engine::reverb::DECAY) > before + 0.05, "dragging up lengthens the decay");
         for title in ["Pre-Delay", "Size", "Damping", "Low Cut", "Diffusion", "Modulation", "Width", "Mix", "Level"] {
             harness.get_by_label(title);
+        }
+    }
+
+    #[test]
+    fn double_clicking_a_mixer_slot_opens_its_editor() {
+        let (mut harness, engine) = harness_with_track();
+        engine.lock().unwrap().insert_plugin(0, "reverb", None).unwrap();
+        harness.state_mut().selected_track = Some(0);
+        harness.state_mut().bottom = Some(BottomTab::Mixer);
+        harness.step();
+        harness.step();
+        let pill = harness.get_all_by_label(opentake_engine::reverb::NAME).next().unwrap().rect().center();
+        double_click_at(&mut harness, pill);
+        assert_eq!(harness.state().open_plugins, vec![(0, SlotRef::Effect(0))], "a built-in opens OpenTake's window");
+        assert!(harness.query_by_label("Open Editor").is_none(), "built-ins have no other");
+        // Asked for over MCP, it opens the same way.
+        harness.state_mut().open_plugins.clear();
+        engine.lock().unwrap().request_editor(0, SlotRef::Effect(0)).unwrap();
+        for _ in 0..3 {
+            harness.step();
+        }
+        assert_eq!(harness.state().open_plugins, vec![(0, SlotRef::Effect(0))]);
+
+        // An audio unit with a view of its own: the header offers it. Tests don't run on the
+        // main thread, so opening fails there and the generic controls stay.
+        #[cfg(target_os = "macos")]
+        {
+            engine.lock().unwrap().insert_plugin(0, "au:aufx:dely:appl", None).unwrap();
+            harness.state_mut().open_plugins = vec![(0, SlotRef::Effect(1))];
+            harness.step();
+            harness.step();
+            click(&mut harness, "Open Editor");
+            assert!(harness.state().editors.is_empty());
+            assert_eq!(harness.state().open_plugins, vec![(0, SlotRef::Effect(1))]);
         }
     }
 

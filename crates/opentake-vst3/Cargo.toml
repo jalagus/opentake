@@ -11,3 +11,12 @@ tracing.workspace = true
 vst3.workspace = true
 libloading.workspace = true
 serde.workspace = true
+
+# Native windows for plug-in editors (see window.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate", "NSString", "NSGeometry", "NSNotification", "NSObject", "NSRunLoop"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSWindow", "NSView", "NSResponder", "NSGraphics", "NSRunningApplication"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi"] }

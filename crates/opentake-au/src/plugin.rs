@@ -14,14 +14,17 @@ use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use objc2_audio_toolbox::*;
 use objc2_core_audio_types::*;
 use objc2_core_foundation::{CFArray, CFData, CFPropertyList, CFPropertyListCreateData, CFPropertyListCreateWithData, CFPropertyListFormat, CFRetained, CFString};
+use opentake_vst3::{Edit, EditQueue};
 use serde::Serialize;
 
+use crate::editor::{AuEditor, ParamListener};
 use crate::{ComponentInfo, Error, Result, find_component};
 
 /// How long to wait for an AUv3 extension that only loads asynchronously.
@@ -138,8 +141,8 @@ struct Setup {
     channels: usize,
 }
 
-struct Instance {
-    unit: AudioUnit,
+pub(crate) struct Instance {
+    pub(crate) unit: AudioUnit,
     /// Has an audio input (effects and music effects).
     effect: bool,
     /// Takes MIDI (instruments and music effects).
@@ -150,7 +153,11 @@ struct Instance {
     ctx: Box<UnsafeCell<RenderContext>>,
     /// The format the unit is initialized with, if it is.
     setup: Mutex<Option<Setup>>,
-    params: Vec<ParamInfo>,
+    pub(crate) params: Vec<ParamInfo>,
+    /// Edits made in the unit's view, queued by its parameter listener (see editor.rs).
+    pub(crate) edits: EditQueue,
+    /// That listener while it exists: the host's own changes are sent as from it.
+    pub(crate) listener: AtomicPtr<AUListenerBase>,
 }
 
 // The AU API is designed for a control thread (properties, parameters) and a render
@@ -203,7 +210,7 @@ impl Instance {
         }
     }
 
-    fn param(&self, id: u32) -> Option<&ParamInfo> {
+    pub(crate) fn param(&self, id: u32) -> Option<&ParamInfo> {
         self.params.iter().find(|p| p.id == id)
     }
 
@@ -211,6 +218,16 @@ impl Instance {
     fn set_param(&self, id: u32, normalized: f64) {
         if let Some(p) = self.param(id) {
             unsafe { AudioUnitSetParameter(self.unit, id, kAudioUnitScope_Global, 0, p.denormalize(normalized), 0) };
+        }
+    }
+
+    /// Set a parameter and notify listeners (an open view follows), except our own. Not for
+    /// the audio thread.
+    fn set_param_notify(&self, id: u32, normalized: f64) {
+        if let Some(p) = self.param(id) {
+            let param = AudioUnitParameter { mAudioUnit: self.unit, mParameterID: id, mScope: kAudioUnitScope_Global, mElement: 0 };
+            // SAFETY: a live unit; the sender is our listener or null.
+            unsafe { AUParameterSet(self.listener.load(Ordering::Acquire), std::ptr::null_mut(), NonNull::from(&param), p.denormalize(normalized), 0) };
         }
     }
 }
@@ -237,6 +254,8 @@ impl AuPlugin {
             ctx: Box::new(UnsafeCell::new(ctx)),
             setup: Mutex::new(None),
             params: Vec::new(),
+            edits: EditQueue::default(),
+            listener: AtomicPtr::new(std::ptr::null_mut()),
         };
         unsafe {
             let user = inst.ctx.get() as *mut c_void;
@@ -283,8 +302,36 @@ impl AuPlugin {
         (status == 0).then(|| p.normalize(value))
     }
 
+    /// Set a parameter; an open view of the unit shows the change.
     pub fn set_param(&self, id: u32, normalized: f64) {
-        self.inst.set_param(id, normalized);
+        self.inst.set_param_notify(id, normalized);
+    }
+
+    /// Whether the unit has a view of its own (a Cocoa view, or an AUv3 view controller).
+    pub fn has_editor(&self) -> bool {
+        crate::editor::has_view(&self.inst, self.info.v3)
+    }
+
+    /// Open the unit's view in a native window titled `title`. Main thread only. An AUv3
+    /// view arrives asynchronously: the window appears on a later [`AuEditor::idle`].
+    pub fn open_editor(&self, title: &str) -> Result<AuEditor> {
+        crate::editor::open(self.inst.clone(), self.info.v3, title)
+    }
+
+    /// Listen for parameter edits made on the unit by others (its view), as an open editor
+    /// does. Events arrive on this thread's run loop.
+    pub fn listen(&self) -> Result<ParamListener> {
+        ParamListener::new(self.inst.clone())
+    }
+
+    /// Edits made in the unit's view since the last call.
+    pub fn take_edits(&self) -> Vec<Edit> {
+        self.inst.edits.take()
+    }
+
+    /// Move a control the way the unit's view does (gesture, value, end) without a window.
+    pub fn emulate_view_edit(&self, id: u32, normalized: f64) {
+        crate::editor::emulate_view_edit(&self.inst, id, normalized);
     }
 
     /// Human readable value without units, e.g. "0.250" (units are in [`ParamInfo`]).
@@ -623,9 +670,16 @@ unsafe fn get_prop_into<T>(unit: AudioUnit, id: u32, scope: u32, element: u32, v
     if status == 0 { Ok(()) } else { Err(status) }
 }
 
+/// The size of a property's value, if the unit has the property.
+pub(crate) unsafe fn get_prop_size(unit: AudioUnit, id: u32) -> Option<usize> {
+    let mut size = 0u32;
+    let status = unsafe { AudioUnitGetPropertyInfo(unit, id, kAudioUnitScope_Global, 0, &mut size, std::ptr::null_mut()) };
+    (status == 0 && size > 0).then_some(size as usize)
+}
+
 /// # Safety
 /// `T` must be the property's C type.
-unsafe fn set_prop<T>(unit: AudioUnit, id: u32, scope: u32, element: u32, value: &T, what: &'static str) -> Result<()> {
+pub(crate) unsafe fn set_prop<T>(unit: AudioUnit, id: u32, scope: u32, element: u32, value: &T, what: &'static str) -> Result<()> {
     check(unsafe { AudioUnitSetProperty(unit, id, scope, element, (value as *const T).cast(), size_of::<T>() as u32) }, what)
 }
 
@@ -764,6 +818,29 @@ mod tests {
         // The peak limiter looks ahead, which it reports as latency.
         let limiter = load("aufx:lmtr:appl");
         assert!(limiter.create_processor(SR, BLOCK).unwrap().latency_samples() > 0);
+    }
+
+    #[test]
+    fn view_edits_reach_the_listener_but_ours_dont() {
+        let plugin = load("aufx:dely:appl");
+        let mix = plugin.parameters().iter().find(|p| p.title.to_lowercase().contains("wet")).unwrap().clone();
+        let listener = plugin.listen().unwrap();
+        plugin.emulate_view_edit(mix.id, 0.3);
+        plugin.set_param(mix.id, 0.6); // the host's own change: sent as from the listener
+        crate::pump_events(Duration::from_millis(300));
+        let edits = plugin.take_edits();
+        assert_eq!(edits.first(), Some(&Edit::Begin(mix.id)), "{edits:?}");
+        assert_eq!(edits.last(), Some(&Edit::End(mix.id)), "{edits:?}");
+        let values: Vec<f64> = edits.iter().filter_map(|e| if let Edit::Perform(id, v) = e { (*id == mix.id).then_some(*v) } else { None }).collect();
+        assert!(values.len() == 1 && (values[0] - 0.3).abs() < 1e-3, "{edits:?}");
+        assert!((plugin.get_param(mix.id).unwrap() - 0.6).abs() < 1e-3);
+
+        // Without a listener nothing is queued.
+        drop(listener);
+        plugin.emulate_view_edit(mix.id, 0.1);
+        crate::pump_events(Duration::from_millis(100));
+        assert!(plugin.take_edits().is_empty());
+        assert!(plugin.has_editor(), "Apple's AUDelay comes with a Cocoa view");
     }
 
     #[test]

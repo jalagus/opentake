@@ -803,6 +803,21 @@ pub struct BypassArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct EditorArgs {
+    #[serde(default)]
+    pub track: usize,
+    /// Effect slot (ignored with instrument: true).
+    #[serde(default)]
+    pub slot: usize,
+    /// The track's instrument instead of an effect.
+    #[serde(default)]
+    pub instrument: bool,
+    /// The master bus's effect chain instead of a track (track is ignored).
+    #[serde(default)]
+    pub master: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AutomationOwnerArgs {
     #[serde(default)]
     pub track: usize,
@@ -1624,6 +1639,16 @@ impl DawServer {
     async fn set_plugin_bypass(&self, Parameters(a): Parameters<BypassArgs>) -> ToolResult {
         let which = if a.master { SlotRef::Master(a.slot) } else { SlotRef::Effect(a.slot) };
         self.with_engine(move |e| e.set_slot_bypass(a.track, which, a.bypass).map(|_| "ok")).await
+    }
+
+    #[tool(description = "Show a VST3 / AU plugin's own editor window to the user in the OpenTake window (built-ins and plugins without one get OpenTake's controls). Needs the GUI; edits made there are undoable and write automation like any control.")]
+    async fn open_plugin_editor(&self, Parameters(a): Parameters<EditorArgs>) -> ToolResult {
+        let which = match (a.master, a.instrument) {
+            (true, _) => SlotRef::Master(a.slot),
+            (false, true) => SlotRef::Instrument,
+            (false, false) => SlotRef::Effect(a.slot),
+        };
+        self.with_engine(move |e| e.request_editor(a.track, which).map(|_| "ok")).await
     }
 
     #[tool(description = "List a plugin's parameters (params: ids, normalized values and display strings), whether it takes a side chain (side_chain_input) and the track keying it (side_chain: track index, name, pre_fader; null when unkeyed).")]

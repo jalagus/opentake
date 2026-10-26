@@ -34,12 +34,16 @@ pub(super) struct History {
     depth: usize,
     /// `Entry::playhead` for the step being recorded.
     pub(super) playhead: Option<f64>,
+    /// Merge keys of gestures in progress (a control held in a plug-in's editor): their
+    /// edits merge however long the gesture lasts.
+    pub(super) held: HashSet<String>,
 }
 
 impl History {
     pub(super) fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
+        self.held.clear();
     }
 }
 
@@ -93,8 +97,9 @@ impl Engine {
         match result {
             Ok(v) => {
                 if self.project != before {
+                    let held = key.as_ref().is_some_and(|k| self.history.held.contains(k));
                     let merge = key.is_some()
-                        && self.history.undo.last().is_some_and(|e| e.key == key && e.at.elapsed() < MERGE_WINDOW);
+                        && self.history.undo.last().is_some_and(|e| e.key == key && (held || e.at.elapsed() < MERGE_WINDOW));
                     match self.history.undo.last_mut() {
                         Some(last) if merge => last.at = Instant::now(),
                         _ => {

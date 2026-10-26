@@ -1,12 +1,15 @@
 //! Minimal VST3 hosting: scanning, loading and processing audio effect plugins.
 
+pub mod editor;
 pub mod host;
 pub mod module;
 pub mod plugin;
 pub mod scan;
+pub mod window;
 
 use std::path::PathBuf;
 
+pub use editor::{Edit, EditQueue, Vst3Editor};
 pub use module::{ClassInfo, Module};
 pub use plugin::{NoteEvent, ParamInfo, Transport, Vst3Plugin, Vst3Processor};
 

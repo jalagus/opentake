@@ -14,7 +14,8 @@ use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{ComPtr, ComWrapper};
 
-use crate::host::{EventList, HostApp, MemoryStream, ParamChanges, from_wstring};
+use crate::editor::{Edit, EditQueue, Vst3Editor};
+use crate::host::{ComponentHandler, EventList, HostApp, MemoryStream, ParamChanges, from_wstring};
 use crate::module::{ClassInfo, Module};
 use crate::{Error, Result};
 
@@ -51,15 +52,18 @@ pub struct Transport {
     pub position_samples: i64,
 }
 
-struct Instance {
+pub(crate) struct Instance {
     /// Generation of the processor that currently owns activation. A processor only
     /// deactivates the plugin on drop if no newer processor has taken over (this lets a
     /// plugin be re-activated, e.g. by undo, while the old processor is still being freed).
     activation: std::sync::Mutex<u64>,
     component: ComPtr<IComponent>,
-    controller: Option<ComPtr<IEditController>>,
+    pub(crate) controller: Option<ComPtr<IEditController>>,
     separate_controller: bool,
     connections: Option<(ComPtr<IConnectionPoint>, ComPtr<IConnectionPoint>)>,
+    /// Set on the controller: edits made in the plug-in's editor land in `edits`.
+    _handler: ComWrapper<ComponentHandler>,
+    edits: Arc<EditQueue>,
     _host: ComWrapper<HostApp>,
     // Must be dropped last so the binary outlives every COM object above.
     _module: Arc<Module>,
@@ -71,6 +75,9 @@ impl Drop for Instance {
             if let Some((c, e)) = &self.connections {
                 c.disconnect(e.as_ptr());
                 e.disconnect(c.as_ptr());
+            }
+            if let Some(ctrl) = &self.controller {
+                ctrl.setComponentHandler(std::ptr::null_mut());
             }
             if self.separate_controller {
                 if let Some(ctrl) = &self.controller {
@@ -131,7 +138,12 @@ impl Vst3Plugin {
                 _ => None,
             };
 
-            let inst = Arc::new(Instance { activation: std::sync::Mutex::new(0), component, controller, separate_controller, connections, _host: host, _module: module });
+            let edits = Arc::new(EditQueue::default());
+            let handler = ComWrapper::new(ComponentHandler { edits: edits.clone() });
+            if let (Some(ctrl), Some(h)) = (&controller, handler.as_com_ref::<IComponentHandler>()) {
+                ctrl.setComponentHandler(h.as_ptr());
+            }
+            let inst = Arc::new(Instance { activation: std::sync::Mutex::new(0), component, controller, separate_controller, connections, _handler: handler, edits, _host: host, _module: module });
 
             // Sync the controller with the component's initial state.
             if let Some(ctrl) = &inst.controller {
@@ -203,6 +215,22 @@ impl Vst3Plugin {
     /// [`Vst3Processor::process_keyed`] feeds.
     pub fn has_side_chain(&self) -> bool {
         unsafe { side_chain_bus(&self.inst.component).is_some() }
+    }
+
+    /// Whether the plug-in may have an editor of its own here (it has an edit controller
+    /// and this platform has editor windows); [`open_editor`](Self::open_editor) tells for sure.
+    pub fn has_editor(&self) -> bool {
+        self.inst.controller.is_some() && crate::window::platform_type().is_some()
+    }
+
+    /// Open the plug-in's editor in a native window titled `title`. Main thread only.
+    pub fn open_editor(&self, title: &str) -> Result<Vst3Editor> {
+        crate::editor::open(self.inst.clone(), title)
+    }
+
+    /// Parameter edits made in the plug-in's editor since the last call.
+    pub fn take_edits(&self) -> Vec<Edit> {
+        self.inst.edits.take()
     }
 
     /// Prepare the plugin for processing and return the audio-thread half.

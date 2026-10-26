@@ -315,6 +315,44 @@ mod tests {
         assert!(back.project().tracks[keys].is_instrument());
     }
 
+    /// What an audio unit's own view does (no window needed): its listener queues the
+    /// gesture, which lands in the project as one undo step; open editors follow automation.
+    #[test]
+    fn audio_unit_view_edits_route_to_the_project() {
+        use crate::engine::plugins::Loaded;
+        use opentake_project::AutomationPoint;
+        let mut e = Engine::new();
+        let t = e.add_track("Gtr").unwrap();
+        e.insert_plugin(t, "au:aufx:dely:appl", None).unwrap();
+        let instance = e.project().tracks[t].plugins[0].instance;
+        assert!(e.has_editor(t, SlotRef::Effect(0)), "AUDelay has a Cocoa view");
+        let mix = e.plugin_params(t, 0).unwrap().into_iter().find(|p| p.title.contains("Wet")).unwrap();
+        e.remember_values(t, SlotRef::Effect(0)); // as opening the editor does
+        let Some(Loaded::Au(plugin)) = e.pool.get(&instance) else { panic!("an AU slot") };
+        let _listener = plugin.listen().unwrap();
+        plugin.emulate_view_edit(mix.id, 0.25);
+        opentake_au::pump_events(std::time::Duration::from_millis(300));
+        let steps = e.history_info().undo_steps.len();
+        e.apply_editor_edits().unwrap();
+        let saved = |e: &Engine| e.project().tracks[t].plugins[0].params.iter().find(|p| p.0 == mix.id).map(|p| p.1);
+        assert!(saved(&e).is_some_and(|v| (v - 0.25).abs() < 1e-3), "{:?}", saved(&e));
+        assert_eq!(e.history_info().undo_steps.len(), steps + 1);
+        e.undo().unwrap();
+        let unit_value = |e: &Engine| e.plugin_params(t, 0).unwrap().into_iter().find(|p| p.id == mix.id).unwrap().value;
+        assert!((unit_value(&e) - mix.value).abs() < 1e-3, "undo reaches the unit (and its view)");
+
+        // Automation playback shows in an open editor: the unit holds the lane's value.
+        let target = e.param_target(Some(t), SlotRef::Effect(0), mix.id).unwrap();
+        let lane = e.add_lane(Some(t), target).unwrap();
+        e.insert_point(Some(t), lane, AutomationPoint::new(0.0, 0.8)).unwrap();
+        e.sync_editors(&[instance]);
+        let Some(Loaded::Au(plugin)) = e.pool.get(&instance) else { unreachable!() };
+        assert!((plugin.get_param(mix.id).unwrap() - 0.8).abs() < 1e-3);
+        e.remove_lane(Some(t), lane).unwrap();
+        e.sync_editors(&[instance]);
+        assert!((unit_value(&e) - mix.value).abs() < 1e-3, "back to the set value");
+    }
+
     #[test]
     fn audio_units_play_through_the_mixer() {
         let mut e = Engine::new();

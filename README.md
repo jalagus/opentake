@@ -19,6 +19,7 @@ you watch the changes appear live — and undo anything you don't like.
 - 🎙️ Multitrack recording from any audio interface (CoreAudio, WASAPI, ALSA/JACK via cpal), latency-compensated with a built-in loopback measurement
 - 🎹 Instrument tracks, piano roll, a built-in synth and GM drum kit; VST3 instruments and effects, plus Audio Units on macOS
 - 🎛️ Built-in EQ, compressor, multiband compressor, limiter, delay, reverb, gate, de-esser, chorus and phaser on any track or the master bus; plug-in delay compensation
+- 🪟 Plug-ins' own editor windows (VST3 on macOS and Windows, Audio Units): what you turn there is undoable and writes automation
 - 🔀 Buses and sends: route tracks into a bus, or send them pre/post-fader to a shared reverb or delay bus
 - 🔑 Side-chain inputs for dynamics: key a compressor, gate, limiter, multiband or de-esser (or a side-chain-capable VST3 / AU) from another track, e.g. a kick pumping a pad
 - 📈 Automation of volume, pan, mute and any plug-in parameter, in lanes under each track, with Read, Touch and Latch modes
@@ -31,7 +32,7 @@ you watch the changes appear live — and undo anything you don't like.
   fades, crossfades and click-free merging of regions
 - 🎚️ Full mixer, metronome, undo/redo for everything
 - 💾 Export the mix and stems to WAV or FLAC, faster than real time
-- 🤖 MCP server (stdio or HTTP) with 89 tools — the agent and you share one session
+- 🤖 MCP server (stdio or HTTP) with 90 tools — the agent and you share one session
 - 📂 Its own `.otp` project files (double-click to open), Reaper `.rpp` and DAWproject (Bitwig, Studio One, Cubase) projects
 - 🔀 Imports Ableton Live sets (`.als`), Ardour sessions, and Logic Pro projects exported as Final Cut Pro XML
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
@@ -63,8 +64,8 @@ The builds aren't signed yet:
 | Crate | What it does |
 |---|---|
 | `crates/opentake-project` | Project model (tracks, clips, plugin slots), Reaper `.rpp` import/export, Guitar Pro 7/8 reader |
-| `crates/opentake-vst3` | VST3 hosting: bundle scanning, loading, parameters, state, realtime processing |
-| `crates/opentake-au` | Audio Unit hosting on macOS (AudioToolbox): listing, loading, parameters, state, host transport, realtime processing |
+| `crates/opentake-vst3` | VST3 hosting: bundle scanning, loading, parameters, state, realtime processing, editor views and the native windows plug-in editors live in |
+| `crates/opentake-au` | Audio Unit hosting on macOS (AudioToolbox): listing, loading, parameters, state, host transport, realtime processing, Cocoa / AUv3 views |
 | `crates/opentake-engine` | cpal audio I/O, lock-free mixer, WAV recorder, control-side `Engine` API |
 | `crates/opentake` | `opentake` binary: egui GUI, MCP server (stdio or streamable HTTP), small CLI |
 
@@ -139,6 +140,13 @@ agent.
   The chorus (1–4 voices) shows each voice's sweeping delay, and the phaser (2–12 stages) its
   notches across the swept range.
   Plug-in latency is compensated automatically.
+- **Plug-in editors**: double-click a VST3 or Audio Unit slot in the mixer (or click **Open
+  Editor** in its window's header) to open the plug-in's own editor, in a window of its own
+  floating above OpenTake. Each control you move there is one undo step, and with an
+  automation lane in Touch or Latch it's written while playing; automation playback, undo and
+  OpenTake's sliders move the plug-in's controls in turn. Closing it brings back OpenTake's
+  generic controls if they were open. Built-in effects keep their own editors. An agent can
+  show one with `open_plugin_editor`.
 - **Buses**: Track → New Bus (or Create Bus from Selection), then pick a track's Output in
   the inspector or mixer; effects on the bus process the whole group.
 - **Sends**: the Sends slots under a strip's Audio FX feed buses besides the output. Click the
@@ -236,7 +244,7 @@ of the tool calls behind them):
 `add_track`, `add_bus`, `add_send`, `update_send`, `remove_send`, `move_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `set_clip_gain`, `normalize_clip`, `set_clip_pitch_stretch`, `set_clip_fades`, `crossfade_clips`, `merge_clips`, `remove_clip`,
 `select_take`, `delete_take`, `comp_take`, `clear_comp`, `flatten_comp`,
 `play`, `stop`, `seek`, `record`, `list_midi_inputs`, `set_midi_inputs`,
-`scan_plugins`, `insert_plugin`, `remove_plugin`, `insert_master_plugin`, `remove_master_plugin`, `set_plugin_bypass`,
+`scan_plugins`, `insert_plugin`, `remove_plugin`, `insert_master_plugin`, `remove_master_plugin`, `set_plugin_bypass`, `open_plugin_editor`,
 `list_plugin_params`, `set_plugin_param`, `set_sidechain` (`"eq"` inserts the built-in EQ; `master: true` addresses the master bus),
 `list_instruments`, `add_instrument_track`, `set_instrument`, `list_instrument_params`, `set_instrument_param`,
 `add_midi_clip`, `set_midi_notes`, `add_midi_notes`, `update_midi_clip`, `copy_midi_clip`, `remove_midi_clip`,
@@ -310,11 +318,14 @@ automation other than tempo, sends/returns and fades aren't imported.
   Resampling is linear.
 - Recording latency comes from what the device reports; some devices misreport it (the
   built-in Mac audio by 20–40 ms), so measure it once per setup (Audio Settings → Measure Latency).
-- VST3: no plugin editor windows (generic parameter sliders instead) and no `IMessage` host
-  objects (some plugins need them for processor ↔ controller messaging). Plugin
-  parameters are saved by value, but full state chunks aren't saved yet. Instruments get
-  note events only and haven't been tested with many third-party plugins.
-- Audio Units (macOS only): no editor windows (generic sliders), stereo/mono main bus plus a
+- VST3: editor windows on macOS and Windows only; Linux (X11 embedding needs the host's run
+  loop) keeps the generic parameter sliders. A window the user resizes is fitted to the
+  plug-in on the next GUI frame, and a preset loaded in an editor updates only parameters
+  OpenTake has already saved. Plugin parameters are saved by value, but full state chunks
+  aren't saved yet. Instruments get note events only and haven't been tested with many
+  third-party plugins.
+- Audio Units (macOS only): editor windows for Cocoa views (AUv2) and AUv3 view controllers
+  (the latter untested so far); stereo/mono main bus plus a
   side chain on a second input element (no extra outputs), notes only (no pitch bend/CC). State is saved as the
   unit's property list; Reaper's AU state may not restore. AUv3 extensions that load only
   asynchronously wait up to 10 s and fail if they need the main thread meanwhile.
@@ -351,14 +362,16 @@ automation other than tempo, sends/returns and fades aren't imported.
   bus (stereo or mono as it declares); side-chain VST3s / AUs have had little third-party testing,
   and `.rpp` / DAWproject export drops keys.
 - Automation: plug-in parameters change once per 64-sample block (fader, pan and mute ramp
-  within it), so changes land within ~1.3 ms of their point; plug-in editor windows don't follow
-  automated values; no automation of region gain, and Touch/Latch only record from the GUI.
+  within it), so changes land within ~1.3 ms of their point (plug-in editor windows show them
+  at the GUI's frame rate); no automation of region gain, and Touch/Latch only record from
+  the GUI and plug-in editors.
 
 ## Development
 
 ```sh
 cargo test                     # unit tests + headless GUI interaction tests (egui_kittest)
 OPENTAKE_SCREENSHOT=/tmp/ui.png cargo test -p opentake render_screenshot -- --ignored   # render the GUI to PNGs (README screenshots)
+cargo run -p opentake-engine --example open_editor -- au:aufx:dely:appl   # open a plug-in's editor window, no audio
 ```
 
 ## License

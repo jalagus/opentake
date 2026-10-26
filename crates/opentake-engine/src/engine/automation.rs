@@ -549,6 +549,15 @@ impl Engine {
         Ok(())
     }
 
+    /// A control that reports its release (a plug-in editor's gesture) is still held: a
+    /// Touch write goes on even while it doesn't move.
+    pub(super) fn hold_control(&mut self, owner: LaneOwner, target: AutomationTarget) {
+        let id = self.owner_id(owner);
+        if let Some(w) = self.writing.iter_mut().find(|w| w.owner == id && w.target == target && w.touching) {
+            w.moved = std::time::Instant::now();
+        }
+    }
+
     /// Whether `target` is being written (its control shows the written value).
     pub fn is_writing(&self, owner: LaneOwner, target: AutomationTarget) -> bool {
         let id = self.owner_id(owner);

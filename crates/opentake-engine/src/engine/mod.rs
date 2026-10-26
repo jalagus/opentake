@@ -9,6 +9,7 @@ mod au;
 mod automation;
 mod calibration;
 mod comp;
+mod editors;
 mod export;
 mod fades;
 mod flex;
@@ -49,6 +50,7 @@ pub use analysis::{LevelReport, MixJob, MixReport};
 pub use au::AudioUnitInfo;
 pub use automation::{AutomationParam, LaneOwner};
 pub use calibration::LatencyReport;
+pub use editors::PluginEditor;
 pub use export::{AudioFormat, ExportOptions, ExportReport, ExportedFile, SAMPLE_RATES};
 pub use fades::{CROSSFADE_SECS, FadeUpdate, JOIN_SECS};
 pub use flex::{FlexJob, FlexRender, MAX_SEMITONES, PitchStretch, STRETCH_RANGE};
@@ -302,6 +304,8 @@ pub struct Engine {
     /// controls being written into lanes (see automation.rs).
     live_automation: HashMap<u64, Vec<EnvTarget>>,
     writing: Vec<automation::Writing>,
+    /// Gestures in plug-in editors and what open editors were last shown (see editors.rs).
+    editor_state: editors::EditorState,
     history: history::History,
     /// Added to the measured round trip when placing recordings (milliseconds), and the
     /// stored offsets per device setup (see calibration.rs).
@@ -345,6 +349,7 @@ impl Engine {
             live_instrument: HashMap::new(),
             live_automation: HashMap::new(),
             writing: Vec::new(),
+            editor_state: editors::EditorState::default(),
             history: history::History::default(),
             record_offset_ms: 0.0,
             latency_store: calibration::LatencyStore::default(),

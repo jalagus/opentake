@@ -1,11 +1,16 @@
 //! Host-side COM objects handed to plugins.
 
 use std::cell::{Cell, RefCell};
-use std::ffi::c_void;
+use std::collections::HashMap;
+use std::ffi::{CStr, CString, c_void};
+use std::sync::Arc;
 
+use vst3::Steinberg::Vst::IAttributeList_::AttrID;
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
 use vst3::{Class, ComWrapper};
+
+use crate::editor::{Edit, EditQueue};
 
 pub const HOST_NAME: &str = "OpenTake";
 
@@ -24,12 +29,210 @@ impl IHostApplicationTrait for HostApp {
         kResultOk
     }
 
-    unsafe fn createInstance(&self, _cid: *mut TUID, _iid: *mut TUID, obj: *mut *mut c_void) -> tresult {
-        // TODO: provide IMessage / IAttributeList so component <-> controller messaging works.
-        if !obj.is_null() {
-            unsafe { *obj = std::ptr::null_mut() };
+    /// Component and controller talk through `IConnectionPoint::notify` with messages the
+    /// host creates here (many editors only show the right state once that works).
+    unsafe fn createInstance(&self, cid: *mut TUID, iid: *mut TUID, obj: *mut *mut c_void) -> tresult {
+        if obj.is_null() {
+            return kInvalidArgument;
         }
-        kNotImplemented
+        // SAFETY: the ids are valid when non-null (sloppy plug-ins pass only one).
+        let asks = |id: &TUID| unsafe { (!cid.is_null() && *cid == *id) || (!iid.is_null() && *iid == *id) };
+        let created = if asks(&IMessage_iid) {
+            ComWrapper::new(HostMessage::default()).to_com_ptr::<IMessage>().map(|p| p.into_raw() as *mut c_void)
+        } else if asks(&IAttributeList_iid) {
+            ComWrapper::new(AttributeList::default()).to_com_ptr::<IAttributeList>().map(|p| p.into_raw() as *mut c_void)
+        } else {
+            None
+        };
+        // SAFETY: checked non-null; the plug-in owns the reference handed out.
+        unsafe { *obj = created.unwrap_or(std::ptr::null_mut()) };
+        if created.is_some() { kResultOk } else { kNotImplemented }
+    }
+}
+
+/// `IMessage`: an id plus an attribute list, passed between component and controller.
+pub struct HostMessage {
+    id: RefCell<Option<CString>>,
+    attributes: ComWrapper<AttributeList>,
+}
+
+impl Default for HostMessage {
+    fn default() -> Self {
+        Self { id: RefCell::new(None), attributes: ComWrapper::new(AttributeList::default()) }
+    }
+}
+
+impl Class for HostMessage {
+    type Interfaces = (IMessage,);
+}
+
+impl IMessageTrait for HostMessage {
+    unsafe fn getMessageID(&self) -> FIDString {
+        self.id.borrow().as_ref().map_or(std::ptr::null(), |id| id.as_ptr())
+    }
+
+    unsafe fn setMessageID(&self, id: FIDString) {
+        // SAFETY: a non-null id is a NUL-terminated string.
+        *self.id.borrow_mut() = (!id.is_null()).then(|| unsafe { CStr::from_ptr(id) }.to_owned());
+    }
+
+    /// Not add-ref'ed, as in the SDK's host classes: the message owns its list.
+    unsafe fn getAttributes(&self) -> *mut IAttributeList {
+        self.attributes.as_com_ref::<IAttributeList>().map_or(std::ptr::null_mut(), |r| r.as_ptr())
+    }
+}
+
+enum Attr {
+    Int(i64),
+    Float(f64),
+    /// UTF-16 without the terminator.
+    String(Vec<TChar>),
+    Binary(Vec<u8>),
+}
+
+/// `IAttributeList`: typed values by key. The list owns string and binary data, so the
+/// pointer `getBinary` hands out lives as long as the message (or until the key is set again).
+#[derive(Default)]
+pub struct AttributeList {
+    values: RefCell<HashMap<CString, Attr>>,
+}
+
+impl AttributeList {
+    fn set(&self, id: AttrID, value: Attr) -> tresult {
+        if id.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: a non-null id is a NUL-terminated string.
+        self.values.borrow_mut().insert(unsafe { CStr::from_ptr(id) }.to_owned(), value);
+        kResultOk
+    }
+
+    fn get<T>(&self, id: AttrID, f: impl FnOnce(&Attr) -> Option<T>) -> Option<T> {
+        if id.is_null() {
+            return None;
+        }
+        // SAFETY: as in `set`.
+        self.values.borrow().get(unsafe { CStr::from_ptr(id) }).and_then(f)
+    }
+}
+
+impl Class for AttributeList {
+    type Interfaces = (IAttributeList,);
+}
+
+/// Write `value` through `out` (if both exist).
+unsafe fn put<T>(value: Option<T>, out: *mut T) -> tresult {
+    match value {
+        Some(v) if !out.is_null() => {
+            unsafe { *out = v };
+            kResultOk
+        }
+        _ => kResultFalse,
+    }
+}
+
+impl IAttributeListTrait for AttributeList {
+    unsafe fn setInt(&self, id: AttrID, value: int64) -> tresult {
+        self.set(id, Attr::Int(value))
+    }
+
+    unsafe fn getInt(&self, id: AttrID, value: *mut int64) -> tresult {
+        unsafe { put(self.get(id, |a| if let Attr::Int(v) = a { Some(*v) } else { None }), value) }
+    }
+
+    unsafe fn setFloat(&self, id: AttrID, value: f64) -> tresult {
+        self.set(id, Attr::Float(value))
+    }
+
+    unsafe fn getFloat(&self, id: AttrID, value: *mut f64) -> tresult {
+        unsafe { put(self.get(id, |a| if let Attr::Float(v) = a { Some(*v) } else { None }), value) }
+    }
+
+    unsafe fn setString(&self, id: AttrID, string: *const TChar) -> tresult {
+        if string.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: a NUL-terminated UTF-16 string.
+        let len = (0..).take_while(|&i| unsafe { *string.add(i) } != 0).count();
+        self.set(id, Attr::String(unsafe { std::slice::from_raw_parts(string, len) }.to_vec()))
+    }
+
+    /// `size_in_bytes` is the buffer's size; the copy is cut to fit and always terminated.
+    unsafe fn getString(&self, id: AttrID, string: *mut TChar, size_in_bytes: uint32) -> tresult {
+        let capacity = size_in_bytes as usize / std::mem::size_of::<TChar>();
+        if string.is_null() || capacity == 0 {
+            return kInvalidArgument;
+        }
+        let found = self.get(id, |a| {
+            let Attr::String(s) = a else { return None };
+            let n = s.len().min(capacity - 1);
+            // SAFETY: the plug-in's buffer holds `capacity` characters.
+            unsafe {
+                std::ptr::copy_nonoverlapping(s.as_ptr(), string, n);
+                *string.add(n) = 0;
+            }
+            Some(())
+        });
+        if found.is_some() { kResultOk } else { kResultFalse }
+    }
+
+    unsafe fn setBinary(&self, id: AttrID, data: *const c_void, size_in_bytes: uint32) -> tresult {
+        // SAFETY: `data` holds `size_in_bytes` bytes.
+        let bytes = if data.is_null() { Vec::new() } else { unsafe { std::slice::from_raw_parts(data as *const u8, size_in_bytes as usize) }.to_vec() };
+        self.set(id, Attr::Binary(bytes))
+    }
+
+    unsafe fn getBinary(&self, id: AttrID, data: *mut *const c_void, size_in_bytes: *mut uint32) -> tresult {
+        if data.is_null() || size_in_bytes.is_null() {
+            return kInvalidArgument;
+        }
+        match self.get(id, |a| if let Attr::Binary(b) = a { Some((b.as_ptr(), b.len())) } else { None }) {
+            Some((ptr, len)) => {
+                unsafe {
+                    *data = ptr as *const c_void;
+                    *size_in_bytes = len as uint32;
+                }
+                kResultOk
+            }
+            None => kResultFalse,
+        }
+    }
+}
+
+/// `IComponentHandler`: how the edit controller (in practice its editor) reports parameter
+/// edits. They're queued for the engine, which applies them to the processor, the project,
+/// undo and automation (see `Vst3Plugin::take_edits`).
+pub struct ComponentHandler {
+    pub(crate) edits: Arc<EditQueue>,
+}
+
+impl Class for ComponentHandler {
+    type Interfaces = (IComponentHandler,);
+}
+
+impl IComponentHandlerTrait for ComponentHandler {
+    unsafe fn beginEdit(&self, id: ParamID) -> tresult {
+        self.edits.push(Edit::Begin(id));
+        kResultOk
+    }
+
+    unsafe fn performEdit(&self, id: ParamID, value: ParamValue) -> tresult {
+        self.edits.push(Edit::Perform(id, value.clamp(0.0, 1.0)));
+        kResultOk
+    }
+
+    unsafe fn endEdit(&self, id: ParamID) -> tresult {
+        self.edits.push(Edit::End(id));
+        kResultOk
+    }
+
+    /// New parameter values (a preset loaded in the editor) are picked up; other restarts
+    /// (latency, buses) take effect when the processor is next set up.
+    unsafe fn restartComponent(&self, flags: int32) -> tresult {
+        if flags & RestartFlags_::kParamValuesChanged != 0 {
+            self.edits.push(Edit::Reload);
+        }
+        kResultOk
     }
 }
 

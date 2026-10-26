@@ -3,6 +3,7 @@
 //! parameters, state and realtime processing. On other platforms this crate is empty.
 #![cfg(target_os = "macos")]
 
+mod editor;
 mod plugin;
 
 use std::ptr::NonNull;
@@ -11,6 +12,7 @@ use objc2_audio_toolbox::*;
 use objc2_core_foundation::{CFRetained, CFString};
 use serde::Serialize;
 
+pub use editor::{AuEditor, ParamListener, pump_events};
 pub use plugin::{AuPlugin, AuProcessor, NoteEvent, ParamInfo, Transport};
 
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +23,8 @@ pub enum Error {
     Call(&'static str, i32),
     #[error("{0}")]
     Other(&'static str),
+    #[error("editor window: {0}")]
+    Window(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

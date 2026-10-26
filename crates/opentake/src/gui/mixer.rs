@@ -410,13 +410,22 @@ fn slot_pill(app: &mut DawApp, ui: &mut egui::Ui, t: usize, which: SlotRef, name
         let color = if bypass { theme::TEXT_FAINT } else { theme::TEXT };
         let label = egui::Label::new(RichText::new(short_plugin_name(name)).size(11.0).color(color)).truncate().sense(Sense::click());
         let r = ui.add_sized([label_w, 18.0], label);
-        let r = if which == SlotRef::Instrument { r.on_hover_text("Open instrument (right-click to change)") } else { r.on_hover_text("Open plug-in window") };
+        let r = if which == SlotRef::Instrument {
+            r.on_hover_text("Open instrument (double-click: its own editor; right-click to change)")
+        } else {
+            r.on_hover_text("Open plug-in window (double-click: its own editor)")
+        };
         if r.clicked() {
             if open {
                 app.open_plugins.retain(|&x| x != (t, which));
             } else {
                 app.open_plugins.push((t, which));
             }
+        }
+        if r.double_clicked() {
+            // Its two clicks opened and closed OpenTake's window; the plug-in's own opens
+            // (or OpenTake's again, for built-ins and plug-ins without one).
+            app.act(Action::OpenEditor(t, which));
         }
         if which == SlotRef::Instrument {
             r.context_menu(|ui| {

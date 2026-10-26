@@ -775,6 +775,12 @@ impl Engine {
     }
 
     pub fn set_slot_param(&mut self, track: usize, which: SlotRef, id: u32, value: f64) -> Result<Option<String>> {
+        let instance = self.slot_ref(track, which)?.instance;
+        self.set_slot_param_keyed(track, which, id, value, format!("param:{instance}:{id}"))
+    }
+
+    /// [`set_slot_param`](Self::set_slot_param) merging into the undo step with `key`.
+    pub(super) fn set_slot_param_keyed(&mut self, track: usize, which: SlotRef, id: u32, value: f64, key: String) -> Result<Option<String>> {
         let index = if matches!(which, SlotRef::Master(_)) { track } else { self.track_index(track)? };
         let value = value.clamp(0.0, 1.0);
         let params = self.slot_params_static(track, which)?;
@@ -786,9 +792,8 @@ impl Engine {
                 slot.params.push((id, current));
             }
         }
-        let instance = self.slot_ref(track, which)?.instance;
         let title = params.iter().find(|p| p.id == id).map(|p| p.title.clone()).unwrap_or_default();
-        self.record(format!("Change {title}"), Some(format!("param:{instance}:{id}")), |e| {
+        self.record(format!("Change {title}"), Some(key), |e| {
             e.apply_param(index, which, id, value)?;
             Ok(())
         })?;
