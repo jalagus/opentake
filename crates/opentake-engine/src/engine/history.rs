@@ -106,6 +106,7 @@ impl Engine {
                         }
                     }
                     self.history.redo.clear();
+                    self.sync_midi_targets()?;
                     self.sync_song_end()?;
                 }
                 Ok(v)
@@ -291,6 +292,7 @@ impl Engine {
         if old.master_volume != self.project.master_volume {
             self.send(Command::SetMasterGain(self.project.master_volume))?;
         }
+        self.sync_midi_targets()?;
         self.sync_song_end()?;
         Ok(())
     }

@@ -23,7 +23,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use opentake_engine::project::{AutomationLane, AutomationMode, AutomationTarget, Curve, Note, Project};
-use opentake_engine::{AudioConfig, AutomationParam, DeviceList, Engine, EngineStatus, HistoryInfo, LaneOwner, ParamView, RegionData, SendUpdate, SlotRef, TrackUpdate, Waveform};
+use opentake_engine::midi_input::MidiSelection;
+use opentake_engine::{AudioConfig, AutomationParam, DeviceList, Engine, EngineStatus, HistoryInfo, LaneOwner, MidiInputs, ParamView, RegionData, SendUpdate, SlotRef, TrackUpdate, Waveform};
 use opentake_vst3::ScannedPlugin;
 use eframe::egui;
 use egui::{Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
@@ -61,6 +62,7 @@ pub fn run(engine: SharedEngine, mcp_url: Option<String>, settings_path: Option<
             app.recent = settings.existing_recent();
             app.tab_scale = settings.tab_scale.unwrap_or(1.0).clamp(0.75, 2.5);
             app.tab_paper = settings.tab_paper.unwrap_or(false);
+            app.midi_saved = settings.midi_selection();
             app.settings_path = settings_path;
             if has_tracks {
                 app.selected_track = Some(0);
@@ -104,6 +106,9 @@ pub(crate) struct Snapshot {
     pub side_chain_inputs: std::collections::HashSet<(usize, SlotRef)>,
     /// What can be automated, per track index, for tracks showing their automation.
     pub auto_params: HashMap<usize, Vec<AutomationParam>>,
+    /// The chosen MIDI inputs, and while recording the notes played so far (timeline seconds).
+    pub midi_selection: MidiSelection,
+    pub recording_notes: Vec<Note>,
 }
 
 /// Copied regions (⌘C): each with its track offset from the top-most copied track, and
@@ -147,7 +152,9 @@ pub(crate) enum Action {
     SetRecordOffset(f64),
     /// Loopback-measure the recording latency on an input channel.
     MeasureLatency(usize),
+    /// Rescan audio devices and MIDI inputs.
     RefreshDevices,
+    SetMidiInputs(MidiSelection),
     NewProject,
     OpenProject(PathBuf),
     SaveProject(Option<PathBuf>),
@@ -262,6 +269,11 @@ pub(crate) struct DawApp {
     /// Track being dragged to a new place (lane headers or mixer strips).
     pub track_drag: Option<usize>,
     devices: Option<DeviceList>,
+    /// MIDI inputs as last scanned (or why they couldn't be), the choice last saved in the
+    /// settings, and the note count last seen with when it changed (the activity light).
+    pub midi_ports: Option<Result<MidiInputs, String>>,
+    midi_saved: MidiSelection,
+    midi_seen: (u64, Option<Instant>),
     audio_cfg: AudioConfig,
     show_audio_settings: bool,
     /// Input channel for the loopback latency measurement.
@@ -331,6 +343,9 @@ impl DawApp {
             open_plugins: Vec::new(),
             track_drag: None,
             devices: None,
+            midi_ports: None,
+            midi_saved: MidiSelection::All,
+            midi_seen: (0, None),
             audio_cfg: AudioConfig::default(),
             show_audio_settings: false,
             latency_channel: 0,
@@ -427,6 +442,10 @@ impl DawApp {
         let open = self.open_plugins.clone();
         let mut cache = std::mem::take(&mut self.auto_params);
         let mut e = self.lock();
+        // MIDI input plays the selected track when no instrument track is armed.
+        if let Err(err) = e.select_track(self.selected_track) {
+            tracing::warn!("MIDI input: {err:#}");
+        }
         // Held and latched controls keep writing their lanes while playing.
         if let Err(err) = e.automation_tick() {
             tracing::warn!("automation: {err:#}");
@@ -461,9 +480,12 @@ impl DawApp {
         let multiband = open.iter().filter_map(|&(t, s)| Some(((t, s), e.multiband_meter(t, s)?))).collect();
         let side_chain_inputs = open.iter().copied().filter(|&(t, s)| e.supports_side_chain(t, s)).collect();
         let params = open.into_iter().filter_map(|(t, s)| Some(((t, s), e.slot_params(t, s).ok()?))).collect();
+        let status = e.status();
         let snap = Snapshot {
             project_path: e.project_path().map(|p| p.to_path_buf()),
-            status: e.status(),
+            recording_notes: if status.recording { e.recording_notes() } else { Vec::new() },
+            midi_selection: e.midi_selection().clone(),
+            status,
             scanned: e.scanned_plugins().to_vec(),
             audio_units: e.audio_units().to_vec(),
             scan_errors: e.scan_errors().to_vec(),
@@ -503,14 +525,14 @@ impl DawApp {
         match action {
             Action::Play => e.play()?,
             Action::Stop => {
-                let clips = e.stop()?;
-                if !clips.is_empty() {
-                    self.info(format!("Recorded {} region(s)", clips.len()));
+                let recorded = e.stop()?;
+                if recorded.count() > 0 {
+                    self.info(format!("Recorded {} region(s)", recorded.count()));
                 }
             }
             Action::Record => {
-                let files = e.record_audio()?;
-                self.info(format!("Recording {} track(s)", files.len()));
+                let r = e.start_recording()?;
+                self.info(format!("Recording {} track(s)", r.files.len() + r.midi_tracks.len()));
             }
             Action::Seek(t) => e.seek(t)?,
             Action::SetTempo(bpm) => e.set_tempo(bpm, None)?,
@@ -559,7 +581,17 @@ impl DawApp {
                     r.round_trip_ms, r.reported_ms, r.record_offset_ms
                 ));
             }
-            Action::RefreshDevices => self.devices = Some(e.list_devices()?),
+            Action::RefreshDevices => {
+                self.midi_ports = Some(e.list_midi_inputs().map_err(|err| format!("{err:#}")));
+                self.devices = Some(e.list_devices()?);
+            }
+            Action::SetMidiInputs(selection) => {
+                let inputs = e.set_midi_inputs(selection)?;
+                if !inputs.errors.is_empty() {
+                    self.error(format!("Couldn't open MIDI input {}", inputs.errors.join("; ")));
+                }
+                self.midi_ports = Some(Ok(inputs));
+            }
             Action::NewProject => {
                 e.new_project("Untitled")?;
                 self.reset_selection(Some(0));
@@ -897,6 +929,21 @@ impl DawApp {
             list.add_recent(path);
             self.recent = list.recent_projects;
             self.save_recent();
+        }
+    }
+
+    /// Remember the MIDI inputs when they change (here or by an agent).
+    fn save_midi_inputs(&mut self, snap: &Snapshot) {
+        if snap.midi_selection == self.midi_saved {
+            return;
+        }
+        self.midi_saved = snap.midi_selection.clone();
+        if let Some(path) = &self.settings_path {
+            let mut settings = crate::settings::Settings::load(path);
+            settings.set_midi_selection(&snap.midi_selection);
+            if let Err(e) = settings.save(path) {
+                self.error(format!("Could not save settings: {e:#}"));
+            }
         }
     }
 
@@ -1931,13 +1978,42 @@ impl DawApp {
         } else if pill(ui, theme::INPUT, "Audio off — click to start", "Start the audio engine").clicked() {
             self.act(Action::StartAudio(self.audio_cfg.clone()));
         }
+        if self.midi_light(ui, snap).clicked() {
+            self.show_audio_settings = true;
+            self.act(Action::RefreshDevices);
+        }
         if show_meter {
             ui.add_space(6.0);
             widgets::stereo_hmeter(ui, vec2(84.0, 10.0), s.master_peak_db).on_hover_text("Stereo Out level");
         }
     }
 
+    /// MIDI activity: a dot that lights while notes come in (and keys are held).
+    fn midi_light(&mut self, ui: &mut egui::Ui, snap: &Snapshot) -> egui::Response {
+        let s = &snap.status;
+        if s.midi_notes_received != self.midi_seen.0 {
+            self.midi_seen = (s.midi_notes_received, Some(Instant::now()));
+        }
+        let lit = !s.midi_keys_down.is_empty() || self.midi_seen.1.is_some_and(|t| t.elapsed() < Duration::from_millis(180));
+        let color = match (lit, s.midi_inputs.is_empty()) {
+            (true, _) => theme::PLAY,
+            (false, false) => theme::shade(theme::PLAY, 0.35),
+            (false, true) => theme::TEXT_FAINT,
+        };
+        let names = |ids: &[usize]| ids.iter().filter_map(|&i| snap.project.tracks.get(i)).map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ");
+        let tip = match (s.midi_inputs.is_empty(), s.midi_input_tracks.is_empty()) {
+            (true, _) if !s.audio_running => "MIDI inputs open when audio runs".to_string(),
+            (true, _) => "No MIDI input connected".to_string(),
+            (false, true) => format!("MIDI in: {}\nArm or select an instrument track to play it", s.midi_inputs.join(", ")),
+            (false, false) => format!("MIDI in: {}\nPlaying: {}", s.midi_inputs.join(", "), names(&s.midi_input_tracks)),
+        };
+        let resp = pill(ui, color, "MIDI", &tip);
+        widgets::label(&resp, egui::Role::Button, "MIDI activity");
+        resp
+    }
+
     // ------------------------------------------------------------------ inspector
+
 
     fn inspector(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
         let selected = self.selected_track.filter(|&t| t < snap.project.tracks.len());
@@ -2179,6 +2255,8 @@ impl DawApp {
                 });
                 ui.end_row();
             });
+            ui.add_space(12.0);
+            self.midi_inputs_section(ui, snap);
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.add(egui::Button::new(RichText::new("Apply").color(Color32::WHITE)).fill(theme::ACCENT)).clicked() {
@@ -2190,6 +2268,43 @@ impl DawApp {
             });
         });
         self.show_audio_settings = open;
+    }
+
+    /// Which MIDI inputs to listen to: all (the default, also devices plugged in later) or
+    /// the ones ticked. Changes apply right away.
+    fn midi_inputs_section(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        widgets::section(ui, "MIDI Inputs");
+        let all = snap.midi_selection == MidiSelection::All;
+        let mut every = all;
+        if ui.checkbox(&mut every, "All MIDI Inputs").on_hover_text("Listen to every MIDI input, including devices plugged in later").changed() {
+            // Unticking "All" keeps the ports there are now, to untick one by one.
+            let ports = self.midi_ports.as_ref().and_then(|r| r.as_ref().ok()).map(|m| m.ports.iter().map(|p| p.name.clone()).collect()).unwrap_or_default();
+            self.act(Action::SetMidiInputs(if every { MidiSelection::All } else { MidiSelection::Ports(ports) }));
+        }
+        let ports = match &self.midi_ports {
+            None => return drop(ui.label(RichText::new("Looking for MIDI inputs…").color(theme::TEXT_FAINT))),
+            Some(Err(e)) => return drop(ui.label(RichText::new(format!("MIDI unavailable: {e}")).color(theme::TEXT_FAINT))),
+            Some(Ok(m)) if m.ports.is_empty() => return drop(ui.label(RichText::new("No MIDI inputs found. Connect a keyboard, then Refresh Devices.").color(theme::TEXT_FAINT))),
+            Some(Ok(m)) => m.ports.clone(),
+        };
+        let chosen = |name: &str| snap.midi_selection.includes(name);
+        ui.indent("midi_ports", |ui| {
+            for port in &ports {
+                ui.horizontal(|ui| {
+                    let mut on = chosen(&port.name);
+                    let resp = ui.add_enabled(!all, egui::Checkbox::new(&mut on, &port.name));
+                    if resp.changed() {
+                        let names = ports.iter().filter(|p| if p.name == port.name { on } else { chosen(&p.name) }).map(|p| p.name.clone()).collect();
+                        self.act(Action::SetMidiInputs(MidiSelection::Ports(names)));
+                    }
+                    let open = snap.status.midi_inputs.contains(&port.name);
+                    let (color, state) = if open { (theme::PLAY, "connected") } else if chosen(&port.name) && snap.status.audio_running { (theme::INPUT, "not connected") } else { (theme::TEXT_FAINT, "off") };
+                    let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 3.0, color);
+                    ui.label(RichText::new(state).size(10.0).color(theme::TEXT_FAINT));
+                });
+            }
+        });
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
@@ -2230,6 +2345,7 @@ impl eframe::App for DawApp {
         }
         self.selection.retain(|r| timeline::region_view(&snap.project, *r).is_some());
         self.track_recent(&snap);
+        self.save_midi_inputs(&snap);
         self.handle_shortcuts(ui, &snap);
         self.handle_dropped_files(ui, &snap);
         self.handle_open_requests(&snap);
@@ -2820,6 +2936,59 @@ mod tests {
         harness.step();
         harness.step();
         assert_eq!(engine.lock().unwrap().record_offset_ms(), 4.0);
+    }
+
+    #[test]
+    fn instrument_tracks_have_record_enable_and_take_midi_input() {
+        let engine: SharedEngine = Arc::new(Mutex::new(Engine::new()));
+        engine.lock().unwrap().add_instrument_track("Keys", "synth").unwrap();
+        let app_engine = engine.clone();
+        let mut harness = Harness::builder().with_size([1360.0, 840.0]).with_step_dt(1.0 / 60.0).build_eframe(move |cc| {
+            theme::apply(&cc.egui_ctx);
+            DawApp::new(app_engine, None)
+        });
+        harness.state_mut().bottom = Some(BottomTab::Mixer);
+        harness.step();
+        assert_eq!(harness.query_all_by_label("Input Monitoring").count(), 0, "MIDI plays through the instrument: no I");
+        assert!(engine.lock().unwrap().midi_input_tracks().is_empty());
+        // Selecting the track routes MIDI input to it; arming makes it record.
+        click(&mut harness, "Keys");
+        assert_eq!(engine.lock().unwrap().midi_input_tracks(), [0]);
+        harness.query_all_by_label("Record Enable").next().expect("R on the instrument track").click();
+        harness.step();
+        harness.step();
+        let mut e = engine.lock().unwrap();
+        assert!(e.project().tracks[0].armed);
+        e.select_track(None).unwrap();
+        assert_eq!(e.midi_input_tracks(), [0], "armed tracks play the input without being selected");
+    }
+
+    #[test]
+    fn audio_settings_choose_midi_inputs() {
+        let engine: SharedEngine = Arc::new(Mutex::new(Engine::new()));
+        let app_engine = engine.clone();
+        let mut harness = Harness::builder().with_size([1000.0, 800.0]).build_eframe(move |cc| {
+            theme::apply(&cc.egui_ctx);
+            DawApp::new(app_engine, None)
+        });
+        let device = |name: &str| opentake_engine::DeviceInfo { id: name.into(), name: name.into(), is_default: true, default_channels: 2, max_channels: 2, default_sample_rate: 48_000 };
+        let port = |name: &str| opentake_engine::midi_input::MidiPortInfo { name: name.into(), enabled: true, open: false };
+        harness.state_mut().devices = Some(DeviceList { host: "CoreAudio".into(), inputs: vec![device("Interface In")], outputs: vec![device("Interface Out")] });
+        harness.state_mut().midi_ports = Some(Ok(MidiInputs { selection: MidiSelection::All, ports: vec![port("Test Keys A"), port("Test Pads B")], errors: Vec::new() }));
+        harness.state_mut().show_audio_settings = true;
+        for _ in 0..4 {
+            harness.step();
+        }
+        harness.get_by_label("MIDI activity");
+        // Unticking "All" keeps the ports there are, then each can be unticked.
+        click(&mut harness, "All MIDI Inputs");
+        let selection = || engine.lock().unwrap().midi_selection().clone();
+        assert_eq!(selection(), MidiSelection::Ports(vec!["Test Keys A".into(), "Test Pads B".into()]));
+        click(&mut harness, "Test Keys A");
+        assert_eq!(selection(), MidiSelection::Ports(vec!["Test Pads B".into()]));
+        harness.step(); // the list re-laid out with the engine's ports
+        click(&mut harness, "All MIDI Inputs");
+        assert_eq!(selection(), MidiSelection::All);
     }
 
     #[test]
@@ -3802,6 +3971,7 @@ mod tests {
                 notes.push(Note { start_secs: (bar as f64 * 4.0 + 2.0) * beat, length_secs: beat, pitch: chord[2] + 5, velocity: 110, tab: None });
             }
             e.set_midi_notes(keys, clip, notes).unwrap();
+            e.update_track(keys, TrackUpdate { armed: Some(true), ..Default::default() }).unwrap();
             // A vocal take folder from cycle recording over the loop, and a bus for bass and keys.
             let (start, bar) = (2.0 * 4.0 * beat, 4.0 * beat);
             let v = e.add_track("Vocal").unwrap();
@@ -3861,6 +4031,19 @@ mod tests {
         }
         let piano = out.replace(".png", "-piano.png");
         harness.render().expect("render").save(&piano).expect("save png");
+
+        // Third: Audio Settings with MIDI inputs.
+        let device = |name: &str| opentake_engine::DeviceInfo { id: name.into(), name: name.into(), is_default: true, default_channels: 2, max_channels: 8, default_sample_rate: 48_000 };
+        let port = |name: &str, open| opentake_engine::midi_input::MidiPortInfo { name: name.into(), enabled: true, open };
+        harness.state_mut().devices = Some(DeviceList { host: "CoreAudio".into(), inputs: vec![device("Interface In")], outputs: vec![device("Interface Out")] });
+        harness.state_mut().midi_ports = Some(Ok(MidiInputs { selection: MidiSelection::All, ports: vec![port("Keystation 49", false), port("IAC Driver Bus 1", false)], errors: Vec::new() }));
+        harness.state_mut().show_audio_settings = true;
+        for _ in 0..4 {
+            harness.step();
+        }
+        let settings = out.replace(".png", "-settings.png");
+        harness.render().expect("render").save(&settings).expect("save png");
+
 
         // Third shot: tablature from the Guitar Pro fixture (or OPENTAKE_SCREENSHOT_GP, seeking
         // to OPENTAKE_SCREENSHOT_AT seconds).

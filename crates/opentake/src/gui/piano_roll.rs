@@ -202,7 +202,9 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
     let grid_resp = ui.interact(grid, ui.make_persistent_id(("piano_grid", track, ci)), Sense::click_and_drag());
     widgets::label(&grid_resp, egui::Role::Group, "Piano Roll Grid");
     notes_interaction(app, ui, &geo, &grid_resp, track, ci, clip, project, color);
-    keyboard(app, ui, &geo, keys, track);
+    // Keys held on a MIDI keyboard light up on the track that plays them.
+    let held: &[u8] = if snap.status.midi_input_tracks.contains(&track) { &snap.status.midi_keys_down } else { &[] };
+    keyboard(app, ui, &geo, keys, track, held);
 
     // Playhead (relative to the region).
     let rel = snap.status.position_secs - clip.position_secs;
@@ -511,7 +513,7 @@ fn audition(app: &mut DawApp, track: usize, pitch: Option<u8>) {
     }
 }
 
-fn keyboard(app: &mut DawApp, ui: &egui::Ui, geo: &Geo, rect: Rect, track: usize) {
+fn keyboard(app: &mut DawApp, ui: &egui::Ui, geo: &Geo, rect: Rect, track: usize, held: &[u8]) {
     let resp = ui.interact(rect, ui.make_persistent_id(("piano_keys", track)), Sense::click_and_drag());
     widgets::label(&resp, egui::Role::Group, "Piano Keyboard");
     let p = ui.painter().with_clip_rect(rect);
@@ -523,11 +525,13 @@ fn keyboard(app: &mut DawApp, ui: &egui::Ui, geo: &Geo, rect: Rect, track: usize
         let pitch = pitch as u8;
         let y = geo.y_of(pitch);
         let row = Rect::from_min_max(pos2(rect.left(), y), pos2(rect.right(), y + geo.key_h));
+        let down = pressed == Some(pitch) || held.contains(&pitch);
         if is_black(pitch) {
             let key = Rect::from_min_max(row.min, pos2(rect.left() + rect.width() * 0.62, row.bottom()));
-            p.rect_filled(key, egui::CornerRadius { ne: 2, se: 2, nw: 0, sw: 0 }, if pressed == Some(pitch) { theme::ACCENT } else { Color32::from_gray(30) });
+            p.rect_filled(key, egui::CornerRadius { ne: 2, se: 2, nw: 0, sw: 0 }, if down { theme::ACCENT } else { Color32::from_gray(30) });
         } else {
-            if pressed == Some(pitch) {
+            if down {
+
                 p.rect_filled(row, 0.0, theme::with_alpha(theme::ACCENT, 140));
             }
             if matches!(pitch % 12, 0 | 5) {

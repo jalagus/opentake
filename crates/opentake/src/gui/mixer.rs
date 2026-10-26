@@ -163,8 +163,10 @@ pub fn track_strip(app: &mut DawApp, ui: &mut egui::Ui, t: usize, track: &Track,
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
-        let records = !track.is_instrument() && !track.bus;
-        let n = if records { 4.0 } else { 2.0 };
+        // Instrument tracks record MIDI (R) but have no audio input to monitor (I).
+        let records = !track.bus;
+        let monitors = records && !track.is_instrument();
+        let n = 2.0 + records as u8 as f32 + monitors as u8 as f32;
         let size = vec2((w - 3.0 * (n - 1.0)) / n, 20.0);
         if widgets::chip(ui, mute, "M", theme::MUTE, "Mute", size).clicked() {
             app.control(&track.automation, Some(t), AutomationTarget::Mute, if mute { 0.0 } else { 1.0 }, Action::UpdateTrack(t, TrackUpdate { mute: Some(!mute), ..Default::default() }));
@@ -172,13 +174,11 @@ pub fn track_strip(app: &mut DawApp, ui: &mut egui::Ui, t: usize, track: &Track,
         if widgets::chip(ui, track.solo, "S", theme::SOLO, "Solo", size).clicked() {
             app.act(Action::UpdateTrack(t, TrackUpdate { solo: Some(!track.solo), ..Default::default() }));
         }
-        if records {
-            if widgets::chip(ui, track.armed, "R", theme::RECORD, "Record Enable", size).clicked() {
-                app.act(Action::UpdateTrack(t, TrackUpdate { armed: Some(!track.armed), ..Default::default() }));
-            }
-            if widgets::chip(ui, track.monitor_input, "I", theme::INPUT, "Input Monitoring", size).clicked() {
-                app.act(Action::UpdateTrack(t, TrackUpdate { monitor_input: Some(!track.monitor_input), ..Default::default() }));
-            }
+        if records && widgets::chip(ui, track.armed, "R", theme::RECORD, "Record Enable", size).clicked() {
+            app.act(Action::UpdateTrack(t, TrackUpdate { armed: Some(!track.armed), ..Default::default() }));
+        }
+        if monitors && widgets::chip(ui, track.monitor_input, "I", theme::INPUT, "Input Monitoring", size).clicked() {
+            app.act(Action::UpdateTrack(t, TrackUpdate { monitor_input: Some(!track.monitor_input), ..Default::default() }));
         }
     });
     if name_plate(ui, &track.name, theme::color_of(track, t), w).clicked() {

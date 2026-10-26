@@ -15,6 +15,7 @@ mod flex;
 mod gain;
 mod guitarpro;
 mod history;
+mod live_midi;
 mod midi;
 mod midi_file;
 mod plugins;
@@ -39,7 +40,8 @@ use serde::Serialize;
 
 use crate::audio::{self, AudioConfig, AudioStreams};
 use crate::media::{self, AudioData};
-use crate::mixer::{ClipFades, ClipRt, Command, EnvTarget, Garbage, LATENCY_UNKNOWN, Mixer, SharedState, TrackParams, TrackRt};
+use crate::midi_input::{self, MidiSelection};
+use crate::mixer::{ClipFades, ClipRt, Command, EnvTarget, Garbage, LATENCY_UNKNOWN, Mixer, RecMidi, SharedState, TrackParams, TrackRt};
 use crate::recorder::{RecordTarget, Recorder};
 
 pub use guitarpro::{GuitarProImport, GuitarProSummary, GuitarProTrackInfo, inspect as inspect_guitar_pro};
@@ -52,6 +54,7 @@ pub use fades::{CROSSFADE_SECS, FadeUpdate, JOIN_SECS};
 pub use flex::{FlexJob, FlexRender, MAX_SEMITONES, PitchStretch, STRETCH_RANGE};
 pub use gain::CLIP_GAIN_DB;
 pub use history::HistoryInfo;
+pub use live_midi::{MidiInputs, RecordedMidi};
 pub use midi::MidiClipUpdate;
 pub use midi_file::{MidiFileImport, MidiFileSummary, MidiFileTrackInfo, gm_program_name, inspect as inspect_midi_file, is_midi_file_path};
 pub use plugins::SlotRef;
@@ -130,6 +133,36 @@ pub struct EngineStatus {
     /// Peak level in dBFS with a 30 dB/s fall (floored at -120).
     pub master_peak_db: [f32; 2],
     pub track_peak_db: Vec<f32>,
+    /// From the engine processing a moment to it being heard, as the device reports it
+    /// (milliseconds). Recorded MIDI is moved earlier by this (plus the buffer it waited for).
+    pub output_latency_ms: Option<f64>,
+    /// MIDI input ports open now, the note-ons received from them so far, the keys held down
+    /// (pitches), and the tracks (indices) that play them.
+    pub midi_inputs: Vec<String>,
+    pub midi_notes_received: u64,
+    pub midi_keys_down: Vec<u8>,
+    pub midi_input_tracks: Vec<usize>,
+}
+
+/// What `start_recording` armed: audio files being written, and instrument tracks recording
+/// MIDI (indices).
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordingStarted {
+    pub files: Vec<PathBuf>,
+    pub midi_tracks: Vec<usize>,
+}
+
+/// What a recording added: audio regions and MIDI regions.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Recorded {
+    pub clips: Vec<Clip>,
+    pub midi_regions: Vec<RecordedMidi>,
+}
+
+impl Recorded {
+    pub fn count(&self) -> usize {
+        self.clips.len() + self.midi_regions.len()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -194,6 +227,9 @@ struct AudioRuntime {
     input_channels: usize,
     commands: Producer<Command>,
     recorder: Option<Recorder>,
+    /// Open MIDI input ports, and the MIDI the audio thread captures while recording.
+    midi: midi_input::Connections,
+    midi_record: Consumer<RecMidi>,
     /// Identifies the device setup (for its stored recording offset).
     setup: String,
     /// Latency probe captures, handed on by the garbage collector.
@@ -271,6 +307,14 @@ pub struct Engine {
     /// stored offsets per device setup (see calibration.rs).
     record_offset_ms: f64,
     latency_store: calibration::LatencyStore,
+    /// MIDI input: the chosen ports, the selected track (id), the tracks the audio thread
+    /// plays input on, and the recording in progress (see live_midi.rs).
+    midi_selection: MidiSelection,
+    selected_track: Option<u64>,
+    live_midi_targets: Vec<u64>,
+    midi_take: Option<live_midi::MidiTake>,
+    /// A recording was started (it may still be counting in).
+    taking: bool,
 }
 
 impl Default for Engine {
@@ -304,6 +348,11 @@ impl Engine {
             history: history::History::default(),
             record_offset_ms: 0.0,
             latency_store: calibration::LatencyStore::default(),
+            midi_selection: MidiSelection::All,
+            selected_track: None,
+            live_midi_targets: Vec::new(),
+            midi_take: None,
+            taking: false,
         }
     }
 
@@ -361,6 +410,7 @@ impl Engine {
 
     pub fn start_audio(&mut self, config: &AudioConfig) -> Result<EngineStatus> {
         self.stop_audio()?;
+        midi_input::now_ns(); // start the shared clock before the audio thread reads it
         let resolved = audio::resolve(config)?;
         let sample_rate = resolved.sample_rate();
         let in_channels = resolved.input_channels();
@@ -390,7 +440,9 @@ impl Engine {
         let _ = cmd_tx.push(Command::SetSongEnd((self.project.length_secs() * sample_rate as f64).round() as u64));
         let _ = cmd_tx.push(self.loop_command_at(sample_rate));
 
-        let mixer = Mixer::new(cmd_rx, g_tx, rec_tx, self.shared.clone(), sample_rate);
+        let mut mixer = Mixer::new(cmd_rx, g_tx, rec_tx, self.shared.clone(), sample_rate);
+        let (midi_tx, midi_record) = rtrb::RingBuffer::new(MIDI_RECORD_RING);
+        mixer.set_midi_record(midi_tx);
         let streams = audio::start(resolved, mixer)?;
         tracing::info!(
             "audio started: {} Hz, out '{}' ({} ch), in {:?} ({} ch)",
@@ -409,18 +461,29 @@ impl Engine {
             streams: Some(streams),
             commands: cmd_tx,
             recorder,
+            midi: midi_input::Connections::default(),
+            midi_record,
             setup,
             probe_results,
             _gc: GarbageCollector::spawn(g_rx, probe_tx),
         });
         // The master bus's inserts too (the tracks went with ResetTracks).
         self.sync_master_chain()?;
+        self.live_midi_targets.clear();
+        self.sync_midi_targets()?;
+        self.open_midi_inputs();
         Ok(self.status())
     }
 
     /// Test hook: run "audio" with a mixer the test drives by calling `process`.
     #[cfg(test)]
     pub(crate) fn attach_test_mixer(&mut self, sample_rate: u32) -> Mixer {
+        self.attach_test_mixer_with_input(sample_rate, 0)
+    }
+
+    /// Test hook: as `attach_test_mixer`, with `in_channels` of input to record.
+    #[cfg(test)]
+    pub(crate) fn attach_test_mixer_with_input(&mut self, sample_rate: u32, in_channels: usize) -> Mixer {
         let (mut cmd_tx, cmd_rx) = rtrb::RingBuffer::new(4096);
         let (g_tx, g_rx) = rtrb::RingBuffer::new(4096);
         self.project.sample_rate = sample_rate;
@@ -431,22 +494,36 @@ impl Engine {
         let _ = cmd_tx.push(Command::ResetTracks(Box::new(tracks)));
         let _ = cmd_tx.push(self.routing_command());
         let (probe_tx, probe_results) = crossbeam_channel::bounded(2);
+        let (rec_tx, recorder) = match in_channels {
+            0 => (None, None),
+            n => {
+                let (tx, rx) = rtrb::RingBuffer::new(n * sample_rate as usize * 4);
+                (Some(tx), Some(Recorder::spawn(rx, n)))
+            }
+        };
+        let (midi_tx, midi_record) = rtrb::RingBuffer::new(MIDI_RECORD_RING);
         self.audio = Some(AudioRuntime {
             streams: None,
             sample_rate,
-            input_channels: 0,
+            input_channels: in_channels,
             commands: cmd_tx,
-            recorder: None,
+            recorder,
+            midi: midi_input::Connections::default(),
+            midi_record,
             setup: "test".into(),
             probe_results,
             _gc: GarbageCollector::spawn(g_rx, probe_tx),
         });
         self.sync_master_chain().unwrap();
-        Mixer::new(cmd_rx, g_tx, None, self.shared.clone(), sample_rate)
+        self.live_midi_targets.clear();
+        self.sync_midi_targets().unwrap();
+        let mut mixer = Mixer::new(cmd_rx, g_tx, rec_tx, self.shared.clone(), sample_rate);
+        mixer.set_midi_record(midi_tx);
+        mixer
     }
 
     pub fn stop_audio(&mut self) -> Result<()> {
-        if self.shared.recording.load(Ordering::Relaxed) {
+        if self.taking {
             self.stop()?;
         }
         self.audio = None;
@@ -571,12 +648,13 @@ impl Engine {
         self.send(Command::Play)
     }
 
-    /// Stop playback; if recording, finalize files and add them as clips (one undo step).
-    pub fn stop(&mut self) -> Result<Vec<Clip>> {
-        let was_recording = self.shared.recording.load(Ordering::Relaxed);
+    /// Stop playback; if recording, finalize files and add them as audio regions, and the
+    /// MIDI played as MIDI regions on the armed instrument tracks (one undo step).
+    pub fn stop(&mut self) -> Result<Recorded> {
+        let taking = std::mem::take(&mut self.taking);
         self.send(Command::Stop)?;
-        if !was_recording {
-            return Ok(Vec::new());
+        if !taking {
+            return Ok(Recorded::default());
         }
 
         // Wait for the audio thread to acknowledge before closing files.
@@ -586,13 +664,19 @@ impl Engine {
         }
         let files = match self.audio.as_ref().and_then(|a| a.recorder.as_ref()) {
             Some(r) => r.stop()?,
-            None => return Ok(Vec::new()),
+            None => Vec::new(),
         };
+        self.drain_midi_take();
+        let take = self.midi_take.take().unwrap_or_default();
 
         let placement = self.record_placement();
         // Undoing a take also takes the playhead back to where recording began.
         self.history.playhead = Some(placement.start as f64 / self.sample_rate() as f64);
-        self.record("Record", None, |e| e.add_recordings(files, &placement))
+        self.record("Record", None, |e| {
+            let clips = e.add_recordings(files, &placement)?;
+            let midi_regions = e.add_midi_take(take, &placement)?;
+            Ok(Recorded { clips, midi_regions })
+        })
     }
 
     pub fn seek(&mut self, secs: f64) -> Result<()> {
@@ -603,36 +687,42 @@ impl Engine {
         self.send(Command::Seek(pos))
     }
 
-    /// Start recording on all armed tracks (also starts playback).
-    pub fn record_audio(&mut self) -> Result<Vec<PathBuf>> {
+    /// Start recording on all armed tracks (also starts playback, after any count-in): audio
+    /// tracks record their input, instrument tracks the MIDI played (see live_midi.rs).
+    pub fn start_recording(&mut self) -> Result<RecordingStarted> {
         let audio = self.audio.as_ref().ok_or_else(|| anyhow!("audio is not running; call start_audio first"))?;
-        let recorder = audio.recorder.as_ref().ok_or_else(|| anyhow!("no input device is open"))?;
-        let in_channels = audio.input_channels;
-        let sr = audio.sample_rate;
-        if self.shared.recording.load(Ordering::Relaxed) {
+        if self.taking || self.shared.recording.load(Ordering::Relaxed) {
             bail!("already recording");
         }
-
-        let dir = self.media_dir();
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let targets: Vec<RecordTarget> = self
-            .project
-            .tracks
-            .iter()
-            .filter(|t| t.armed)
-            .map(|t| RecordTarget {
-                track_id: t.id,
-                channel: (t.input_channel as usize).min(in_channels - 1),
-                path: dir.join(format!("{}-{stamp}.wav", sanitize(&t.name))),
-            })
-            .collect();
-        if targets.is_empty() {
+        let armed = |t: &&Track| t.armed && !t.bus;
+        let audio_tracks: Vec<&Track> = self.project.tracks.iter().filter(armed).filter(|t| !t.is_instrument()).collect();
+        let midi_tracks: Vec<usize> = (0..self.project.tracks.len()).filter(|&i| self.project.tracks[i].armed && self.project.tracks[i].is_instrument()).collect();
+        if audio_tracks.is_empty() && midi_tracks.is_empty() {
             bail!("no tracks are armed for recording");
         }
-        let paths = targets.iter().map(|t| t.path.clone()).collect();
-        recorder.start(targets, sr)?;
+        let mut paths = Vec::new();
+        if !audio_tracks.is_empty() {
+            let recorder = audio.recorder.as_ref().ok_or_else(|| anyhow!("no input device is open (disarm the audio tracks to record only MIDI)"))?;
+            let in_channels = audio.input_channels;
+            let dir = self.media_dir();
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let targets: Vec<RecordTarget> = audio_tracks
+                .iter()
+                .map(|t| RecordTarget {
+                    track_id: t.id,
+                    channel: (t.input_channel as usize).min(in_channels - 1),
+                    path: dir.join(format!("{}-{stamp}.wav", sanitize(&t.name))),
+                })
+                .collect();
+            paths = targets.iter().map(|t| t.path.clone()).collect();
+            recorder.start(targets, audio.sample_rate)?;
+        }
+        // Anything left from before belongs to no take.
+        self.drain_midi_take();
+        self.midi_take = Some(live_midi::MidiTake { tracks: midi_tracks.iter().map(|&i| self.project.tracks[i].id).collect(), events: Vec::new() });
         self.send(Command::Record(true))?;
-        Ok(paths)
+        self.taking = true;
+        Ok(RecordingStarted { files: paths, midi_tracks })
     }
 
     fn update_meters(&mut self) {
@@ -659,7 +749,10 @@ impl Engine {
     pub fn status(&mut self) -> EngineStatus {
         self.update_meters();
         let sr = self.sample_rate();
+        self.drain_midi_take();
         let db = |v: f32| if v > 0.0 { (20.0 * v.log10()).max(SILENCE_DB) } else { SILENCE_DB };
+        let ms = |samples: u32| (samples as f64 * 1000.0 / sr.max(1) as f64 * 100.0).round() / 100.0;
+        let keys = self.shared.midi_keys.each_ref().map(|k| k.load(Ordering::Relaxed));
         let streams = self.audio.as_ref().and_then(|a| a.streams.as_ref());
         EngineStatus {
             audio_running: self.audio.is_some(),
@@ -687,6 +780,15 @@ impl Engine {
             record_overrun_samples: self.shared.record_overruns.load(Ordering::Relaxed),
             master_peak_db: self.meters.master.map(db),
             track_peak_db: self.meters.tracks.iter().map(|&v| db(v)).collect(),
+            output_latency_ms: match self.shared.output_latency.load(Ordering::Relaxed) {
+                _ if self.audio.is_none() => None,
+                LATENCY_UNKNOWN => None,
+                v => Some(ms(v)),
+            },
+            midi_inputs: self.audio.as_ref().map(|a| a.midi.names()).unwrap_or_default(),
+            midi_notes_received: self.shared.midi_notes.load(Ordering::Relaxed),
+            midi_keys_down: (0..128u8).filter(|&p| keys[p as usize / 64] & (1 << (p % 64)) != 0).collect(),
+            midi_input_tracks: self.midi_input_tracks(),
         }
     }
 
@@ -1100,7 +1202,7 @@ impl Engine {
     }
 
     fn replace_project(&mut self, mut project: Project, path: Option<PathBuf>) -> Result<Vec<String>> {
-        if self.shared.recording.load(Ordering::Relaxed) {
+        if self.taking {
             self.stop()?;
         }
         let mut warnings = Vec::new();
@@ -1175,7 +1277,10 @@ impl Engine {
             let looping = self.loop_command_at(sr);
             self.send(looping)?;
             self.sync_master_chain()?;
+            self.live_midi_targets.clear();
         }
+        self.selected_track = None;
+        self.sync_midi_targets()?;
         Ok(warnings)
     }
 }
@@ -1192,6 +1297,10 @@ fn track_params(t: &Track) -> TrackParams {
         output: t.output.unwrap_or(crate::mixer::MASTER),
     }
 }
+
+/// Messages recorded live between two drains (the GUI drains every frame; an agent's
+/// recording is drained on stop, so this holds a long take).
+const MIDI_RECORD_RING: usize = 1 << 16;
 
 /// OpenTake's own project file extension (JSON inside).
 pub const PROJECT_EXTENSION: &str = "otp";

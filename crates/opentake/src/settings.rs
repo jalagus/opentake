@@ -1,7 +1,9 @@
-//! User settings persisted between sessions: plug-in scan folders and recent projects.
+//! User settings persisted between sessions: plug-in scan folders, recent projects, view
+//! preferences and the MIDI inputs.
 
 use std::path::{Path, PathBuf};
 
+use opentake_engine::midi_input::MidiSelection;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -18,6 +20,22 @@ pub struct Settings {
     /// Notation/tab view on a white page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_paper: Option<bool>,
+    /// MIDI input ports listened to, by name. `None` means all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midi_inputs: Option<Vec<String>>,
+}
+
+impl Settings {
+    pub fn midi_selection(&self) -> MidiSelection {
+        self.midi_inputs.clone().map_or(MidiSelection::All, MidiSelection::Ports)
+    }
+
+    pub fn set_midi_selection(&mut self, selection: &MidiSelection) {
+        self.midi_inputs = match selection {
+            MidiSelection::All => None,
+            MidiSelection::Ports(names) => Some(names.clone()),
+        };
+    }
 }
 
 pub const MAX_RECENT: usize = 10;
@@ -87,9 +105,13 @@ mod tests {
     fn round_trip_and_missing_file() {
         let path = std::env::temp_dir().join(format!("opentake-settings-{}/settings.json", std::process::id()));
         assert_eq!(Settings::load(&path), Settings::default());
-        let s = Settings { plugin_paths: Some(vec!["/tmp/plugs".into()]), recent_projects: vec!["/tmp/a.json".into()], tab_scale: Some(1.5), tab_paper: Some(true) };
+        let mut s = Settings { plugin_paths: Some(vec!["/tmp/plugs".into()]), recent_projects: vec!["/tmp/a.json".into()], tab_scale: Some(1.5), tab_paper: Some(true), midi_inputs: None };
+        s.set_midi_selection(&MidiSelection::Ports(vec!["Keys".into()]));
         s.save(&path).unwrap();
         assert_eq!(Settings::load(&path), s);
+        assert_eq!(s.midi_selection(), MidiSelection::Ports(vec!["Keys".into()]));
+        assert_eq!(Settings::default().midi_selection(), MidiSelection::All, "all inputs by default");
+
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

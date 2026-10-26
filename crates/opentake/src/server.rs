@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use opentake_engine::project::{AutomationMode, AutomationPoint, AutomationTarget, Curve, Note};
+use opentake_engine::midi_input::MidiSelection;
 use opentake_engine::{AudioConfig, Engine, MidiClipUpdate, SendUpdate, SlotRef, TrackUpdate};
+
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
@@ -22,6 +24,13 @@ monitor_input) -> record -> stop (recordings become clips) -> save_project. With
 switches which take plays, and comp_take plays another take over a time range (comping the best \
 parts together; get_project lists the clip's `comp`, where the rest plays `active_take`); \
 flatten_comp renders a comp into one plain region.
+
+MIDI input: list_midi_inputs / set_midi_inputs choose the keyboards and controllers (all by default). \
+What's played goes to every record-armed instrument track (update_track armed), or with none armed \
+the track selected in the GUI. record also records MIDI on armed instrument tracks (with audio on \
+armed audio tracks, or MIDI only without an input device): stop turns it into one MIDI region per \
+track, notes placed where the performer heard them; with the cycle on, every pass merges into one \
+region. get_status shows midi_inputs, midi_keys_down and midi_input_tracks.
 
 Tracks, clips and plugin slots are addressed by zero-based index as shown by get_project. \
 Plugin parameters are normalized 0..1; list_plugin_params shows ids, current values and display strings. \
@@ -105,6 +114,13 @@ pub struct StartAudioArgs {
     /// Open output only (no monitoring or recording).
     #[serde(default)]
     pub disable_input: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetMidiInputsArgs {
+    /// MIDI input port names (exact, or a unique part of one) to listen to; ["all"] for every
+    /// port (also ones plugged in later), [] for none.
+    pub inputs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -488,7 +504,8 @@ pub struct UpdateTrackArgs {
     pub pan: Option<f32>,
     pub mute: Option<bool>,
     pub solo: Option<bool>,
-    /// Arm for recording.
+    /// Arm for recording: an audio track records its input, an instrument track the MIDI
+    /// played (and plays MIDI input live).
     pub armed: Option<bool>,
     /// Hear the live input through the track (and its plugins).
     pub monitor_input: Option<bool>,
@@ -943,9 +960,23 @@ fn db_to_gain(db: f32) -> f32 {
 
 #[tool_router]
 impl DawServer {
-    #[tool(description = "Transport position, play/record state, audio device info and peak meters (dBFS).")]
+    #[tool(description = "Transport position, play/record state, audio device info and peak meters (dBFS); MIDI input: open ports (midi_inputs), note-ons received, keys held down now and the tracks that play the input.")]
     async fn get_status(&self) -> ToolResult {
         self.with_engine(|e| Ok(e.status())).await
+    }
+
+    #[tool(description = "List MIDI input ports (keyboards, controllers, virtual ports): enabled = chosen, open = connected. Rescans, so a device plugged in since is found (and opened when chosen).")]
+    async fn list_midi_inputs(&self) -> ToolResult {
+        self.with_engine(|e| e.list_midi_inputs()).await
+    }
+
+    #[tool(description = "Choose MIDI inputs: [\"all\"] (the default, includes devices plugged in later), port names (or a unique part of one), or [] for none. A name no connected port matches is kept and opens when that device is plugged in. Remembered by the GUI.")]
+    async fn set_midi_inputs(&self, Parameters(a): Parameters<SetMidiInputsArgs>) -> ToolResult {
+        let selection = match &a.inputs[..] {
+            [all] if all.eq_ignore_ascii_case("all") => MidiSelection::All,
+            names => MidiSelection::Ports(names.to_vec()),
+        };
+        self.with_engine(move |e| e.set_midi_inputs(selection)).await
     }
 
     #[tool(description = "List audio input and output devices (interfaces) with channel counts.")]
@@ -1542,9 +1573,9 @@ impl DawServer {
         self.with_engine(|e| e.play().map(|_| "playing")).await
     }
 
-    #[tool(description = "Stop playback/recording. If recording, returns the new clips created from the recorded audio.")]
+    #[tool(description = "Stop playback/recording. If recording, returns the new audio regions (recorded_clips) and MIDI regions (recorded_midi: track, region index, note count) — one undo step.")]
     async fn stop(&self) -> ToolResult {
-        self.with_engine(|e| e.stop().map(|clips| json!({ "recorded_clips": clips }))).await
+        self.with_engine(|e| e.stop().map(|r| json!({ "recorded_clips": r.clips, "recorded_midi": r.midi_regions }))).await
     }
 
     #[tool(description = "Move the playhead (seconds).")]
@@ -1552,9 +1583,9 @@ impl DawServer {
         self.with_engine(move |e| e.seek(a.position_secs).map(|_| "ok")).await
     }
 
-    #[tool(description = "Start recording all armed tracks from the current position (also starts playback). Call stop to finish. With the cycle on it loops, and each pass through the cycle becomes a take (a pass under half the cycle is dropped); recording the same cycle again adds takes to the same folder.")]
+    #[tool(description = "Start recording all armed tracks from the current position (also starts playback, after any count-in): audio tracks record their input, instrument tracks the MIDI played on the MIDI inputs (no audio input device needed for MIDI only). Call stop to finish. With the cycle on it loops: each audio pass becomes a take (a pass under half the cycle is dropped; recording the same cycle again adds takes to the same folder), while MIDI from every pass merges into one region spanning the cycle.")]
     async fn record(&self) -> ToolResult {
-        self.with_engine(|e| e.record_audio().map(|files| json!({ "recording_to": files }))).await
+        self.with_engine(|e| e.start_recording().map(|r| json!({ "recording_to": r.files, "recording_midi_on": r.midi_tracks }))).await
     }
 
     #[tool(description = "Scan VST3 folders and list available plugins, plus installed Audio Units on macOS (audio_units; insert them by id).")]

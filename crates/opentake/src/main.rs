@@ -89,9 +89,13 @@ fn main() -> Result<()> {
     let mut engine = Engine::new();
     // Saved scan folders (from the Plug-in Manager); --plugin-path adds to them for this run.
     let settings_path = settings::default_path();
-    if let Some(paths) = settings_path.as_deref().map(settings::Settings::load).and_then(|s| s.plugin_paths) {
+    let saved = settings_path.as_deref().map(settings::Settings::load).unwrap_or_default();
+    if let Some(paths) = saved.plugin_paths.clone() {
         engine.set_plugin_search_paths(paths);
     }
+    // The chosen MIDI inputs open with the audio.
+    engine.set_midi_selection(saved.midi_selection());
+
     // Recording latency offsets per device setup live next to the settings.
     if let Some(dir) = settings_path.as_deref().and_then(|p| p.parent()) {
         engine.set_latency_store(&dir.join("latency.json"));

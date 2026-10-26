@@ -11,6 +11,7 @@ use opentake_project::{Fade, FadeCurve, TempoMap};
 use opentake_project::automation::{AutomationPoint, envelope_at, pos_to_gain};
 
 use crate::media::AudioData;
+use crate::midi_input::{self, BlockClock, MidiMsg, RawMidi};
 
 /// Internal processing block size; device buffers are split into chunks of this size.
 pub const MAX_BLOCK: usize = 512;
@@ -21,6 +22,10 @@ pub const PLUGIN_CAPACITY: usize = 32;
 const MIDI_CLIP_CAPACITY: usize = 512;
 const EVENT_CAPACITY: usize = 1024;
 const LIVE_CAPACITY: usize = 128;
+/// Tracks that play live MIDI input at once.
+pub const MAX_MIDI_TARGETS: usize = 16;
+/// MIDI messages handled per device callback.
+const PENDING_CAPACITY: usize = 512;
 /// Longest plug-in delay that's compensated per track (samples, a power of two).
 const MAX_COMP: usize = 16_384;
 /// Longest compensation delay: a block is written to the delay line before sends tap it, so
@@ -51,6 +56,14 @@ pub struct MidiEvent {
     pub offset: u32,
     pub pitch: u8,
     pub velocity: u8,
+}
+
+/// Live MIDI captured while recording, for the control side: messages at the timeline
+/// position (samples) the performer heard when playing them, and where recording ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecMidi {
+    Msg(i64, MidiMsg),
+    End(i64),
 }
 
 /// An instrument or insert effect on the audio thread.
@@ -248,6 +261,9 @@ pub struct TrackRt {
     /// Which pitches are sounding, so they can be released on stop/seek/edit.
     active: [bool; 128],
     flush: bool,
+    /// Live input's sustain pedal, and the keys let go while it's down (still sounding).
+    sustain: bool,
+    sustained: [bool; 128],
     /// This track's plug-in delay (samples), refreshed every callback.
     latency: usize,
     /// Plug-in delay of everything before this track's output (a bus: its slowest input plus
@@ -290,6 +306,8 @@ impl TrackRt {
             live: Vec::with_capacity(LIVE_CAPACITY),
             active: [false; 128],
             flush: false,
+            sustain: false,
+            sustained: [false; 128],
             latency: 0,
             arrival: 0,
             in_latency: 0,
@@ -356,6 +374,10 @@ pub enum Command {
     SetAutomation { track: u64, lanes: Box<Vec<EnvelopeRt>> },
     /// Audition a note on an instrument track (velocity 0 = off).
     LiveNote { track: u64, pitch: u8, velocity: u8 },
+    /// Read a MIDI input port's ring (see `midi_input`).
+    AddMidiInput(Consumer<RawMidi>),
+    /// The instrument tracks (ids, the first `len`) that play live MIDI input.
+    SetMidiTargets { ids: [u64; MAX_MIDI_TARGETS], len: usize },
     /// Measure the round trip: play the `latency` test signal instead of the mix while
     /// capturing input `channel` until `buf` (empty, with capacity) is full; it comes back as
     /// `Garbage::Probe`.
@@ -377,6 +399,8 @@ pub enum Garbage {
     Sends(Box<Vec<SendRt>>),
     /// A finished latency probe's capture.
     Probe(Box<Vec<f32>>),
+    /// A closed MIDI port's ring.
+    MidiInput(Consumer<RawMidi>),
 }
 
 /// State the audio thread publishes for the control side.
@@ -400,6 +424,12 @@ pub struct SharedState {
     pub io_latency: AtomicU32,
     /// Input samples dropped because the recorder could not keep up.
     pub record_overruns: AtomicU64,
+    /// From a callback to its output being heard (samples, smoothed; `LATENCY_UNKNOWN`
+    /// until the device reports timestamps).
+    pub output_latency: AtomicU32,
+    /// Note-ons received from MIDI inputs, and the keys held down now (bits by pitch).
+    pub midi_notes: AtomicU64,
+    pub midi_keys: [AtomicU64; 2],
     /// Peak level since last read, per track in mixer order (f32 bits).
     pub track_peaks: Vec<AtomicU32>,
     pub master_peak: [AtomicU32; 2],
@@ -422,6 +452,9 @@ impl SharedState {
             record_cycle: [AtomicU64::new(0), AtomicU64::new(0)],
             io_latency: AtomicU32::new(LATENCY_UNKNOWN),
             record_overruns: AtomicU64::new(0),
+            output_latency: AtomicU32::new(LATENCY_UNKNOWN),
+            midi_notes: AtomicU64::new(0),
+            midi_keys: [AtomicU64::new(0), AtomicU64::new(0)],
             track_peaks: (0..MAX_TRACKS).map(|_| AtomicU32::new(0)).collect(),
             master_peak: [AtomicU32::new(0), AtomicU32::new(0)],
             counting_in: AtomicBool::new(false),
@@ -489,6 +522,24 @@ pub struct Mixer {
     scratch: [Vec<f32>; 2],
     /// The side chain of the slot being processed.
     key: [Vec<f32>; 2],
+    /// MIDI input: the ports' rings, when this callback started (`now_ns`), what arrived
+    /// for it (frame in the callback), the tracks that play it, and where recorded notes go.
+    midi_ports: Vec<MidiPort>,
+    midi_clock: BlockClock,
+    callback_ns: Option<i64>,
+    midi_pending: Vec<(u32, MidiMsg)>,
+    midi_targets: [u64; MAX_MIDI_TARGETS],
+    midi_target_len: usize,
+    midi_record: Option<Producer<RecMidi>>,
+    /// Smoothed output latency (samples), and whether a cycle recording has wrapped.
+    out_latency: Option<f64>,
+    midi_wrapped: bool,
+}
+
+struct MidiPort {
+    rx: Consumer<RawMidi>,
+    /// Running status.
+    status: u8,
 }
 
 impl Mixer {
@@ -537,7 +588,36 @@ impl Mixer {
             master: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
             scratch: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
             key: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
+            midi_ports: Vec::with_capacity(midi_input::MAX_PORTS),
+            midi_clock: BlockClock::new(sample_rate),
+            callback_ns: None,
+            midi_pending: Vec::with_capacity(PENDING_CAPACITY),
+            midi_targets: [0; MAX_MIDI_TARGETS],
+            midi_target_len: 0,
+            midi_record: None,
+            out_latency: None,
+            midi_wrapped: false,
         }
+    }
+
+    /// Send live MIDI captured while recording here.
+    pub fn set_midi_record(&mut self, tx: Producer<RecMidi>) {
+        self.midi_record = Some(tx);
+    }
+
+    /// The next callback starts now (`midi_input::now_ns`): places MIDI input in it.
+    pub fn set_callback_time(&mut self, ns: i64) {
+        self.callback_ns = Some(ns);
+    }
+
+    /// From this callback to its output being heard (samples). Smoothed like the round trip.
+    pub fn report_output_latency(&mut self, frames: f64) {
+        let smoothed = match self.out_latency {
+            Some(v) if (frames - v).abs() < self.sample_rate * 0.005 => v + (frames - v) * 0.05,
+            _ => frames,
+        };
+        self.out_latency = Some(smoothed);
+        self.shared.output_latency.store(smoothed.round() as u32, Ordering::Relaxed);
     }
 
     fn discard(&mut self, g: Garbage) {
@@ -766,6 +846,7 @@ impl Mixer {
                     }
                 }
                 Command::Stop => {
+                    self.end_midi_take();
                     self.transport.playing = false;
                     self.transport.recording = false;
                     self.was_recording = false; // a Record in this same callback starts afresh
@@ -791,6 +872,9 @@ impl Mixer {
                     }
                 }
                 Command::Record(on) => {
+                    if !on {
+                        self.end_midi_take();
+                    }
                     self.flush_all_notes();
                     self.was_recording &= on;
                     if on && !self.transport.recording {
@@ -959,6 +1043,26 @@ impl Mixer {
                         }
                     }
                 }
+                Command::AddMidiInput(rx) => {
+                    if self.midi_ports.len() < self.midi_ports.capacity() {
+                        self.midi_ports.push(MidiPort { rx, status: 0 });
+                    } else {
+                        self.discard(Garbage::MidiInput(rx));
+                    }
+                }
+                Command::SetMidiTargets { ids, len } => {
+                    // Tracks no longer playing the input let go of what it held.
+                    let len = len.min(MAX_MIDI_TARGETS);
+                    for k in 0..self.midi_target_len {
+                        let id = self.midi_targets[k];
+                        if !ids[..len].contains(&id)
+                            && let Some(t) = self.track_mut(id)
+                        {
+                            (t.flush, t.sustain, t.sustained) = (true, false, [false; 128]);
+                        }
+                    }
+                    (self.midi_targets, self.midi_target_len) = (ids, len);
+                }
             }
         }
     }
@@ -974,12 +1078,119 @@ impl Mixer {
         self.shared.io_latency.store(smoothed.round() as u32, Ordering::Relaxed);
     }
 
+    /// Take what the MIDI ports received since the last callback, placed in this one
+    /// (sorted by frame), and let go of ports that closed.
+    fn gather_midi(&mut self, frames: usize) {
+        self.midi_clock.begin(self.callback_ns.take(), frames);
+        self.midi_pending.clear();
+        let mut k = 0;
+        while k < self.midi_ports.len() {
+            let port = &mut self.midi_ports[k];
+            let closed = port.rx.is_abandoned();
+            while let Ok(m) = port.rx.pop() {
+                if let Some(msg) = midi_input::parse(m.bytes(), &mut port.status)
+                    && self.midi_pending.len() < self.midi_pending.capacity()
+                {
+                    self.midi_pending.push((self.midi_clock.offset(m.time_ns), msg));
+                }
+
+            }
+            if closed {
+                let port = self.midi_ports.swap_remove(k);
+                self.discard(Garbage::MidiInput(port.rx));
+            } else {
+                k += 1;
+            }
+        }
+        // Stable insertion sort (ports interleave; tiny lists, no allocation).
+        let p = &mut self.midi_pending;
+        for i in 1..p.len() {
+            let mut j = i;
+            while j > 0 && p[j - 1].0 > p[j].0 {
+                p.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+    }
+
+    /// How much earlier than it's processed a live note was played, as heard (samples): the
+    /// callback it waited for (see `BlockClock`), and the output latency, since the performer
+    /// heard each position that much after it was processed. Without output timestamps, half
+    /// the measured round trip stands in for it.
+    fn midi_latency(&self) -> usize {
+        let out = match self.out_latency {
+            Some(v) => v,
+            None => self.io_latency.map_or(0.0, |v| v / 2.0),
+        };
+        self.midi_clock.delay() + out.round() as usize
+    }
+
+    /// The timeline position heard when a note processed `local` frames into this block was
+    /// played. A note played just before a cycle wrap but arriving after it belongs to the end
+    /// of the cycle.
+    fn record_position(&self, local: usize, latency: usize) -> i64 {
+        let raw = self.transport.position_samples + local as i64;
+        let pos = raw - latency as i64;
+        match self.active_loop() {
+            Some((s, e)) if self.midi_wrapped && raw >= s as i64 && pos < s as i64 => pos + (e - s) as i64,
+            _ => pos,
+        }
+    }
+
+    fn record_midi(&mut self, m: RecMidi) {
+        if let Some(tx) = &mut self.midi_record {
+            let _ = tx.push(m); // full: dropped (the control side drains it every frame)
+        }
+    }
+
+    /// Recording stops: mark where (as heard), so notes still held end there.
+    fn end_midi_take(&mut self) {
+        if self.transport.recording {
+            let pos = self.record_position(0, self.midi_latency());
+            self.record_midi(RecMidi::End(pos));
+        }
+    }
+
+    /// Play (and while recording, capture) the MIDI input that falls in this block, `at`
+    /// frames into the callback.
+    fn route_midi(&mut self, at: usize, n: usize) {
+        if self.midi_pending.is_empty() {
+            return;
+        }
+        let latency = self.midi_latency();
+        for k in 0..self.midi_pending.len() {
+            let (frame, msg) = self.midi_pending[k];
+            let Some(local) = (frame as usize).checked_sub(at).filter(|&l| l < n) else { continue };
+            let keys = &self.shared.midi_keys;
+            match msg {
+                MidiMsg::NoteOn { pitch, .. } => {
+                    self.shared.midi_notes.fetch_add(1, Ordering::Relaxed);
+                    keys[pitch as usize / 64].fetch_or(1 << (pitch % 64), Ordering::Relaxed);
+                }
+                MidiMsg::NoteOff { pitch } => drop(keys[pitch as usize / 64].fetch_and(!(1 << (pitch % 64)), Ordering::Relaxed)),
+                MidiMsg::AllNotesOff => keys.iter().for_each(|k| k.store(0, Ordering::Relaxed)),
+                MidiMsg::Sustain(_) => {}
+            }
+            if self.transport.recording {
+                let pos = self.record_position(local, latency);
+                self.record_midi(RecMidi::Msg(pos, msg));
+            }
+            for j in 0..self.midi_target_len {
+                let id = self.midi_targets[j];
+                if let Some(t) = self.track_mut(id) {
+                    live_midi(t, msg, local as u32);
+                }
+            }
+        }
+    }
+
     /// Process interleaved device buffers. `input` may be empty (no input device).
     pub fn process(&mut self, input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize) {
         self.handle_commands();
         self.update_latency();
         self.automated = !self.master_automation.is_empty() || self.tracks.iter().any(|t| !t.automation.is_empty());
         let frames = output.len() / out_channels.max(1);
+        self.gather_midi(frames);
         let in_frames = if in_channels > 0 { input.len() / in_channels } else { 0 };
         let mut done = 0;
         while done < frames {
@@ -1019,7 +1230,7 @@ impl Mixer {
             };
             let out_chunk = &mut output[done * out_channels..(done + n) * out_channels];
             let before = self.transport.position_samples.max(0) as u64;
-            self.process_block(in_chunk, in_channels, out_chunk, out_channels, n);
+            self.process_block(in_chunk, in_channels, out_chunk, out_channels, done, n);
             done += n;
             // Plain playback stops when it runs past the last region (not while recording
             // or cycling).
@@ -1038,6 +1249,7 @@ impl Mixer {
                         self.shared.record_cycle[1].store(end, Ordering::Relaxed);
                         self.shared.record_wrap.store(self.recorded, Ordering::Relaxed);
                     }
+                    self.midi_wrapped |= self.transport.recording;
                 }
             }
         }
@@ -1047,7 +1259,8 @@ impl Mixer {
         self.shared.recording.store(self.transport.recording, Ordering::Relaxed);
     }
 
-    fn process_block(&mut self, input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize, n: usize) {
+    /// One block of `n` frames, `at` frames into the device callback.
+    fn process_block(&mut self, input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize, at: usize, n: usize) {
         // De-interleave input; missing frames (e.g. input underrun) are silent.
         let in_ch = in_channels.min(MAX_INPUT_CHANNELS);
         let in_frames = if in_channels > 0 { input.len() / in_channels } else { 0 };
@@ -1062,6 +1275,7 @@ impl Mixer {
             self.shared.record_latency.store(self.shared.io_latency.load(Ordering::Relaxed), Ordering::Relaxed);
             self.shared.record_wrap.store(NO_WRAP, Ordering::Relaxed);
             self.recorded = 0;
+            self.midi_wrapped = false;
         }
         self.was_recording = self.transport.recording;
         if self.transport.recording {
@@ -1091,6 +1305,8 @@ impl Mixer {
         let pos = self.read_position(self.transport.position_samples);
         let block_transport = Transport { position_samples: pos as i64, ..self.transport };
         let clock = Clock::new(self, n);
+
+        self.route_midi(at, n);
 
         // Buses collect their inputs in `buf`; everything else starts it from silence.
         for t in self.tracks.iter_mut().filter(|t| t.bus) {
@@ -1142,8 +1358,9 @@ impl Mixer {
                 }
             }
 
+            // Audio input; an instrument track's input is MIDI (played through its instrument).
             let p = &track.params;
-            if (p.monitor || (p.armed && auto_monitor)) && p.input_channel < in_ch {
+            if track.instrument.is_none() && (p.monitor || (p.armed && auto_monitor)) && p.input_channel < in_ch {
                 for i in 0..n {
                     let s = self.input[p.input_channel][i];
                     l[i] += s;
@@ -1524,6 +1741,39 @@ impl TrackRt {
             return self.instrument.as_mut();
         }
         self.plugins.iter_mut().find(|p| p.instance == instance)
+    }
+}
+
+/// Live MIDI input for an instrument track at `offset` in the block. The sustain pedal holds
+/// keys let go while it's down until it comes up (instruments see no controllers yet), and a
+/// held key struck again restarts. Allocation-free.
+fn live_midi(t: &mut TrackRt, msg: MidiMsg, offset: u32) {
+    let live = &mut t.live;
+    let mut push = |pitch: u8, velocity: u8| {
+        if live.len() < live.capacity() {
+            live.push(MidiEvent { offset, pitch, velocity });
+        }
+    };
+    match msg {
+        MidiMsg::NoteOn { pitch, velocity } => {
+            if std::mem::take(&mut t.sustained[pitch as usize]) {
+                push(pitch, 0);
+            }
+            push(pitch, velocity);
+        }
+        MidiMsg::NoteOff { pitch } if t.sustain => t.sustained[pitch as usize] = true,
+        MidiMsg::NoteOff { pitch } => push(pitch, 0),
+        MidiMsg::Sustain(down) => {
+            t.sustain = down;
+            if !down {
+                for (pitch, held) in t.sustained.iter_mut().enumerate() {
+                    if std::mem::take(held) {
+                        push(pitch as u8, 0);
+                    }
+                }
+            }
+        }
+        MidiMsg::AllNotesOff => (t.flush, t.sustain, t.sustained) = (true, false, [false; 128]),
     }
 }
 

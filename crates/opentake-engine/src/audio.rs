@@ -201,6 +201,16 @@ pub fn start(resolved: ResolvedConfig, mut mixer: Mixer) -> Result<AudioStreams>
         out_cfg,
         move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
             let frames = out.len() / out_channels;
+            // MIDI input is placed in this callback by the time it started (see
+            // `midi_input`); recorded notes allow for how much later its output is heard.
+            mixer.set_callback_time(crate::midi_input::now_ns());
+            let ts = info.timestamp();
+            if let (Some(cb), Some(pb)) = (nanos(ts.callback), nanos(ts.playback))
+                && (0..1_000_000_000).contains(&(pb - cb))
+            {
+                mixer.report_output_latency((pb - cb) as f64 * sample_rate as f64 / 1e9);
+            }
+
             let wanted = (frames * in_channels).min(in_buf.len());
             let mut got = 0;
             if in_channels > 0 {

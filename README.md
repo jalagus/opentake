@@ -25,11 +25,13 @@ you watch the changes appear live — and undo anything you don't like.
 - ⏱️ Project tempo map (tempo and time-signature changes), metronome with count-in
 - 🔁 Cycle recording: loop a section and record take after take, then pick the one that plays
   or comp the best parts of several takes together (Logic-style quick swipe comping in take lanes)
+- 🎹 MIDI input and MIDI recording from any keyboard or controller (CoreMIDI, Windows MIDI, ALSA),
+  with sustain pedal, latency-compensated note placement and cycle overdub
 - ✂️ Region editing: select, move, copy, split, trim, snap, cycle/loop; region gain and normalize;
   fades, crossfades and click-free merging of regions
 - 🎚️ Full mixer, metronome, undo/redo for everything
 - 💾 Export the mix and stems to WAV or FLAC, faster than real time
-- 🤖 MCP server (stdio or HTTP) with 87 tools — the agent and you share one session
+- 🤖 MCP server (stdio or HTTP) with 89 tools — the agent and you share one session
 - 📂 Its own `.otp` project files (double-click to open), Reaper `.rpp` and DAWproject (Bitwig, Studio One, Cubase) projects
 - 🔀 Imports Ableton Live sets (`.als`), Ardour sessions, and Logic Pro projects exported as Final Cut Pro XML
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
@@ -114,6 +116,15 @@ agent.
 - **Record and arrange**: audio and instrument tracks; move, trim, split, copy and loop regions
   with snapping; tempo and time-signature changes; a metronome with count-in.
 - **MIDI**: a built-in synth and drum kit or any VST3 / Audio Unit instrument, edited in the piano roll.
+- **Play and record MIDI**: plug in a keyboard (Audio Settings → MIDI Inputs: all inputs by
+  default, or tick the ones to use; the MIDI light in the control bar flashes as notes come in).
+  What you play goes to every record-armed (**R**) instrument track, or with none armed to the
+  selected one, like Logic. Press record (**R**): armed instrument tracks record MIDI — together
+  with armed audio tracks, or on their own without an audio input — and the notes appear in the
+  red region as you play. Stop makes one MIDI region per track, with notes placed where you heard
+  them (output latency compensated) and the sustain pedal folded into note lengths. With the
+  cycle on, every pass merges into one region over the cycle (overdub). One undo removes the
+  take and puts the playhead back where recording began.
 - **Guitar Pro import**: drop a `.gp` file to get one instrument track per part, the song's
   tempo map, and tablature or notation that scrolls along with the arrangement (**T**).
 - **MIDI files**: drop a `.mid` file (or File → Import MIDI File…) to pick its parts; each
@@ -224,7 +235,7 @@ of the tool calls behind them):
 `set_master_volume`, `set_metronome`, `set_auto_input_monitoring`, `set_count_in`, `set_loop`,
 `add_track`, `add_bus`, `add_send`, `update_send`, `remove_send`, `move_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `set_clip_gain`, `normalize_clip`, `set_clip_pitch_stretch`, `set_clip_fades`, `crossfade_clips`, `merge_clips`, `remove_clip`,
 `select_take`, `delete_take`, `comp_take`, `clear_comp`, `flatten_comp`,
-`play`, `stop`, `seek`, `record`,
+`play`, `stop`, `seek`, `record`, `list_midi_inputs`, `set_midi_inputs`,
 `scan_plugins`, `insert_plugin`, `remove_plugin`, `insert_master_plugin`, `remove_master_plugin`, `set_plugin_bypass`,
 `list_plugin_params`, `set_plugin_param`, `set_sidechain` (`"eq"` inserts the built-in EQ; `master: true` addresses the master bus),
 `list_instruments`, `add_instrument_track`, `set_instrument`, `list_instrument_params`, `set_instrument_param`,
@@ -246,7 +257,9 @@ keeping the master peak under -1 dBFS and the phone drop similar across tracks.
 
 Recording: arm a track (`update_track` with `armed: true` and `input_channel`), call
 `record`, then `stop`. Each armed track gets a mono 32-bit float WAV in
-`<project dir>/Audio/`, and it's added to the track as a clip.
+`<project dir>/Audio/`, and it's added to the track as a clip. Armed instrument tracks record
+the MIDI played on the inputs `list_midi_inputs` shows (`set_midi_inputs` chooses them); `stop`
+returns the new MIDI regions too.
 
 ## Reaper projects
 
@@ -312,8 +325,13 @@ automation other than tempo, sends/returns and fades aren't imported.
   `cargo run -p opentake-project --example gpinfo -- song.gp` prints what the reader sees.
 - MIDI files: notes, tempo and time signatures are imported (format 0/1; format 2 is read
   as parallel tracks); program changes only pick names, and CC, pitch bend and lyrics are skipped.
-- MIDI: no MIDI input / recording yet, no CC/pitch-bend; notes are in seconds, so changing
-  the tempo map doesn't stretch existing regions (they keep their real-time positions).
+- MIDI: notes and the sustain pedal only — pitch bend, mod wheel and other CCs from MIDI
+  inputs are ignored (live and when recording; the pedal is folded into note lengths), and
+  channels are merged (omni). Live MIDI plays one audio buffer late (constant, no jitter) and
+  through any plug-in delay compensation. MIDI recording merges cycle passes (no MIDI take
+  folders, no replace mode or quantize-on-input yet); a key held over the cycle end ends there.
+  Notes are in seconds, so changing the tempo map doesn't stretch existing regions (they keep
+  their real-time positions).
 - Takes: one comp per folder (no alternative comps to switch between), and a new cycle pass
   replaces it; a region fade longer than the first or last comp segment is shortened to it.
 - Tempo map: steps only (no gradual tempo ramps); Reaper ramps are imported as steps.

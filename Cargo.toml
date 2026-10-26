@@ -38,6 +38,7 @@ roxmltree = "0.21"
 flate2 = "1"
 flacenc = "0.5"
 midly = "0.5"
+midir = "0.11"
 signalsmith-stretch = "0.1"
 
 # Region pitch/stretch renders in C++; keep it fast in debug builds too.

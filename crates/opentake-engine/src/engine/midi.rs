@@ -15,7 +15,7 @@ pub struct MidiClipUpdate {
     pub mute: Option<bool>,
 }
 
-const MIN_NOTE_SECS: f64 = 0.005;
+pub(super) const MIN_NOTE_SECS: f64 = 0.005;
 
 pub(super) fn validate_notes(notes: &[Note]) -> Result<()> {
     for n in notes {

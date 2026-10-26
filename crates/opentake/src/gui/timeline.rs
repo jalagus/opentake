@@ -8,7 +8,7 @@ use std::sync::Arc;
 use opentake_engine::{AutomationParam, FadeUpdate, RegionData, TrackUpdate, Waveform};
 use opentake_engine::project::automation::{envelope_at, gain_to_pos, pos_to_gain};
 use opentake_engine::project::tempo::{bar_len_q, beat_len_q};
-use opentake_engine::project::{AutomationLane, AutomationMode, AutomationTarget, BarLine, Clip, Curve, Fade, FadeCurve, Grid, MidiClip, Project, Take, TempoChange, TempoMap, Track, effective_fades};
+use opentake_engine::project::{AutomationLane, AutomationMode, AutomationTarget, BarLine, Clip, Curve, Fade, FadeCurve, Grid, MidiClip, Note, Project, Take, TempoChange, TempoMap, Track, effective_fades};
 use eframe::egui;
 use egui::{Align, Align2, Color32, CursorIcon, FontId, Layout, Painter, Pos2, Rangef, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
 
@@ -560,7 +560,8 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
 
                 if track.armed {
                     if let Some(start) = snap.status.record_start_secs {
-                        recording_region(&painter, rect, &app.view, start, playhead, project, ui);
+                        let notes: &[Note] = if track.is_instrument() { &snap.recording_notes } else { &[] };
+                        recording_region(&painter, rect, &app.view, start, playhead, project, notes, ui);
                     }
                 }
                 // The fades each audio region plays with, crossfades over overlaps included.
@@ -716,8 +717,10 @@ fn handle_zoom_scroll(app: &mut DawApp, ui: &egui::Ui) {
 
 /// Draws one region and handles select / move / copy / trim / split.
 /// What an armed track is recording right now: a red region growing with the playhead (a
-/// cycle recording restarts it at the cycle start on every pass).
-fn recording_region(painter: &Painter, row: Rect, view: &View, start: f64, playhead: f64, project: &Project, ui: &egui::Ui) {
+/// cycle recording restarts it at the cycle start on every pass), with the notes played so
+/// far on an instrument track (timeline seconds).
+#[allow(clippy::too_many_arguments)]
+fn recording_region(painter: &Painter, row: Rect, view: &View, start: f64, playhead: f64, project: &Project, notes: &[Note], ui: &egui::Ui) {
     let start = if playhead < start && project.loop_enabled { project.loop_start_secs } else { start };
     if playhead <= start {
         return;
@@ -734,8 +737,21 @@ fn recording_region(painter: &Painter, row: Rect, view: &View, start: f64, playh
     let pulse = (ui.input(|i| i.time) * 3.0).sin() as f32 * 0.5 + 0.5;
     painter.circle_filled(pos2(bar.left() + 9.0, bar.center().y), 3.5, Color32::from_white_alpha((120.0 + 135.0 * pulse) as u8));
     painter.with_clip_rect(bar).text(pos2(bar.left() + 17.0, bar.center().y), Align2::LEFT_CENTER, "Recording", FontId::proportional(10.5), Color32::WHITE);
+    // Notes as small bars, spread over the played pitch range (a held note grows).
+    if let (Some(lo), Some(hi)) = (notes.iter().map(|n| n.pitch).min(), notes.iter().map(|n| n.pitch).max()) {
+        let body = Rect::from_min_max(pos2(rect.left(), bar.bottom() + 3.0), pos2(rect.right(), rect.bottom() - 3.0));
+        let (lo, hi) = (lo.saturating_sub(2) as f32, hi.saturating_add(2) as f32);
+        let h = (body.height() / (hi - lo + 1.0)).clamp(1.5, 5.0);
+        let p = painter.with_clip_rect(body);
+        for n in notes {
+            let y = body.bottom() - (n.pitch as f32 - lo + 0.5) / (hi - lo + 1.0) * body.height();
+            let (x0, x1) = (view.x_of(n.start_secs), view.x_of((n.start_secs + n.length_secs).min(playhead)));
+            p.rect_filled(Rect::from_min_max(pos2(x0, y - h / 2.0), pos2(x1.max(x0 + 2.0), y + h / 2.0)), 1.0, Color32::from_white_alpha(210));
+        }
+    }
     ui.ctx().request_repaint();
 }
+
 
 /// One region: drawing and gestures. `fades` are an audio region's effective fades.
 #[allow(clippy::too_many_arguments)]
@@ -1914,11 +1930,14 @@ fn track_header(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, track: &Track, s
                 ("M", track.mute, theme::MUTE, "Mute", |v| TrackUpdate { mute: Some(v), ..Default::default() }),
                 ("S", track.solo, theme::SOLO, "Solo", |v| TrackUpdate { solo: Some(v), ..Default::default() }),
             ];
-            // Record/input apply to audio input; instrument tracks don't record MIDI yet, and
-            // buses only mix.
-            let records = !track.is_instrument() && !track.bus;
+            // Audio tracks record and monitor their input; instrument tracks record MIDI (and
+            // always play it live through the instrument, so no I); buses only mix.
+            let records = !track.bus;
+            let monitors = records && !track.is_instrument();
             if records {
                 chips.push(("R", track.armed, theme::RECORD, "Record Enable", |v| TrackUpdate { armed: Some(v), ..Default::default() }));
+            }
+            if monitors {
                 chips.push(("I", track.monitor_input, theme::INPUT, "Input Monitoring", |v| TrackUpdate {
                     monitor_input: Some(v),
                     ..Default::default()
@@ -1939,8 +1958,9 @@ fn track_header(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, track: &Track, s
                     }
                 }
             }
-            if !records {
-                ui.add_space(2.0 * 23.0);
+            let missing = 2 - records as usize - monitors as usize;
+            if missing > 0 {
+                ui.add_space(missing as f32 * 23.0);
             }
             let a = widgets::chip(ui, track.show_automation, "A", theme::AUTOMATION, "Show Automation", size);
             if a.clicked() {
