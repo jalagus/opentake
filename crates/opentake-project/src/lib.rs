@@ -18,6 +18,7 @@ pub mod rpp;
 pub mod sends;
 pub mod sidechain;
 pub mod tempo;
+pub mod vstpreset;
 
 pub use automation::{AutomationLane, AutomationMode, AutomationPoint, AutomationTarget, Curve};
 pub use comp::{COMP_JOIN_SECS, CompSegment, played_clips};
@@ -28,4 +29,5 @@ pub use model::*;
 pub use region_loop::{LoopPass, MAX_LOOP_PASSES, MIN_LOOP_SECS, RegionLoop};
 pub use sends::{AuxSend, MAX_SEND_GAIN};
 pub use sidechain::SideChain;
+pub use vstpreset::VstPreset;
 pub use tempo::{BarLine, Grid, MusicalPos, TempoChange, TempoMap, TempoSegment};

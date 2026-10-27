@@ -89,6 +89,14 @@ impl Drop for Instance {
     }
 }
 
+/// A VST3 plug-in's saved state: the component's and the edit controller's chunks, as a
+/// `.vstpreset` holds them ("Comp" and "Cont").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginState {
+    pub component: Vec<u8>,
+    pub controller: Option<Vec<u8>>,
+}
+
 /// Control-side handle: parameters, state, instantiating the processor.
 pub struct Vst3Plugin {
     inst: Arc<Instance>,
@@ -193,22 +201,55 @@ impl Vst3Plugin {
         }
     }
 
-    /// Component (processor) state blob, suitable for saving in a project.
-    pub fn get_state(&self) -> Result<Vec<u8>> {
-        unsafe { get_component_state(&self.inst.component) }
+    /// The plug-in's full state: the component's (`IComponent::getState`: what it
+    /// processes with) and the edit controller's (`IEditController::getState`: editor-side
+    /// settings, often none). The latter is `None` when the plug-in has no controller or
+    /// declines to save one.
+    pub fn save_state(&self) -> Result<PluginState> {
+        unsafe {
+            let component = get_component_state(&self.inst.component)?;
+            let controller = self.inst.controller.as_ref().and_then(|ctrl| {
+                let stream = ComWrapper::new(MemoryStream::default());
+                let s = stream.to_com_ptr::<IBStream>()?;
+                (ctrl.getState(s.as_ptr()) == kResultOk).then(|| stream.bytes())
+            });
+            Ok(PluginState { component, controller })
+        }
     }
 
-    pub fn set_state(&self, state: &[u8]) -> Result<()> {
+    /// Restore a saved state, in the order the VST3 spec gives: `IComponent::setState`, then
+    /// the controller's `setComponentState` with the same bytes and its own `setState`. Call
+    /// it before the processor is set up (also allowed later, from this thread). A component
+    /// that refuses the state is an error; a controller that does is only logged (it then
+    /// keeps showing its defaults until the parameters are set).
+    pub fn load_state(&self, state: &PluginState) -> Result<()> {
+        // Each call reads a fresh stream from the start: plug-ins may seek or read to the end.
+        let stream = |bytes: &[u8]| ComWrapper::new(MemoryStream::from_bytes(bytes.to_vec()));
         unsafe {
-            let stream = ComWrapper::new(MemoryStream::from_bytes(state.to_vec()));
-            let s = stream.to_com_ptr::<IBStream>().ok_or(Error::Com("IBStream"))?;
+            let comp = stream(&state.component);
+            let s = comp.to_com_ptr::<IBStream>().ok_or(Error::Com("IBStream"))?;
             check(self.inst.component.setState(s.as_ptr()), "IComponent::setState")?;
             if let Some(ctrl) = &self.inst.controller {
-                s.seek(0, 0, std::ptr::null_mut());
-                ctrl.setComponentState(s.as_ptr());
+                let comp = stream(&state.component);
+                let s = comp.to_com_ptr::<IBStream>().ok_or(Error::Com("IBStream"))?;
+                if let Err(e) = check(ctrl.setComponentState(s.as_ptr()), "IEditController::setComponentState") {
+                    tracing::warn!("{}: {e}", self.class.name);
+                }
+                if let Some(bytes) = &state.controller {
+                    let own = stream(bytes);
+                    let s = own.to_com_ptr::<IBStream>().ok_or(Error::Com("IBStream"))?;
+                    if let Err(e) = check(ctrl.setState(s.as_ptr()), "IEditController::setState") {
+                        tracing::warn!("{}: {e}", self.class.name);
+                    }
+                }
             }
-            Ok(())
         }
+        // A plug-in may answer with `restartComponent` (values changed): that's this restore,
+        // not an edit to record.
+        for edit in self.inst.edits.take().into_iter().filter(|e| !matches!(e, Edit::Reload)) {
+            self.inst.edits.push(edit);
+        }
+        Ok(())
     }
 
     /// Whether the plug-in has a side-chain input (an aux audio input bus), which

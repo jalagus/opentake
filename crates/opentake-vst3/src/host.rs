@@ -236,7 +236,10 @@ impl IComponentHandlerTrait for ComponentHandler {
     }
 }
 
-/// In-memory `IBStream`, used for saving and restoring plugin state.
+/// In-memory `IBStream` (and `ISizeableStream`, which some plug-in frameworks ask for to
+/// size their reads), used for saving and restoring plugin state. Semantics follow the
+/// SDK's `MemoryStream`: reads stop at the end, the position may be sought past the end
+/// (never before the start), and writing there fills the gap with zeros.
 #[derive(Default)]
 pub struct MemoryStream {
     data: RefCell<Vec<u8>>,
@@ -254,7 +257,7 @@ impl MemoryStream {
 }
 
 impl Class for MemoryStream {
-    type Interfaces = (IBStream,);
+    type Interfaces = (IBStream, ISizeableStream);
 }
 
 impl IBStreamTrait for MemoryStream {
@@ -262,6 +265,10 @@ impl IBStreamTrait for MemoryStream {
         let data = self.data.borrow();
         let pos = self.pos.get().min(data.len());
         let n = (num_bytes.max(0) as usize).min(data.len() - pos);
+        if buffer.is_null() && n > 0 {
+            return kInvalidArgument;
+        }
+        // SAFETY: the plug-in's buffer holds `num_bytes` >= `n` bytes; `num_read` is null or valid.
         unsafe {
             std::ptr::copy_nonoverlapping(data[pos..].as_ptr(), buffer as *mut u8, n);
             if !num_read.is_null() {
@@ -274,11 +281,15 @@ impl IBStreamTrait for MemoryStream {
 
     unsafe fn write(&self, buffer: *mut c_void, num_bytes: int32, num_written: *mut int32) -> tresult {
         let n = num_bytes.max(0) as usize;
+        if buffer.is_null() && n > 0 {
+            return kInvalidArgument;
+        }
         let mut data = self.data.borrow_mut();
         let pos = self.pos.get();
         if data.len() < pos + n {
             data.resize(pos + n, 0);
         }
+        // SAFETY: `buffer` holds `n` bytes and `data` was grown to fit them.
         unsafe {
             std::ptr::copy_nonoverlapping(buffer as *const u8, data[pos..].as_mut_ptr(), n);
             if !num_written.is_null() {
@@ -290,16 +301,17 @@ impl IBStreamTrait for MemoryStream {
     }
 
     unsafe fn seek(&self, pos: int64, mode: int32, result: *mut int64) -> tresult {
-        let len = self.data.borrow().len() as i64;
-        let base = match mode {
-            0 => 0,                     // kIBSeekSet
-            1 => self.pos.get() as i64, // kIBSeekCur
-            2 => len,                   // kIBSeekEnd
+        use IBStream_::IStreamSeekMode_::*;
+        let base = match mode as IBStream_::IStreamSeekMode {
+            m if m == kIBSeekSet => 0,
+            m if m == kIBSeekCur => self.pos.get() as i64,
+            m if m == kIBSeekEnd => self.data.borrow().len() as i64,
             _ => return kInvalidArgument,
         };
-        let new = (base + pos).clamp(0, len);
+        let new = base.saturating_add(pos).max(0);
         self.pos.set(new as usize);
         if !result.is_null() {
+            // SAFETY: checked non-null.
             unsafe { *result = new };
         }
         kResultOk
@@ -309,7 +321,27 @@ impl IBStreamTrait for MemoryStream {
         if pos.is_null() {
             return kInvalidArgument;
         }
+        // SAFETY: checked non-null.
         unsafe { *pos = self.pos.get() as int64 };
+        kResultOk
+    }
+}
+
+impl ISizeableStreamTrait for MemoryStream {
+    unsafe fn getStreamSize(&self, size: *mut int64) -> tresult {
+        if size.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: checked non-null.
+        unsafe { *size = self.data.borrow().len() as int64 };
+        kResultOk
+    }
+
+    unsafe fn setStreamSize(&self, size: int64) -> tresult {
+        if size < 0 {
+            return kInvalidArgument;
+        }
+        self.data.borrow_mut().resize(size as usize, 0);
         kResultOk
     }
 }
@@ -587,6 +619,62 @@ impl IEventListTrait for EventList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What plug-ins do with a state stream: write, tell, seek back to patch a size, seek
+    /// to the end to size it, read in pieces past the end.
+    #[test]
+    fn memory_stream_reads_writes_and_seeks_like_the_sdk() {
+        use IBStream_::IStreamSeekMode_::*;
+        let stream = ComWrapper::new(MemoryStream::default());
+        let s = stream.to_com_ptr::<IBStream>().unwrap();
+        let mut n = 0;
+        let mut at = 0i64;
+        unsafe {
+            let mut header = *b"SIZE";
+            assert_eq!(s.write(header.as_mut_ptr() as *mut c_void, 4, &mut n), kResultOk);
+            let mut body = *b"payload";
+            s.write(body.as_mut_ptr() as *mut c_void, 7, &mut n);
+            assert_eq!(n, 7);
+            s.tell(&mut at);
+            assert_eq!(at, 11);
+            // Patch the header in place, then back to the end.
+            s.seek(0, kIBSeekSet as i32, &mut at);
+            let mut size = 7u32.to_le_bytes();
+            s.write(size.as_mut_ptr() as *mut c_void, 4, std::ptr::null_mut());
+            s.seek(0, kIBSeekEnd as i32, &mut at);
+            assert_eq!(at, 11);
+            // Past the end: the gap is zero-filled on write; never before the start.
+            s.seek(2, kIBSeekCur as i32, &mut at);
+            assert_eq!(at, 13);
+            let mut tail = [9u8];
+            s.write(tail.as_mut_ptr() as *mut c_void, 1, std::ptr::null_mut());
+            s.seek(-100, kIBSeekCur as i32, &mut at);
+            assert_eq!(at, 0);
+            assert_eq!(s.seek(0, 7, &mut at), kInvalidArgument);
+        }
+        assert_eq!(stream.bytes(), [&7u32.to_le_bytes()[..], b"payload", &[0, 0, 9]].concat());
+
+        let sized = stream.to_com_ptr::<ISizeableStream>().expect("sizeable");
+        let mut len = 0i64;
+        unsafe { sized.getStreamSize(&mut len) };
+        assert_eq!(len, 14);
+        // Reads stop at the end and report what they got.
+        let mut buf = [0u8; 10];
+        unsafe {
+            s.seek(4, kIBSeekSet as i32, std::ptr::null_mut());
+            assert_eq!(s.read(buf.as_mut_ptr() as *mut c_void, 10, &mut n), kResultOk);
+            assert_eq!((n, &buf[..7]), (10, &b"payload"[..]));
+            s.read(buf.as_mut_ptr() as *mut c_void, 10, &mut n);
+            assert_eq!(n, 0, "at the end");
+            s.tell(&mut at);
+            assert_eq!(at, 14);
+            s.seek(20, kIBSeekSet as i32, std::ptr::null_mut());
+            s.read(buf.as_mut_ptr() as *mut c_void, 4, &mut n);
+            assert_eq!(n, 0, "past the end");
+            sized.setStreamSize(4);
+        }
+        assert_eq!(stream.bytes(), 7u32.to_le_bytes());
+    }
 
     #[test]
     fn midi_controllers_become_parameter_changes_at_their_offsets() {

@@ -11,3 +11,4 @@ serde_json.workspace = true
 zip.workspace = true
 roxmltree.workspace = true
 flate2.workspace = true
+base64 = "0.23"

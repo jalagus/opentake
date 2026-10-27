@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 pub use editor::{Edit, EditQueue, Vst3Editor};
 pub use module::{ClassInfo, Module};
-pub use plugin::{NoteEvent, ParamInfo, Transport, Vst3Plugin, Vst3Processor};
+pub use plugin::{NoteEvent, ParamInfo, PluginState, Transport, Vst3Plugin, Vst3Processor};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

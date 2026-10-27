@@ -276,7 +276,7 @@ impl Engine {
 
     /// The plug-in changed values itself (a preset): saved values that differ follow, as
     /// one undo step, and the processor gets them.
-    fn reload_params(&mut self, track: usize, which: SlotRef) -> Result<()> {
+    pub(super) fn reload_params(&mut self, track: usize, which: SlotRef) -> Result<()> {
         let slot = self.slot_ref(track, which)?;
         let Some(plugin) = self.pool.get(&slot.instance) else { return Ok(()) };
         let changed: Vec<(u32, f64)> = slot.params.iter().filter_map(|&(id, saved)| plugin.get_param(id).filter(|v| (v - saved).abs() > 1e-6).map(|v| (id, v))).collect();

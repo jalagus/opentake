@@ -3,12 +3,19 @@
 //! Loaded instances live in `Engine::pool` keyed by a session-unique instance id that is
 //! also stored in the project (`PluginSlot::instance`). Removing a plugin keeps the
 //! instance in the pool, so undo can bring back the very same instance with its state.
+//!
+//! A hosted plug-in's state beyond its parameters (a VST3's component and controller
+//! chunks, an AU's ClassInfo) lives in the instance while the project is open: it's written
+//! into the slots when saving ([`Engine::project_with_plugin_state`]) and given to each new
+//! instance made from a slot (loading, offline rendering). A slot's saved parameter values
+//! are applied on top of a restored state: they're the values set here (automation's base
+//! line), which a state saved during automation playback needn't hold.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use opentake_project::{Controller, PluginFormat, PluginSlot};
-use opentake_vst3::{ClassInfo, Module, NoteEvent, ScannedPlugin, Vst3Plugin, Vst3Processor};
+use opentake_project::{Controller, PluginFormat, PluginSlot, Project, VstPreset};
+use opentake_vst3::{ClassInfo, Module, NoteEvent, PluginState, ScannedPlugin, Vst3Plugin, Vst3Processor};
 
 use super::{Engine, ParamView, display_name};
 use crate::mixer::{Command, KeyRt, MASTER, MAX_BLOCK, MidiData, MidiEvent, PLUGIN_CAPACITY, PluginRt, Processor, Transport};
@@ -210,6 +217,12 @@ fn builtin_slot(name: &str, path: &str) -> PluginSlot {
     }
 }
 
+/// A VST3 instance's current state as a `.vstpreset`.
+fn vst3_preset(plugin: &Vst3Plugin) -> Result<VstPreset> {
+    let state = plugin.save_state()?;
+    Ok(VstPreset::new(&plugin.class.cid, state.component, state.controller))
+}
+
 /// Apply stored parameter values to a fresh processor.
 fn with_params(mut p: Box<dyn Processor>, params: &[(u32, f64)]) -> Box<dyn Processor> {
     for &(id, value) in params {
@@ -367,24 +380,80 @@ impl Engine {
         Ok(slot)
     }
 
-    /// Locate and instantiate a plugin referenced by a project file. Returns its instance id.
-    pub(super) fn load_slot(&mut self, slot: &PluginSlot) -> Result<u64> {
-        match slot.format {
-            PluginFormat::Builtin if slot.path == synth::PATH => return Ok(self.add_to_pool(Loaded::Synth)),
-            PluginFormat::Builtin if slot.path == drums::PATH => return Ok(self.add_to_pool(Loaded::Drums)),
-            PluginFormat::Builtin if builtin_effect_instance(&slot.path).is_some() => {
-                return Ok(self.add_to_pool(builtin_effect_instance(&slot.path).expect("known built-in")));
-            }
-            PluginFormat::Vst3 => {}
-            PluginFormat::AudioUnit => return self.load_au_slot(slot),
-            _ => bail!("unsupported plugin format"),
+    /// A loaded hosted plug-in's current state as its slot stores it (`None` for built-ins
+    /// and slots that aren't loaded).
+    pub(super) fn capture_state(&self, slot: &PluginSlot) -> Option<Result<Vec<String>>> {
+        match self.pool.get(&slot.instance)? {
+            Loaded::Vst3(plugin) => Some(vst3_preset(plugin).map(|p| p.to_lines())),
+            #[cfg(target_os = "macos")]
+            Loaded::Au(plugin) => Some(super::au::capture_state(plugin)),
+            _ => None,
         }
-        let plugin = self.instantiate_vst3_slot(slot)?;
-        Ok(self.add_to_pool(Loaded::Vst3(plugin)))
     }
 
-    /// A new VST3 instance for a slot, with its saved parameter values.
-    fn instantiate_vst3_slot(&mut self, slot: &PluginSlot) -> Result<Vst3Plugin> {
+    /// The project with every loaded plug-in's current state written into its slot. A state
+    /// that can't be had keeps what the slot had (with a warning in the log).
+    pub(super) fn project_with_plugin_state(&self) -> Project {
+        let mut project = self.project.clone();
+        let slots = project.tracks.iter_mut().flat_map(|t| t.instrument.iter_mut().chain(t.plugins.iter_mut())).chain(project.master_plugins.iter_mut());
+        for slot in slots {
+            match self.capture_state(slot) {
+                Some(Ok(state)) => slot.state = state,
+                Some(Err(e)) => tracing::warn!("'{}': state not saved: {e:#}", slot.name),
+                None => {}
+            }
+        }
+        project
+    }
+
+    /// Save a VST3 slot's current state as a `.vstpreset` file (what VST3 hosts load as a
+    /// preset). Returns its size in bytes.
+    pub fn save_plugin_preset(&self, track: usize, which: SlotRef, path: &Path) -> Result<usize> {
+        let slot = self.slot_ref(track, which)?;
+        let Some(Loaded::Vst3(plugin)) = self.pool.get(&slot.instance) else { bail!("'{}' isn't a loaded VST3 plug-in", slot.name) };
+        let bytes = vst3_preset(plugin)?.to_bytes();
+        std::fs::write(path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+        Ok(bytes.len())
+    }
+
+    /// Load a `.vstpreset` file into a VST3 slot. Parameter values the project holds follow
+    /// the preset as one undo step; the rest of the plug-in's state isn't part of undo.
+    pub fn load_plugin_preset(&mut self, track: usize, which: SlotRef, path: &Path) -> Result<()> {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let preset = VstPreset::from_bytes(&bytes).with_context(|| path.display().to_string())?;
+        let slot = self.slot_ref(track, which)?;
+        let Some(Loaded::Vst3(plugin)) = self.pool.get(&slot.instance) else { bail!("'{}' isn't a loaded VST3 plug-in", slot.name) };
+        if !preset.class_id.eq_ignore_ascii_case(&plugin.class.cid) {
+            bail!("the preset is for another plug-in (class {})", preset.class_id);
+        }
+        plugin.load_state(&PluginState { component: preset.component().to_vec(), controller: preset.controller().map(<[u8]>::to_vec) })?;
+        self.reload_params(track, which)
+    }
+
+    /// Locate and instantiate a plugin referenced by a project file. Returns its instance id
+    /// and a warning if its saved state couldn't be restored. A VST3's state then lives in
+    /// the instance, so the slot drops its copy (it can be large, and every undo step holds
+    /// the project).
+    pub(super) fn load_slot(&mut self, slot: &mut PluginSlot) -> Result<(u64, Option<String>)> {
+        match slot.format {
+            PluginFormat::Builtin if slot.path == synth::PATH => return Ok((self.add_to_pool(Loaded::Synth), None)),
+            PluginFormat::Builtin if slot.path == drums::PATH => return Ok((self.add_to_pool(Loaded::Drums), None)),
+            PluginFormat::Builtin if builtin_effect_instance(&slot.path).is_some() => {
+                return Ok((self.add_to_pool(builtin_effect_instance(&slot.path).expect("known built-in")), None));
+            }
+            PluginFormat::Vst3 => {}
+            PluginFormat::AudioUnit => return Ok((self.load_au_slot(slot)?, None)),
+            _ => bail!("unsupported plugin format"),
+        }
+        let (plugin, warning) = self.instantiate_vst3_slot(slot)?;
+        slot.state = Vec::new();
+        Ok((self.add_to_pool(Loaded::Vst3(plugin)), warning))
+    }
+
+    /// A new VST3 instance for a slot, with its saved state and parameter values. A state it
+    /// can't take (damaged, another host's format, refused) is skipped, which the warning
+    /// returned says: the parameters still apply.
+    fn instantiate_vst3_slot(&mut self, slot: &PluginSlot) -> Result<(Vst3Plugin, Option<String>)> {
         let bundle = if Path::new(&slot.path).exists() {
             PathBuf::from(&slot.path)
         } else {
@@ -398,15 +467,27 @@ impl Engine {
         let cid = slot.uid.rsplit('{').next().map(|s| s.trim_end_matches('}').to_string());
         let name = display_name(&slot.name);
         let plugin = self.instantiate(&bundle, cid.as_deref(), name.as_deref())?;
+        let mut warning = None;
+        if !slot.state.is_empty() {
+            let restored = VstPreset::from_lines(&slot.state).map_err(anyhow::Error::from).and_then(|p| {
+                if !p.class_id.eq_ignore_ascii_case(&plugin.class.cid) {
+                    tracing::warn!("'{}': state saved for class {}, loading into {}", slot.name, p.class_id, plugin.class.cid);
+                }
+                let state = PluginState { component: p.component().to_vec(), controller: p.controller().map(<[u8]>::to_vec) };
+                Ok(plugin.load_state(&state)?)
+            });
+            warning = restored.err().map(|e| format!("plugin '{}': saved state not restored, using its parameters: {e:#}", slot.name));
+        }
         for &(id, value) in &slot.params {
             plugin.set_param_on_controller(id, value);
         }
-        Ok(plugin)
+        Ok((plugin, warning))
     }
 
     /// A separate processor for offline rendering (analysis, export): built-ins are created
-    /// fresh, VST3s get a new instance, so the live audio thread is never touched. Saved
-    /// parameter values are applied; VST3 state beyond parameters isn't saved yet.
+    /// fresh, VST3s get a new instance with the live one's current state (or the slot's, if
+    /// it isn't loaded), so the live audio thread is never touched. Saved parameter values
+    /// are applied.
     pub(super) fn offline_processor(&mut self, slot: &PluginSlot, sample_rate: f64) -> Result<Box<dyn Processor>> {
         let sr = sample_rate;
         let p: Box<dyn Processor> = match (slot.format.clone(), slot.path.as_str()) {
@@ -423,7 +504,16 @@ impl Engine {
             (PluginFormat::Builtin, chorus::PATH) => Box::new(Chorus::new(sr)),
             (PluginFormat::Builtin, phaser::PATH) => Box::new(Phaser::new(sr)),
             (PluginFormat::Vst3, _) => {
-                let plugin = self.instantiate_vst3_slot(slot)?;
+                let mut slot = slot.clone();
+                match self.capture_state(&slot) {
+                    Some(Ok(state)) => slot.state = state,
+                    Some(Err(e)) => tracing::warn!("'{}': state not captured for rendering: {e:#}", slot.name),
+                    None => {}
+                }
+                let (plugin, warning) = self.instantiate_vst3_slot(&slot)?;
+                if let Some(w) = warning {
+                    tracing::warn!("{w}");
+                }
                 let mut p = plugin.create_processor(sr, MAX_BLOCK, 2)?;
                 for &(id, value) in &slot.params {
                     p.queue_param(id, value);
@@ -896,6 +986,115 @@ mod tests {
         assert!(n == CTRL_PITCH_BEND && (centre - 0.5).abs() < 1e-4);
         assert_eq!(vst3_control(Controller::MOD_WHEEL, 127), (1, 1.0));
         assert_eq!(vst3_control(Controller::ChannelPressure, 0), (CTRL_AFTERTOUCH, 0.0));
+    }
+
+    /// A plug-in that isn't installed keeps its saved state through loading and saving.
+    #[test]
+    fn missing_vst3_keeps_its_state_in_the_project_file() {
+        let dir = std::env::temp_dir().join(format!("opentake-vst3-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut project = Project::default();
+        let mut track = opentake_project::Track::new("Gtr");
+        let preset = VstPreset::new("00112233445566778899AABBCCDDEEFF", vec![3; 1000], Some(vec![4; 10]));
+        track.plugins.push(PluginSlot { state: preset.to_lines(), params: vec![(7, 0.25)], ..builtin_slot("VST3: Gone (Nobody)", "/nowhere/Gone.vst3") });
+        track.plugins[0].format = PluginFormat::Vst3;
+        project.tracks.push(track);
+        let path = dir.join("song.otp");
+        std::fs::write(&path, serde_json::to_string(&project).unwrap()).unwrap();
+
+        let mut e = Engine::new();
+        let warnings = e.load_project(&path).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("Gone")), "{warnings:?}");
+        let again = dir.join("again.otp");
+        e.save_project(Some(&again)).unwrap();
+        let back: Project = serde_json::from_str(&std::fs::read_to_string(&again).unwrap()).unwrap();
+        assert_eq!(VstPreset::from_lines(&back.tracks[0].plugins[0].state), Ok(preset));
+        assert_eq!(back.tracks[0].plugins[0].params, vec![(7, 0.25)]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The first installed VST3 effect, if any (tests with a real plug-in need one).
+    fn installed_vst3_effect() -> Option<(PathBuf, ClassInfo)> {
+        let roots = opentake_vst3::scan::default_search_paths();
+        opentake_vst3::scan_plugins(&roots).into_iter().find_map(|(bundle, classes)| Some((bundle, classes.ok()?.into_iter().find(|c| !c.is_instrument())?)))
+    }
+
+    fn vst3_state(e: &Engine, t: usize) -> VstPreset {
+        let Some(Loaded::Vst3(plugin)) = e.pool.get(&e.project().tracks[t].plugins[0].instance) else { panic!("a loaded VST3") };
+        vst3_preset(plugin).unwrap()
+    }
+
+    /// With a real plug-in (skipped when none is installed): its full state survives saving
+    /// and loading in every format, undo after loading, and goes to offline instances.
+    #[test]
+    fn vst3_state_survives_save_load_undo_and_offline_rendering() {
+        let Some((bundle, class)) = installed_vst3_effect() else {
+            eprintln!("no VST3 effect installed; skipping");
+            return;
+        };
+        let mut e = Engine::new();
+        let mut mixer = e.attach_test_mixer(48_000);
+        let t = e.add_track("Gtr").unwrap();
+        e.insert_plugin(t, &bundle.to_string_lossy(), None).unwrap();
+        let initial = vst3_state(&e, t);
+        // Change a parameter the plug-in stores (one that takes the value); the processor
+        // gets it with the next block.
+        let params = e.plugin_params(t, 0).unwrap();
+        let changed = params.iter().filter(|p| !p.read_only).find_map(|p| {
+            let target = if p.value > 0.5 { 0.1 } else { 0.9 };
+            e.set_plugin_param(t, 0, p.id, target).ok()?;
+            let Some(Loaded::Vst3(plugin)) = e.pool.get(&e.project().tracks[t].plugins[0].instance) else { return None };
+            plugin.get_param(p.id).filter(|v| (v - p.value).abs() > 1e-3).map(|v| (p.id, v))
+        });
+        mixer.process(&[], 0, &mut [0.0; 2 * 64], 2);
+        let before = vst3_state(&e, t);
+        assert!(before.class_id.eq_ignore_ascii_case(&class.cid) && !before.component().is_empty());
+        if changed.is_some() {
+            assert_ne!(before.component(), initial.component(), "the component state holds the change");
+        }
+
+        let dir = std::env::temp_dir().join(format!("opentake-vst3-state-{}", std::process::id()));
+        for ext in ["otp", "rpp", "dawproject"] {
+            let path = dir.join(format!("song.{ext}"));
+            e.save_project(Some(&path)).unwrap();
+            let mut back = Engine::new();
+            let warnings = back.load_project(&path).unwrap();
+            assert!(warnings.is_empty(), "{ext}: {warnings:?}");
+            assert_eq!(vst3_state(&back, t).component(), before.component(), "{ext}: the component state comes back");
+            assert!(back.project().tracks[t].plugins[0].state.is_empty(), "{ext}: the instance holds it");
+            if let Some((id, v)) = changed {
+                let now = back.plugin_params(t, 0).unwrap().into_iter().find(|p| p.id == id).unwrap().value;
+                assert!((now - v).abs() < 1e-3, "{ext}: {now} != {v}");
+            }
+            // Undo after loading: removing and bringing back the plug-in keeps its state.
+            back.remove_plugin(t, 0).unwrap();
+            back.undo().unwrap();
+            assert_eq!(vst3_state(&back, t).component(), before.component(), "{ext}: after undo");
+        }
+        // An offline instance gets the live one's state: the state alone sets the controller.
+        let mut slot = e.project().tracks[t].plugins[0].clone();
+        slot.state = e.capture_state(&slot).unwrap().unwrap();
+        slot.params.clear();
+        let (copy, warning) = e.instantiate_vst3_slot(&slot).unwrap();
+        assert_eq!(warning, None);
+        assert_eq!(vst3_preset(&copy).unwrap().component(), before.component());
+        if let Some((id, v)) = changed {
+            assert!(copy.get_param(id).is_some_and(|now| (now - v).abs() < 1e-3), "the controller follows the state");
+        }
+        assert!(e.offline_processor(&e.project().tracks[t].plugins[0].clone(), 48_000.0).is_ok());
+        // Presets: saved from one instance, loaded into another (the saved values follow).
+        let preset = dir.join("tone.vstpreset");
+        assert!(e.save_plugin_preset(t, SlotRef::Effect(0), &preset).unwrap() > 48);
+        let fresh = e.add_track("Fresh").unwrap();
+        e.insert_plugin(fresh, &bundle.to_string_lossy(), None).unwrap();
+        e.load_plugin_preset(fresh, SlotRef::Effect(0), &preset).unwrap();
+        assert_eq!(vst3_state(&e, fresh).component(), before.component());
+        assert!(e.load_plugin_preset(fresh, SlotRef::Effect(0), &dir.join("song.otp")).is_err(), "not a preset");
+        // A state the plug-in can't use leaves it on its parameters.
+        slot.state = vec!["bm90IGEgcHJlc2V0".into()];
+        let warning = e.instantiate_vst3_slot(&slot).unwrap().1;
+        assert!(warning.is_some_and(|w| w.contains("not a VST3 preset")));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

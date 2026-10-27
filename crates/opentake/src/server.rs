@@ -198,10 +198,23 @@ fn project_json(project: &opentake_engine::project::Project, include_notes: bool
             }
             keys_json(project, Some(i), t.get_mut("plugins"));
             loops_json(t, track);
+            state_json(t.get_mut("instrument"));
+            t.get_mut("plugins").and_then(|p| p.as_array_mut()).into_iter().flatten().for_each(|s| state_json(Some(s)));
         }
     }
     keys_json(project, None, v.get_mut("master_plugins"));
+    v.get_mut("master_plugins").and_then(|p| p.as_array_mut()).into_iter().flatten().for_each(|s| state_json(Some(s)));
     v
+}
+
+/// A saved plug-in state is binary: shown by its size, if there is one. (A loaded VST3
+/// keeps its state in the instance until the project is saved.)
+fn state_json(slot: Option<&mut serde_json::Value>) {
+    let Some(o) = slot.and_then(|s| s.as_object_mut()) else { return };
+    let lines: Vec<String> = o.remove("state").and_then(|s| serde_json::from_value(s).ok()).unwrap_or_default();
+    if !lines.is_empty() {
+        o.insert("state".into(), json!(format!("{} bytes", opentake_engine::project::vstpreset::state_size(&lines))));
+    }
 }
 
 /// Looped regions say how long the loop is and how many passes play.
@@ -1043,6 +1056,33 @@ pub struct EditorArgs {
     /// The master bus's effect chain instead of a track (track is ignored).
     #[serde(default)]
     pub master: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PresetArgs {
+    #[serde(default)]
+    pub track: usize,
+    /// Effect slot (ignored with instrument: true).
+    #[serde(default)]
+    pub slot: usize,
+    /// The track's instrument instead of an effect.
+    #[serde(default)]
+    pub instrument: bool,
+    /// The master bus's effect chain instead of a track (track is ignored).
+    #[serde(default)]
+    pub master: bool,
+    /// The `.vstpreset` file.
+    pub path: PathBuf,
+}
+
+impl PresetArgs {
+    fn which(&self) -> SlotRef {
+        match (self.master, self.instrument) {
+            (true, _) => SlotRef::Master(self.slot),
+            (false, true) => SlotRef::Instrument,
+            (false, false) => SlotRef::Effect(self.slot),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1995,6 +2035,16 @@ impl DawServer {
         self.with_engine(move |e| e.set_slot_bypass(a.track, which, a.bypass).map(|_| "ok")).await
     }
 
+    #[tool(description = "Save a VST3 plugin's complete current state (its settings beyond the parameters too) as a .vstpreset file, which VST3 hosts load as a preset. Returns its size.")]
+    async fn save_plugin_preset(&self, Parameters(a): Parameters<PresetArgs>) -> ToolResult {
+        self.with_engine(move |e| e.save_plugin_preset(a.track, a.which(), &a.path).map(|bytes| json!({ "path": a.path, "bytes": bytes }))).await
+    }
+
+    #[tool(description = "Load a .vstpreset file into a VST3 plugin (the preset must be for that plugin). Undo restores the parameter values OpenTake had saved, not the rest of the plugin's state.")]
+    async fn load_plugin_preset(&self, Parameters(a): Parameters<PresetArgs>) -> ToolResult {
+        self.with_engine(move |e| e.load_plugin_preset(a.track, a.which(), &a.path).map(|_| "ok")).await
+    }
+
     #[tool(description = "Show a VST3 / AU plugin's own editor window to the user in the OpenTake window (built-ins and plugins without one get OpenTake's controls). Needs the GUI; edits made there are undoable and write automation like any control.")]
     async fn open_plugin_editor(&self, Parameters(a): Parameters<EditorArgs>) -> ToolResult {
         let which = match (a.master, a.instrument) {
@@ -2164,6 +2214,21 @@ mod compact_tests {
         assert!(v["tracks"][0]["midi_clips"][0].get("looped").is_none() && v["tracks"][0]["midi_clips"][1].get("loop").is_none());
     }
 
+    fn t_slot() -> opentake_engine::project::PluginSlot {
+        opentake_engine::project::PluginSlot {
+            name: "VST3: Synth".into(),
+            format: opentake_engine::project::PluginFormat::Vst3,
+            path: String::new(),
+            uid: String::new(),
+            bypass: false,
+            state: Vec::new(),
+            params: Vec::new(),
+            id: 0,
+            side_chain: None,
+            instance: 0,
+        }
+    }
+
     #[test]
     fn project_json_replaces_notes_with_counts_unless_asked() {
         let mut p = Project::default();
@@ -2180,7 +2245,13 @@ mod compact_tests {
             looped: None,
         });
         p.tracks.push(t);
+        let mut eq = opentake_engine::project::PluginSlot { state: vec!["AAAAAA==".into()], ..t_slot() };
+        eq.name = "VST3: EQ".into();
+        p.tracks[0].plugins.push(eq);
+        p.tracks[0].instrument = Some(t_slot());
         let compact = project_json(&p, false);
+        assert_eq!(compact["tracks"][0]["plugins"][0]["state"], "4 bytes", "states show their size");
+        assert!(compact["tracks"][0]["instrument"].get("state").is_none());
         let clip = &compact["tracks"][0]["midi_clips"][0];
         assert!(clip.get("notes").is_none());
         assert_eq!(clip["note_count"], 3);

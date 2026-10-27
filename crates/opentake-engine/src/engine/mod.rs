@@ -1232,7 +1232,10 @@ impl Engine {
             let name = track.name.clone();
             for slot in track.instrument.iter_mut().chain(track.plugins.iter_mut()) {
                 slot.instance = match self.load_slot(slot) {
-                    Ok(instance) => instance,
+                    Ok((instance, warning)) => {
+                        warnings.extend(warning.map(|w| format!("track '{name}': {w}")));
+                        instance
+                    }
                     Err(e) => {
                         warnings.push(format!("track '{name}': plugin '{}' not loaded: {e:#}", slot.name));
                         0
@@ -1257,7 +1260,10 @@ impl Engine {
         }
         for slot in &mut project.master_plugins {
             slot.instance = match self.load_slot(slot) {
-                Ok(instance) => instance,
+                Ok((instance, warning)) => {
+                    warnings.extend(warning.map(|w| format!("master: {w}")));
+                    instance
+                }
                 Err(e) => {
                     warnings.push(format!("master: plugin '{}' not loaded: {e:#}", slot.name));
                     0

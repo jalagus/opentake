@@ -278,7 +278,7 @@ of the tool calls behind them):
 `select_take`, `delete_take`, `comp_take`, `clear_comp`, `flatten_comp`,
 `play`, `stop`, `seek`, `record`, `list_midi_inputs`, `set_midi_inputs`,
 `scan_plugins`, `insert_plugin`, `remove_plugin`, `insert_master_plugin`, `remove_master_plugin`, `set_plugin_bypass`, `open_plugin_editor`,
-`list_plugin_params`, `set_plugin_param`, `set_sidechain` (`"eq"` inserts the built-in EQ; `master: true` addresses the master bus),
+`list_plugin_params`, `set_plugin_param`, `set_sidechain`, `save_plugin_preset`, `load_plugin_preset` (`"eq"` inserts the built-in EQ; `master: true` addresses the master bus; presets are VST3 `.vstpreset` files),
 `list_instruments`, `add_instrument_track`, `set_instrument`, `list_instrument_params`, `set_instrument_param`,
 `add_midi_clip`, `set_midi_notes`, `add_midi_notes`, `get_midi_controllers`, `set_midi_controllers`, `update_midi_clip`, `copy_midi_clip`, `remove_midi_clip`,
 `inspect_guitar_pro`, `import_guitar_pro`, `inspect_midi_file`, `import_midi_file`, `export_midi_file`,
@@ -322,13 +322,16 @@ item looping (`LOOP 1`: the whole source loops; exported as one item per pass)),
 from tracks with the master send off import as buses), sends (receives with their volume, mute
 and mode: post-fader, or pre-fader; Reaper's pre-FX loads as pre-fader), volume/pan/mute envelopes
 (`VOLENV2`/`PANENV2`/`MUTEENV`) and markers (`MARKER`; a region comes in as a marker at its start). VST3 plugins in a Reaper project are matched by
-bundle file name and class id/name and loaded if installed; Audio Units by their
-type/subtype/manufacturer codes or name.
+bundle file name and class id/name and loaded if installed, with their state chunk
+(written back in Reaper's form on export); Audio Units by their type/subtype/manufacturer
+codes or name.
 
 Not (yet) supported: plug-in parameter envelopes (`PARMENV`, which number parameters by
 position), fader-scaled volume envelopes, send envelopes, MIDI items, takes beyond the
-first, and Reaper's opaque plugin state blobs. Those are kept in the model and written
-back on export, but they aren't applied to the loaded plugin.
+first, and the state blobs of VST2/CLAP plug-ins. Those are kept in the model and written
+back on export, but they aren't applied to the loaded plugin. Reaper's VST3 chunk layout
+isn't documented; a chunk that doesn't read as expected is kept and written back the same
+way, and the plug-in starts from its defaults.
 
 ## Projects from other DAWs
 
@@ -338,8 +341,9 @@ original file is never overwritten.
 
 - **DAWproject** (`.dawproject`; Bitwig Studio, Studio One, Cubase 14+): tracks, volume/pan/
   mute/solo, audio clips (embedded audio is extracted to `<name> Media/` next to the file),
-  MIDI clips, clip loops, tempo and time-signature automation, arrangement markers, plug-in references. Also
-  **exported** (Save As → DAWproject) with the audio embedded, to take a project into those DAWs.
+  MIDI clips, clip loops, tempo and time-signature automation, arrangement markers, plug-in references
+  (VST3 ones with their state, from the embedded `.vstpreset` files). Also **exported** (Save As →
+  DAWproject) with the audio and VST3 states embedded, to take a project into those DAWs.
 - **Ableton Live** (`.als`, Live 9–12): audio and MIDI tracks, arrangement clips with
   start/loop markers, mixer, tempo automation, locators (as markers), plug-in references. Live's own devices become
   the built-in synth/drums or are skipped; session-view clips aren't imported.
@@ -351,7 +355,8 @@ original file is never overwritten.
   tempo map. MIDI regions (kept in separate `.mid` files), buses and sends aren't imported.
 
 Common limits: warped/time-stretched clips play at their original speed, plug-in states
-(presets) aren't transferred (VST3 plug-ins are found by name and start at their defaults),
+(presets) aren't transferred apart from DAWproject's VST3 states (VST3 plug-ins are found
+by name and start at their defaults),
 automation other than tempo, sends/returns and fades aren't imported.
 
 ## Known limitations / next steps
@@ -363,9 +368,11 @@ automation other than tempo, sends/returns and fades aren't imported.
   built-in Mac audio by 20–40 ms), so measure it once per setup (Audio Settings → Measure Latency).
 - VST3: editor windows on macOS and Windows only; Linux (X11 embedding needs the host's run
   loop) keeps the generic parameter sliders. A window the user resizes is fitted to the
-  plug-in on the next GUI frame, and a preset loaded in an editor updates only parameters
-  OpenTake has already saved. Plugin parameters are saved by value, but full state chunks
-  aren't saved yet. VST3 has no MIDI controller events: pitch bend and CCs reach an
+  plug-in on the next GUI frame. A plug-in's full state is saved with the project (VST3: the
+  component and controller state as a `.vstpreset`; Audio Units: the ClassInfo), and the
+  parameter values set in OpenTake are applied on top when it loads. Undo covers parameter
+  values, not the rest of a plug-in's state: undoing a preset loaded in its editor restores
+  only parameters OpenTake had already saved. VST3 has no MIDI controller events: pitch bend and CCs reach an
   instrument only as the parameters it maps them to (`IMidiMapping`), and are dropped
   otherwise. Instruments haven't been tested with many third-party plugins.
 - Audio Units (macOS only): editor windows for Cocoa views (AUv2) and AUv3 view controllers

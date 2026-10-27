@@ -7,7 +7,7 @@
 use anyhow::Result;
 #[cfg(not(target_os = "macos"))]
 use anyhow::bail;
-use opentake_project::{PluginSlot, Project};
+use opentake_project::PluginSlot;
 use serde::Serialize;
 
 use super::{Engine, display_name};
@@ -77,25 +77,6 @@ impl Engine {
         Some(pick)
     }
 
-    /// The project with every loaded audio unit's current state written into its slot.
-    pub(super) fn project_with_plugin_state(&self) -> Project {
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-        let mut project = self.project.clone();
-        #[cfg(target_os = "macos")]
-        {
-            let slots = project.tracks.iter_mut().flat_map(|t| t.instrument.iter_mut().chain(t.plugins.iter_mut())).chain(project.master_plugins.iter_mut());
-            for slot in slots {
-                if let Some(super::plugins::Loaded::Au(plugin)) = self.pool.get(&slot.instance) {
-                    match plugin.get_state() {
-                        Ok(state) => slot.state = mac::encode_state(&state),
-                        Err(e) => tracing::warn!("'{}': state not saved: {e}", slot.name),
-                    }
-                }
-            }
-        }
-        project
-    }
-
     /// Create a slot and pooled instance for an audio unit.
     pub(super) fn new_au_slot(&mut self, info: &AudioUnitInfo) -> Result<PluginSlot> {
         #[cfg(target_os = "macos")]
@@ -125,7 +106,7 @@ impl Engine {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) use mac::{AuInsert, param_views};
+pub(super) use mac::{AuInsert, capture_state, param_views};
 
 #[cfg(target_os = "macos")]
 mod mac {
@@ -144,6 +125,11 @@ mod mac {
     /// Base64 in lines of 128 characters, the way Reaper stores plug-in state.
     pub(super) fn encode_state(state: &[u8]) -> Vec<String> {
         STANDARD.encode(state).as_bytes().chunks(128).map(|c| String::from_utf8_lossy(c).into_owned()).collect()
+    }
+
+    /// A unit's current state, as its slot stores it (see `Engine::project_with_plugin_state`).
+    pub(in crate::engine) fn capture_state(plugin: &AuPlugin) -> Result<Vec<String>> {
+        Ok(encode_state(&plugin.get_state()?))
     }
 
     fn decode_state(lines: &[String]) -> Result<Vec<u8>> {

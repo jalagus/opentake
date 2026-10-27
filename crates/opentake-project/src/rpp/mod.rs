@@ -3,7 +3,8 @@
 //! Supported: tempo/time signature, sample rate, tracks (name, volume, pan, mute,
 //! solo, record arm, input, monitoring), audio items (position, length, source
 //! offset, gain, mute, file, fades), FX chain references (VST2/VST3/CLAP, bypass,
-//! opaque state), buses (as receives; folders import as buses), sends (receives with their
+//! state: VST3 chunks are read into `.vstpreset` form and written back in Reaper's, see
+//! `vst3.rs`; others stay opaque), buses (as receives; folders import as buses), sends (receives with their
 //! volume, mute and pre/post-fader mode) and volume, pan and mute
 //! automation (`VOLENV2`/`PANENV2`/`MUTEENV`; volume envelopes in Reaper's fader scaling
 //! are skipped) and markers (`MARKER`; a region imports as a marker at its start). Plug-in parameter envelopes (`PARMENV`) aren't carried over: Reaper
@@ -11,6 +12,7 @@
 //! file is ignored on import.
 
 pub mod tree;
+mod vst3;
 
 use std::path::{Path, PathBuf};
 
@@ -291,13 +293,17 @@ fn import_fx_chain(node: &Node) -> Vec<PluginSlot> {
                     "AU" => (PluginFormat::AudioUnit, p(1), au_uid(&n.params)),
                     _ => (PluginFormat::Other, p(1), String::new()),
                 };
+                let state = match n.lines().map(|l| l.raw.clone()).collect::<Vec<_>>() {
+                    lines if format == PluginFormat::Vst3 => vst3::decode(&uid, &lines).map_or(lines, |p| p.to_lines()),
+                    lines => lines,
+                };
                 plugins.push(PluginSlot {
                     name: p(0),
                     format,
                     path,
                     uid,
                     bypass,
-                    state: n.lines().map(|l| l.raw.clone()).collect(),
+                    state,
                     params: Vec::new(),
                     id: 0,
                     side_chain: None,
@@ -465,8 +471,13 @@ fn export_track(track: &Track, base_dir: &Path, receives: &[(usize, AuxSend)]) -
                     Node::new("VST").with_params(&[plugin.name.as_str(), &file, "0", "", &plugin.uid, ""])
                 }
             };
-            for line in &plugin.state {
-                chunk.push_raw(line.clone());
+            // A VST3 state goes back in Reaper's form; a chunk this host didn't read, as it was.
+            let state = match crate::VstPreset::from_lines(&plugin.state) {
+                Ok(preset) if plugin.format == PluginFormat::Vst3 => vst3::encode(&plugin.uid, &preset),
+                _ => plugin.state.clone(),
+            };
+            for line in state {
+                chunk.push_raw(line);
             }
             fx.push_chunk(chunk);
         }
@@ -648,6 +659,25 @@ mod tests {
         let c = &t.clips[0];
         assert_eq!(c.file, PathBuf::from("/proj/Audio/vox-01.wav"));
         assert_eq!((c.position_secs, c.length_secs, c.source_offset_secs, c.gain), (2.5, 10.0, 1.25, 0.8));
+    }
+
+    /// A VST3 state goes out as Reaper's chunk and comes back as the same `.vstpreset`;
+    /// a chunk that couldn't be read (the sample's) goes back out as it came in.
+    #[test]
+    fn vst3_state_round_trips_as_a_reaper_chunk() {
+        let base = Path::new("/proj");
+        let mut p = from_str(SAMPLE, base).unwrap();
+        let raw = p.tracks[0].plugins[0].state.clone();
+        let mut slot = p.tracks[0].plugins[0].clone();
+        slot.uid = "ABCDEF0123456789ABCDEF0123456789".into();
+        slot.state = crate::VstPreset::new(&slot.uid, vec![42; 300], Some(b"view".to_vec())).to_lines();
+        p.tracks[0].plugins.push(slot.clone());
+        let text = to_string(&p, base);
+        assert!(text.contains(&raw[0]) && text.contains("AAAQAAAA"), "{text}");
+        assert!(!text.contains(&slot.state[0]), "written in Reaper's form");
+        let back = from_str(&text, base).unwrap();
+        assert_eq!(back.tracks[0].plugins[0].state, raw);
+        assert_eq!(back.tracks[0].plugins[1].state, slot.state);
     }
 
     #[test]

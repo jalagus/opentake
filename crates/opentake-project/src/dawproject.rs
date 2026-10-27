@@ -4,11 +4,12 @@
 //!
 //! Imported: tempo/time signature and their automation (as steps), tracks (folders are
 //! flattened; the master channel sets the master volume), volume/pan/mute/solo, plug-in
-//! references (by name and id; their states aren't applied), audio clips (embedded audio
+//! references (by name and id; VST3 states from their `.vstpreset` files), audio clips (embedded audio
 //! is extracted next to the project; warped clips play at their original speed), MIDI
 //! clips with notes, clip loops, nested clip timelines, arrangement markers. Not imported: other automation,
 //! sends/returns, fades, built-in devices of the other DAW, the clip launcher.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,7 @@ use crate::import::{ImportError, Imported, QuarterTempo, audio_clip, db_to_gain,
 use crate::marker::Marker;
 use crate::model::{Clip, MidiClip, Note, PluginFormat, PluginSlot, Project, Track};
 use crate::tempo::TempoMap;
+use crate::vstpreset::VstPreset;
 
 pub fn load(path: &Path) -> Result<Imported, ImportError> {
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -35,8 +37,8 @@ pub fn from_reader<R: Read + Seek>(reader: R, project_dir: &Path, media_dir: &Pa
     let mut zip = zip::ZipArchive::new(reader)?;
     let mut xml = String::new();
     zip.by_name("project.xml")?.read_to_string(&mut xml)?;
-    let mut media = Media { zip, project_dir: project_dir.to_path_buf(), media_dir: media_dir.to_path_buf(), extracted: HashMap::new() };
-    parse(&xml, &mut |f: Node| media.resolve(f))
+    let media = RefCell::new(Media { zip, project_dir: project_dir.to_path_buf(), media_dir: media_dir.to_path_buf(), extracted: HashMap::new() });
+    parse_with(&xml, &mut |f: Node| media.borrow_mut().resolve(f), &mut |f: Node| media.borrow_mut().read(f))
 }
 
 struct Media<R> {
@@ -71,10 +73,28 @@ impl<R: Read + Seek> Media<R> {
         self.extracted.insert(raw.to_string(), out.clone());
         Ok(out)
     }
+
+    /// The contents of a (small) file a `<File>`-like element points to, e.g. a plug-in state.
+    fn read(&mut self, file: Node) -> Result<Vec<u8>, String> {
+        let raw = file.attribute("path").unwrap_or_default();
+        if file.attribute("external") == Some("true") {
+            return std::fs::read(resolve_path(raw, &self.project_dir)).map_err(|e| format!("'{raw}': {e}"));
+        }
+        let mut entry = self.zip.by_name(raw).map_err(|_| format!("'{raw}' is missing from the archive"))?;
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(|e| format!("'{raw}': {e}"))?;
+        Ok(bytes)
+    }
 }
 
-/// Parse `project.xml`. `media` turns a `<File>` element into a local path.
+/// Parse `project.xml`. `media` turns a `<File>` element into a local path. Plug-in states
+/// aren't read (see [`parse_with`]).
 pub fn parse(xml: &str, media: &mut dyn FnMut(Node) -> Result<PathBuf, String>) -> Result<Imported, ImportError> {
+    parse_with(xml, media, &mut |_| Err("no archive".into()))
+}
+
+/// [`parse`], with `states` reading the file a plug-in's `<State>` element points to.
+pub fn parse_with(xml: &str, media: &mut dyn FnMut(Node) -> Result<PathBuf, String>, states: &mut dyn FnMut(Node) -> Result<Vec<u8>, String>) -> Result<Imported, ImportError> {
     let doc = crate::import::parse_xml(xml)?;
     let root = doc.root_element();
     if root.tag_name().name() != "Project" {
@@ -122,7 +142,7 @@ pub fn parse(xml: &str, media: &mut dyn FnMut(Node) -> Result<PathBuf, String>) 
         project.tidy_markers();
     }
 
-    let mut ctx = Ctx { map: project.tempo_map(), tracks: Vec::new(), ids: HashMap::new(), warnings, media, plugin_states: false };
+    let mut ctx = Ctx { map: project.tempo_map(), tracks: Vec::new(), ids: HashMap::new(), warnings, media, states, plugin_states: false };
     if let Some(structure) = child(root, "Structure") {
         for node in structure.children().filter(Node::is_element) {
             ctx.structure(node, &mut project);
@@ -136,7 +156,7 @@ pub fn parse(xml: &str, media: &mut dyn FnMut(Node) -> Result<PathBuf, String>) 
         ctx.warnings.push("clip launcher scenes aren't imported, only the arrangement".into());
     }
     if ctx.plugin_states {
-        ctx.warnings.push("plug-in states (presets) aren't imported; plug-ins start with their defaults".into());
+        ctx.warnings.push("some plug-in states (presets) aren't imported; those plug-ins start with their defaults".into());
     }
     for track in &mut ctx.tracks {
         track.clips.sort_by(|a, b| a.position_secs.total_cmp(&b.position_secs));
@@ -165,6 +185,8 @@ struct Ctx<'a> {
     ids: HashMap<String, usize>,
     warnings: Vec<String>,
     media: &'a mut dyn FnMut(Node) -> Result<PathBuf, String>,
+    states: &'a mut dyn FnMut(Node) -> Result<Vec<u8>, String>,
+    /// A plug-in state wasn't imported (a format other than VST3, or unreadable).
     plugin_states: bool,
 }
 
@@ -243,8 +265,16 @@ impl Ctx<'_> {
                 return;
             }
         };
-        self.plugin_states |= child(d, "State").is_some();
         let mut slot: PluginSlot = named_plugin(format, name, d.attribute("deviceVendor"), d.attribute("deviceID").unwrap_or_default());
+        if let Some(state) = child(d, "State") {
+            // VST3 states are `.vstpreset` files, which is what a slot keeps.
+            let preset = (format == PluginFormat::Vst3).then(|| (self.states)(state)).map(|b| b.and_then(|b| VstPreset::from_bytes(&b).map_err(|e| e.to_string())));
+            match preset {
+                Some(Ok(p)) => slot.state = p.to_lines(),
+                Some(Err(e)) => self.warnings.push(format!("track '{}': state of '{name}' not imported: {e}", track.name)),
+                None => self.plugin_states = true,
+            }
+        }
         slot.bypass = child(d, "Enabled").and_then(|e| e.attribute("value")) == Some("false");
         if d.attribute("deviceRole") == Some("instrument") && track.instrument.is_none() {
             track.instrument = Some(slot);
@@ -439,8 +469,9 @@ fn pan(p: Node) -> f32 {
 // ------------------------------------------------------------------------------ export
 
 /// Write a DAWproject archive (audio files embedded) that Bitwig, Studio One and Cubase
-/// can open. Positions are written in beats along the tempo map. Built-in plug-ins, plug-in
-/// parameter values and take folders' inactive takes aren't exported. Returns warnings.
+/// can open. Positions are written in beats along the tempo map. VST3 states are embedded as
+/// `.vstpreset` files. Built-in plug-ins, other plug-in states, parameter values apart from
+/// those states and take folders' inactive takes aren't exported. Returns warnings.
 pub fn save(project: &Project, path: &Path) -> Result<Vec<String>, ImportError> {
     let tmp = path.with_extension("dawproject.tmp");
     let warnings = write(project, std::fs::File::create(&tmp)?)?;
@@ -480,6 +511,14 @@ pub fn write<W: Write + Seek>(project: &Project, out: W) -> Result<Vec<String>, 
             warnings.push(format!("built-in '{}' isn't exported (the other DAW doesn't have it)", p.name));
         }
     }
+    for (t, track) in project.tracks.iter().enumerate() {
+        for (d, (slot, _)) in devices(track).into_iter().enumerate() {
+            if let Some((path, preset)) = state_file(t, d, slot) {
+                zip.start_file(path.as_str(), deflate)?;
+                zip.write_all(&preset.to_bytes())?;
+            }
+        }
+    }
     zip.start_file("project.xml", deflate)?;
     zip.write_all(project_xml(project, &files).as_bytes())?;
     zip.start_file("metadata.xml", deflate)?;
@@ -506,15 +545,15 @@ pub fn project_xml(project: &Project, files: &HashMap<PathBuf, String>) -> Strin
     let _ = writeln!(x, "    <TimeSignature numerator=\"{num}\" denominator=\"{den}\" id=\"{}\"/>\n  </Transport>\n  <Structure>", next());
     let master_id = "master".to_string();
     let mut track_ids = Vec::new();
-    for t in &project.tracks {
+    for (ti, t) in project.tracks.iter().enumerate() {
         let (tid, cid) = (next(), next());
         let kind = if t.is_instrument() { "notes" } else { "audio" };
         let _ = writeln!(x, "    <Track contentType=\"{kind}\" loaded=\"true\" id=\"{tid}\" name=\"{}\">", esc(&t.name));
         let _ = writeln!(x, "      <Channel audioChannels=\"2\" destination=\"{master_id}\" role=\"regular\" solo=\"{}\" id=\"{cid}\">", t.solo);
-        let plugins: Vec<(&PluginSlot, &str)> = t.instrument.iter().map(|p| (p, "instrument")).chain(t.plugins.iter().map(|p| (p, "audioFX"))).filter(|(p, _)| p.format != PluginFormat::Builtin).collect();
+        let plugins = devices(t);
         if !plugins.is_empty() {
             x.push_str("        <Devices>\n");
-            for (p, role) in plugins {
+            for (d, (p, role)) in plugins.into_iter().enumerate() {
                 let tag = match p.format {
                     PluginFormat::Vst3 => "Vst3Plugin",
                     PluginFormat::Vst2 => "Vst2Plugin",
@@ -525,7 +564,11 @@ pub fn project_xml(project: &Project, files: &HashMap<PathBuf, String>) -> Strin
                 let uid = p.uid.rsplit('{').next().unwrap_or_default().trim_end_matches('}');
                 let name = plugin_display_name(&p.name);
                 let _ = writeln!(x, "          <{tag} deviceID=\"{}\" deviceName=\"{}\" deviceRole=\"{role}\" loaded=\"true\" id=\"{}\" name=\"{}\">", esc(uid), esc(&name), next(), esc(&name));
-                let _ = writeln!(x, "            <Enabled value=\"{}\" id=\"{}\" name=\"On/Off\"/>\n          </{tag}>", !p.bypass, next());
+                let _ = writeln!(x, "            <Enabled value=\"{}\" id=\"{}\" name=\"On/Off\"/>", !p.bypass, next());
+                if let Some((path, _)) = state_file(ti, d, p) {
+                    let _ = writeln!(x, "            <State path=\"{}\" external=\"false\"/>", esc(&path));
+                }
+                let _ = writeln!(x, "          </{tag}>");
             }
             x.push_str("        </Devices>\n");
         }
@@ -645,6 +688,18 @@ fn wav_header(path: &Path) -> Option<(u16, u32, Option<f64>)> {
 }
 
 /// "VST3: Diva (u-he)" -> "Diva"
+/// A track's plug-ins as exported: (slot, device role), built-ins left out.
+fn devices(t: &Track) -> Vec<(&PluginSlot, &'static str)> {
+    t.instrument.iter().map(|p| (p, "instrument")).chain(t.plugins.iter().map(|p| (p, "audioFX"))).filter(|(p, _)| p.format != PluginFormat::Builtin).collect()
+}
+
+/// Where device `device` of track `track` keeps its state in the archive, and the state:
+/// VST3 slots with one.
+fn state_file(track: usize, device: usize, slot: &PluginSlot) -> Option<(String, VstPreset)> {
+    let preset = VstPreset::from_lines(&slot.state).ok().filter(|_| slot.format == PluginFormat::Vst3)?;
+    Some((format!("plugins/track{}-{}.vstpreset", track + 1, device + 1), preset))
+}
+
 fn plugin_display_name(full: &str) -> String {
     let rest = full.split_once(": ").map_or(full, |(_, r)| r);
     rest.rsplit_once(" (").map_or(rest, |(n, _)| n).to_string()
@@ -760,7 +815,7 @@ mod tests {
         assert!(bass.plugins[0].bypass);
         let drums = &p.tracks[1];
         assert!(drums.mute && (drums.volume - 0.501).abs() < 1e-3);
-        assert!(warnings.iter().any(|w| w.contains("presets")), "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("state of 'Diva' not imported")), "{warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("effect channel 'Return'")), "{warnings:?}");
     }
 
@@ -815,6 +870,11 @@ mod tests {
         let mut audio = Track::new("Vox");
         audio.pan = 0.5;
         audio.clips.push(audio_clip("v1", wav.clone(), 6.0, 4.0, 0.25));
+        // A VST3 with its state travels as a .vstpreset in the archive.
+        let mut eq = named_plugin(PluginFormat::Vst3, "Pro-Q 3", Some("FabFilter"), "72C4DB717A4D459AB97E51745D84B39D");
+        let preset = VstPreset::new(&eq.uid, (0..5000).map(|i| (i % 251) as u8).collect(), Some(b"<ui/>".to_vec()));
+        eq.state = preset.to_lines();
+        audio.plugins.push(eq);
         let mut keys = Track::new("Keys");
         keys.instrument = Some(synth_slot());
         keys.midi_clips.push(MidiClip {
@@ -845,6 +905,9 @@ mod tests {
         assert_eq!(std::fs::read(&c.file).unwrap(), bytes);
         assert!((c.position_secs - 6.0).abs() < 1e-9 && (c.length_secs - 4.0).abs() < 1e-9 && (c.source_offset_secs - 0.25).abs() < 1e-9);
         assert_eq!(q.tracks[0].pan, 0.5);
+        assert_eq!(VstPreset::from_lines(&q.tracks[0].plugins[0].state), Ok(preset));
+        let xml = project_xml(&p, &HashMap::new());
+        assert!(xml.contains(r#"<State path="plugins/track1-1.vstpreset" external="false"/>"#), "{xml}");
         let m = &q.tracks[1].midi_clips[0];
         assert!((m.position_secs - 2.0).abs() < 1e-9 && (m.length_secs - 8.0).abs() < 1e-9);
         let n = m.notes[0];

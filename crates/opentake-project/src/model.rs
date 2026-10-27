@@ -724,7 +724,11 @@ pub struct PluginSlot {
     /// Format-specific identifier (VST3 class id as hex, VST2 unique id, ...).
     pub uid: String,
     pub bypass: bool,
-    /// Opaque, format-specific plugin state (base64 lines as stored by the host that saved it).
+    /// The plug-in's saved state, base64 in lines. VST3: a `.vstpreset` (component and
+    /// controller state, see `vstpreset.rs`), or a Reaper chunk this host couldn't read
+    /// (kept for writing back). Audio Units: the ClassInfo property list. Others: as the
+    /// host that saved it stored it. A loaded VST3's state lives in the instance: it's
+    /// written here when saving, and dropped from the session's copy on loading.
     pub state: Vec<String>,
     /// Normalized parameter values set by this host, as (param id, value). Applied on load.
     #[serde(default)]
