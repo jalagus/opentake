@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Result, bail};
-use opentake_project::{Clip, MidiClip};
+use opentake_project::{Clip, MidiClip, TempoMap};
 use serde::{Deserialize, Serialize};
 
 use super::Engine;
@@ -40,25 +40,32 @@ pub enum RegionData {
 }
 
 impl RegionData {
-    pub fn position(&self) -> f64 {
+    /// Where the region starts and ends on the timeline, in seconds (a MIDI region's through
+    /// the tempo map: it's stored in quarter notes).
+    pub fn span(&self, map: &TempoMap) -> (f64, f64) {
         match self {
-            Self::Audio(c) => c.position_secs,
-            Self::Midi(c) => c.position_secs,
+            Self::Audio(c) => (c.position_secs, c.position_secs + c.length_secs),
+            Self::Midi(c) => (c.start_secs(map), c.end_secs(map)),
         }
     }
 
-    pub fn length(&self) -> f64 {
-        match self {
-            Self::Audio(c) => c.length_secs,
-            Self::Midi(c) => c.length_secs,
-        }
+    pub fn position(&self, map: &TempoMap) -> f64 {
+        self.span(map).0
     }
 
-    fn with_position(self, position: f64) -> Self {
+    /// Length in seconds.
+    pub fn length(&self, map: &TempoMap) -> f64 {
+        let (start, end) = self.span(map);
+        end - start
+    }
+
+    /// The region moved to start at timeline time `position` (seconds). A MIDI region keeps
+    /// its length in beats, so it lasts as long as the tempo where it lands says.
+    pub fn with_position(self, position: f64, map: &TempoMap) -> Self {
         let position = position.max(0.0);
         match self {
             Self::Audio(c) => Self::Audio(Clip { position_secs: position, ..c }),
-            Self::Midi(c) => Self::Midi(MidiClip { position_secs: position, ..c }),
+            Self::Midi(c) => Self::Midi(MidiClip { position_beats: map.quarters_at(position), ..c }),
         }
     }
 }
@@ -116,6 +123,7 @@ impl Engine {
             return Ok(Vec::new());
         }
         let n = self.project.tracks.len() as isize;
+        let map = self.project.tempo_map();
         let mut moves = Vec::new();
         for &r in regions {
             let target = r.track as isize + delta_track;
@@ -123,8 +131,8 @@ impl Engine {
                 bail!("can't move a region to track {target}");
             }
             let data = self.region_data(r)?;
-            let pos = data.position() + delta_secs;
-            moves.push((target as usize, data.with_position(pos)));
+            let pos = data.position(&map) + delta_secs;
+            moves.push((target as usize, data.with_position(pos, &map)));
         }
         // Validate audio media before changing anything.
         let sr = self.sample_rate();
@@ -195,12 +203,15 @@ impl Engine {
 
     /// Split every given region that spans `at_secs`, as one step. Others are ignored.
     pub fn split_regions(&mut self, regions: &[RegionRef], at_secs: f64) -> Result<usize> {
+        let map = self.project.tempo_map();
         let mut targets: Vec<RegionRef> = regions
             .iter()
             .copied()
             .filter(|&r| {
-                self.region_data(r)
-                    .is_ok_and(|d| at_secs > d.position() + Self::MIN_CLIP_SECS && at_secs < d.position() + d.length() - Self::MIN_CLIP_SECS)
+                self.region_data(r).is_ok_and(|d| {
+                    let (start, end) = d.span(&map);
+                    at_secs > start + Self::MIN_CLIP_SECS && at_secs < end - Self::MIN_CLIP_SECS
+                })
             })
             .collect();
         if targets.is_empty() {
@@ -214,16 +225,15 @@ impl Engine {
             // Highest index first so inserting the right halves doesn't shift the others.
             for r in targets.iter().rev() {
                 let data = e.region_data(*r)?;
-                let cut = at_secs - data.position();
                 let t = &mut e.project.tracks[r.track];
                 match data {
                     RegionData::Audio(c) => {
-                        let (left, right) = c.split(cut);
+                        let (left, right) = c.split(at_secs - c.position_secs);
                         t.clips[r.index] = left;
                         t.clips.insert(r.index + 1, right);
                     }
                     RegionData::Midi(c) => {
-                        let (left, right) = c.split(cut);
+                        let (left, right) = c.split(c.beats_at(&map, at_secs));
                         t.midi_clips[r.index] = left;
                         t.midi_clips.insert(r.index + 1, right);
                     }
@@ -270,6 +280,7 @@ mod tests {
         let copies = e.move_regions(&[RegionRef::audio(0, 1), RegionRef::midi(2, 0)], 8.0, 0, true).unwrap();
         assert_eq!(copies, vec![RegionRef::audio(0, 2), RegionRef::midi(2, 1)]);
         assert_eq!(e.project().tracks[0].clips.len(), 3, "originals stay");
+        assert_eq!(e.project().tracks[2].midi_clips[1].position_beats, 16.0, "8 s later, in beats");
         assert!(e.move_regions(&group, 0.0, 5, false).is_err(), "can't move past the last track");
         std::fs::remove_dir_all(dir).ok();
     }
@@ -286,7 +297,7 @@ mod tests {
         assert_eq!(e.project().tracks[2].midi_clips.len(), 2);
 
         let data = e.region_data(RegionRef::audio(1, 0)).unwrap();
-        let pasted = e.insert_regions(vec![(0, data.with_position(10.0))]).unwrap();
+        let pasted = e.insert_regions(vec![(0, data.with_position(10.0, &e.project().tempo_map()))]).unwrap();
         assert_eq!(pasted, vec![RegionRef::audio(0, 0)]);
         assert_eq!(e.project().tracks[0].clips[0].position_secs, 10.0);
         std::fs::remove_dir_all(dir).ok();

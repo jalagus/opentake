@@ -395,15 +395,17 @@ fn render_midi(track: &opentake_project::Track, inst: &mut dyn Processor, lanes:
     let mut events: Vec<(usize, MidiData)> = Vec::new();
     for c in track.midi_clips.iter().filter(|c| !c.mute) {
         let c = c.unrolled();
-        for n in c.notes.iter().filter(|n| n.start_secs < c.length_secs) {
-            let on = ((c.position_secs + n.start_secs) * sr) as usize;
-            let off = ((c.position_secs + (n.start_secs + n.length_secs).min(c.length_secs)) * sr) as usize;
+        // Quarter notes into the region -> samples, through the tempo map.
+        let at = |rel: f64| (c.secs_of(map, rel).max(0.0) * sr) as usize;
+        for n in c.notes.iter().filter(|n| n.start_beats < c.length_beats) {
+            let on = at(n.start_beats);
+            let off = at((n.start_beats + n.length_beats).min(c.length_beats));
             events.push((on, MidiData::Note { pitch: n.pitch, velocity: n.velocity.max(1) }));
             events.push((off, MidiData::Note { pitch: n.pitch, velocity: 0 }));
         }
         for lane in &c.controllers {
-            for e in lane.events.iter().filter(|e| e.time_secs < c.length_secs) {
-                events.push((((c.position_secs + e.time_secs) * sr) as usize, MidiData::Control { kind: lane.kind, value: lane.kind.raw(e.value) }));
+            for e in lane.events.iter().filter(|e| e.time_beats < c.length_beats) {
+                events.push((at(e.time_beats), MidiData::Control { kind: lane.kind, value: lane.kind.raw(e.value) }));
             }
         }
     }
@@ -616,7 +618,7 @@ mod tests {
         let mut e = Engine::new();
         let t = e.add_instrument_track("Keys", "synth").unwrap();
         let c = e.add_midi_clip(t, 0.0, 4.0, None).unwrap();
-        let notes = (0..8).map(|i| Note { start_secs: i as f64 * 0.5, length_secs: 0.45, pitch: 45, velocity: 100, tab: None }).collect();
+        let notes = (0..8).map(|i| Note { start_beats: i as f64, length_beats: 0.9, pitch: 45, velocity: 100, tab: None }).collect();
         e.set_midi_notes(t, c, notes).unwrap();
 
         let r = e.analyze_mix(None, None).unwrap();

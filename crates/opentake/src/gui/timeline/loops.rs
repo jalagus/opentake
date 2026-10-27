@@ -47,10 +47,15 @@ pub(super) fn paint_handle(painter: &Painter, rect: Rect, row: Rect) {
 }
 
 /// Where a loop-handle drag to `t` (snapped) ends the region: at least its first pass.
-pub(super) fn drag_end(view: RegionView, t: f64) -> f64 {
-    let l = view.looped().unwrap_or(RegionLoop::new(view.length));
-    let first = (l.len_secs - l.phase_secs.rem_euclid(l.len_secs)).min(view.length);
-    t.clamp(view.position + first, view.position + first + (MAX_LOOP_PASSES - 1) as f64 * l.len_secs)
+pub(super) fn drag_end(view: RegionView, t: f64, map: &TempoMap) -> f64 {
+    // In the region's units: seconds, or a MIDI region's quarter notes.
+    let (rel, length, back): (f64, f64, &dyn Fn(f64) -> f64) = match view.content {
+        Content::Audio(_) => (t - view.position, view.length, &|rel| view.position + rel),
+        Content::Midi(c) => (c.beats_at(map, t), c.length_beats, &|rel| c.secs_of(map, rel)),
+    };
+    let l = view.looped().unwrap_or(RegionLoop::new(length));
+    let first = (l.len - l.phase.rem_euclid(l.len)).min(length);
+    back(rel.clamp(first, first + (MAX_LOOP_PASSES - 1) as f64 * l.len))
 }
 
 /// The audio region as drawn mid-gesture: trimmed, stretched, or looped by the handle.
@@ -63,7 +68,7 @@ pub(super) fn shown_audio(c: &Clip, p: &Painted) -> Clip {
             let k = (p.end - p.start) / c.length_secs;
             shown.stretch = c.stretch * k;
             if let Some(l) = &mut shown.looped {
-                (l.len_secs, l.phase_secs) = (l.len_secs * k, l.phase_secs * k);
+                (l.len, l.phase) = (l.len * k, l.phase * k);
             }
             shown.scale_comp(k);
         }
@@ -76,11 +81,20 @@ pub(super) fn shown_audio(c: &Clip, p: &Painted) -> Clip {
     shown
 }
 
-/// A MIDI region's passes as drawn (`p.start..p.end`).
-pub(super) fn shown_midi_passes(c: &MidiClip, p: &Painted) -> Vec<LoopPass> {
-    let looped = c.looped.or((p.mode == Some(DragMode::LoopEnd)).then(|| RegionLoop::new(c.length_secs)));
-    let length = p.end - p.start;
-    looped.map_or_else(|| vec![LoopPass { index: 0, at: 0.0, from: 0.0, len: length }], |l| l.passes(length))
+/// A MIDI region's passes as drawn (`p.start..p.end`), in quarter notes from where it's
+/// drawn starting (returned first).
+pub(super) fn shown_midi_passes(c: &MidiClip, p: &Painted) -> (f64, Vec<LoopPass>) {
+    let looped = c.looped.or((p.mode == Some(DragMode::LoopEnd)).then(|| RegionLoop::new(c.length_beats)));
+    let start = p.map.quarters_at(p.start);
+    let length = p.map.quarters_at(p.end) - start;
+    (start, looped.map_or_else(|| vec![LoopPass { index: 0, at: 0.0, from: 0.0, len: length }], |l| l.passes(length)))
+}
+
+/// Passes in quarter notes from `start` as timeline seconds from where that is (to draw the
+/// tint and notches; `from` stays in quarter notes).
+pub(super) fn passes_in_secs(passes: &[LoopPass], start: f64, map: &TempoMap) -> Vec<LoopPass> {
+    let s0 = map.secs_at(start);
+    passes.iter().map(|p| LoopPass { at: map.secs_at(start + p.at) - s0, len: map.secs_at(start + p.at + p.len) - map.secs_at(start + p.at), ..*p }).collect()
 }
 
 /// Repeats look fainter than the content: tint them towards the lane.
@@ -180,8 +194,13 @@ impl DawApp {
                 self.act(Action::LoopRegions { regions: vec![r], to: if on { LoopTo::Fill } else { LoopTo::Off } });
             }
             if let Some(l) = view.looped() {
-                let passes = l.passes(view.length).len();
-                ui.label(RichText::new(format!("{:.2} s × {passes}", l.len_secs)).size(11.0).color(theme::TEXT_FAINT)).on_hover_text("Loop length and how many times it plays");
+                // A MIDI region's loop is in beats (it follows the tempo).
+                let (length, unit) = match view.content {
+                    Content::Midi(c) => (c.length_beats, "beats"),
+                    Content::Audio(_) => (view.length, "s"),
+                };
+                let passes = l.passes(length).len();
+                ui.label(RichText::new(format!("{:.2} {unit} × {passes}", l.len)).size(11.0).color(theme::TEXT_FAINT)).on_hover_text("Loop length and how many times it plays");
             }
         });
     }
@@ -251,7 +270,7 @@ mod tests {
     fn looped(engine: &SharedEngine) -> Vec<(f64, f64, Option<f64>)> {
         let e = engine.lock().unwrap();
         let r = |x: f64| (x * 100.0).round() / 100.0;
-        e.project().tracks[0].clips.iter().map(|c| (r(c.position_secs), r(c.length_secs), c.looped.map(|l| l.len_secs))).collect()
+        e.project().tracks[0].clips.iter().map(|c| (r(c.position_secs), r(c.length_secs), c.looped.map(|l| l.len))).collect()
     }
 
     #[test]
@@ -309,7 +328,7 @@ mod tests {
             e.set_region_loop(&[RegionRef::audio(0, 0)], LoopTo::Until(4.5)).unwrap();
             let t = e.add_instrument_track("Keys", "synth").unwrap();
             let c = e.add_midi_clip(t, 1.0, 1.0, None).unwrap();
-            let note = |s: f64, p: u8| opentake_engine::project::Note { start_secs: s, length_secs: 0.2, pitch: p, velocity: 100, tab: None };
+            let note = |s: f64, p: u8| opentake_engine::project::Note { start_beats: 2.0 * s, length_beats: 0.4, pitch: p, velocity: 100, tab: None };
             e.set_midi_notes(t, c, vec![note(0.0, 60), note(0.25, 64), note(0.5, 67), note(0.75, 72)]).unwrap();
             e.set_region_loop(&[RegionRef::midi(t, c)], LoopTo::Passes(4)).unwrap();
         }

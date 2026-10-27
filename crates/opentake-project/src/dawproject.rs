@@ -160,7 +160,7 @@ pub fn parse_with(xml: &str, media: &mut dyn FnMut(Node) -> Result<PathBuf, Stri
     }
     for track in &mut ctx.tracks {
         track.clips.sort_by(|a, b| a.position_secs.total_cmp(&b.position_secs));
-        track.midi_clips.sort_by(|a, b| a.position_secs.total_cmp(&b.position_secs));
+        track.midi_clips.sort_by(|a, b| a.position_beats.total_cmp(&b.position_beats));
         if !track.midi_clips.is_empty() && track.instrument.as_ref().is_none_or(|i| i.format != PluginFormat::Vst3) {
             if let Some(i) = &track.instrument {
                 ctx.warnings.push(format!("track '{}': instrument '{}' can't be loaded; using the built-in synth", track.name, i.name));
@@ -368,14 +368,16 @@ impl Ctx<'_> {
                             continue;
                         }
                         let velocity = (attr_f64(n, "vel").unwrap_or(0.8) * 127.0).round().clamp(1.0, 127.0) as u8;
-                        notes.push(Note { start_secs: s, length_secs: (e - s).max(0.001), pitch: key as u8, velocity, tab: None });
+                        // MIDI regions count in quarter notes (from the song start for now).
+                        let (s, e) = (self.map.quarters_at(s), self.map.quarters_at(e));
+                        notes.push(Note { start_beats: s, length_beats: (e - s).max(0.002), pitch: key as u8, velocity, tab: None });
                     }
                 }
-                let start = span.0;
-                let end = if span.1.is_finite() { span.1 } else { notes.iter().map(|n| n.start_secs + n.length_secs).fold(start, f64::max) };
-                notes.iter_mut().for_each(|n| n.start_secs -= start);
-                notes.sort_by(|a, b| a.start_secs.total_cmp(&b.start_secs));
-                let clip = MidiClip { name: name.unwrap_or_default().to_string(), position_secs: start, length_secs: end - start, mute: false, notes, tab: None, tempos: Vec::new(), controllers: Vec::new(), looped: None };
+                let start = self.map.quarters_at(span.0);
+                let end = if span.1.is_finite() { self.map.quarters_at(span.1) } else { notes.iter().map(|n| n.start_beats + n.length_beats).fold(start, f64::max) };
+                notes.iter_mut().for_each(|n| n.start_beats -= start);
+                notes.sort_by(|a, b| a.start_beats.total_cmp(&b.start_beats));
+                let clip = MidiClip { name: name.unwrap_or_default().to_string(), position_beats: start, length_beats: end - start, mute: false, notes, tab: None, tempos: Vec::new(), controllers: Vec::new(), looped: None };
                 self.tracks[t].midi_clips.push(clip);
             }
             _ => {
@@ -607,15 +609,14 @@ pub fn project_xml(project: &Project, files: &HashMap<PathBuf, String>) -> Strin
             }
             x.push_str("            </Warps>\n          </Clip>\n");
         }
+        // MIDI regions are in beats already.
         for m in t.midi_clips.iter().map(MidiClip::unrolled) {
-            let (start, end) = (q(m.position_secs), q(m.position_secs + m.length_secs));
+            let (start, end) = (m.position_beats, m.end_beats());
             let _ = writeln!(x, "          <Clip time=\"{start}\" duration=\"{}\" playStart=\"0\" name=\"{}\"{}>", end - start, esc(&m.name), if m.mute { " enable=\"false\"" } else { "" });
             let _ = writeln!(x, "            <Notes id=\"{}\">", next());
             for n in &m.notes {
-                let s = q(m.position_secs + n.start_secs);
-                let e = q(m.position_secs + n.start_secs + n.length_secs);
                 let vel = n.velocity as f64 / 127.0;
-                let _ = writeln!(x, "              <Note time=\"{}\" duration=\"{}\" channel=\"0\" key=\"{}\" vel=\"{vel}\" rel=\"{vel}\"/>", s - start, e - s, n.pitch);
+                let _ = writeln!(x, "              <Note time=\"{}\" duration=\"{}\" channel=\"0\" key=\"{}\" vel=\"{vel}\" rel=\"{vel}\"/>", n.start_beats, n.length_beats, n.pitch);
             }
             x.push_str("            </Notes>\n          </Clip>\n");
         }
@@ -824,10 +825,11 @@ mod tests {
         let p = parse_sample(SAMPLE).project;
         // 120 bpm: a beat is 0.5 s. The clip loops its first 4 beats twice.
         let m = &p.tracks[0].midi_clips[0];
-        assert_eq!((m.name.as_str(), m.position_secs, m.length_secs), ("Riff", 2.0, 4.0));
-        let notes: Vec<(f64, f64, u8, u8)> = m.notes.iter().map(|n| (n.start_secs, n.length_secs, n.pitch, n.velocity)).collect();
+        // In beats: at 2 s for 4 s.
+        assert_eq!((m.name.as_str(), m.position_beats, m.length_beats), ("Riff", 4.0, 8.0));
+        let notes: Vec<(f64, f64, u8, u8)> = m.notes.iter().map(|n| (n.start_beats, n.length_beats, n.pitch, n.velocity)).collect();
         // The long note is cut at the loop end; the note after the loop end never plays.
-        assert_eq!(notes, vec![(0.0, 0.5, 40, 127), (1.0, 1.0, 43, 64), (2.0, 0.5, 40, 127), (3.0, 1.0, 43, 64)]);
+        assert_eq!(notes, vec![(0.0, 1.0, 40, 127), (2.0, 2.0, 43, 64), (4.0, 1.0, 40, 127), (6.0, 2.0, 43, 64)]);
 
         let clips = &p.tracks[1].clips;
         assert_eq!(clips.len(), 2);
@@ -879,10 +881,10 @@ mod tests {
         keys.instrument = Some(synth_slot());
         keys.midi_clips.push(MidiClip {
             name: "chords".into(),
-            position_secs: 2.0,
-            length_secs: 8.0,
+            position_beats: 2.0,
+            length_beats: 8.0,
             mute: false,
-            notes: vec![Note { start_secs: 0.5, length_secs: 7.0, pitch: 60, velocity: 100, tab: None }],
+            notes: vec![Note { start_beats: 0.5, length_beats: 7.0, pitch: 60, velocity: 100, tab: None }],
             tab: None,
             tempos: Vec::new(),
             controllers: Vec::new(),
@@ -909,9 +911,10 @@ mod tests {
         let xml = project_xml(&p, &HashMap::new());
         assert!(xml.contains(r#"<State path="plugins/track1-1.vstpreset" external="false"/>"#), "{xml}");
         let m = &q.tracks[1].midi_clips[0];
-        assert!((m.position_secs - 2.0).abs() < 1e-9 && (m.length_secs - 8.0).abs() < 1e-9);
+        // Beats both ways, across the tempo change.
+        assert!((m.position_beats - 2.0).abs() < 1e-9 && (m.length_beats - 8.0).abs() < 1e-9);
         let n = m.notes[0];
-        assert!((n.start_secs - 0.5).abs() < 1e-9 && (n.length_secs - 7.0).abs() < 1e-9 && n.pitch == 60 && n.velocity == 100);
+        assert!((n.start_beats - 0.5).abs() < 1e-9 && (n.length_beats - 7.0).abs() < 1e-9 && n.pitch == 60 && n.velocity == 100);
         assert!(!back.warnings.iter().any(|w| w.contains("original speed")), "{:?}", back.warnings);
         // Markers, in beats in the file, come back at their times (across the tempo change).
         let markers: Vec<_> = q.markers.iter().map(|m| ((m.time_secs * 1e6).round() / 1e6, m.name.as_str(), m.color)).collect();

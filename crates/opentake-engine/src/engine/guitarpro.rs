@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use opentake_project::guitarpro::{self, Score, TrackKind, timeline};
-use opentake_project::{Controller, ControllerEvent, ControllerLane, Marker, MidiClip, Note, PluginFormat, PluginSlot, TabBar, TabLayout, TabPos, TempoChange, TempoMark};
+use opentake_project::{Controller, ControllerEvent, ControllerLane, Marker, MidiClip, Note, PluginFormat, PluginSlot, TabBar, TabLayout, TabPos, TempoChange, TempoMap, TempoMark};
 use serde::Serialize;
 
 use super::Engine;
@@ -50,17 +50,24 @@ pub struct GuitarProTrackInfo {
     pub notes: usize,
 }
 
-/// A track's bends, slides and vibrato as a pitch-bend lane (song seconds), and the bend
-/// range it needs: ±2 semitones (the usual default) when that covers it, else ±12 (wider
-/// moves are clipped). The built-in synth is set to that range; other instruments must
-/// be set to it by hand.
-fn bend_lane(perf: &timeline::Performance, track: usize) -> Option<(ControllerLane, f64)> {
+/// A song's clock from its tempo changes ((song seconds, bpm), from 0): song seconds <->
+/// quarter notes, which is how its regions count.
+pub(super) fn song_clock(tempos: &[(f64, f64)]) -> TempoMap {
+    let changes: Vec<TempoChange> = tempos.iter().skip(1).map(|&(at_secs, bpm)| TempoChange { at_secs, bpm, time_signature: None }).collect();
+    TempoMap::new(tempos.first().map_or(120.0, |t| t.1), (4, 4), &changes)
+}
+
+/// A track's bends, slides and vibrato as a pitch-bend lane (song quarter notes), and the
+/// bend range it needs: ±2 semitones (the usual default) when that covers it, else ±12
+/// (wider moves are clipped). The built-in synth is set to that range; other instruments
+/// must be set to it by hand.
+fn bend_lane(perf: &timeline::Performance, clock: &TempoMap, track: usize) -> Option<(ControllerLane, f64)> {
     let curve = timeline::pitch_curve(&perf.events, track);
     let widest = curve.iter().fold(0.0f64, |m, p| m.max(p.1.abs()));
     let range = if widest <= 2.0 + 1e-9 { 2.0 } else { 12.0 };
     let bend = Controller::PitchBend;
     // On the 14-bit grid, so a held bend repeats exactly and thins out.
-    let events = curve.iter().map(|&(t, semis)| ControllerEvent { time_secs: t, value: bend.from_raw(bend.raw((semis / range) as f32)) }).collect();
+    let events = curve.iter().map(|&(t, semis)| ControllerEvent { time_beats: clock.quarters_at(t), value: bend.from_raw(bend.raw((semis / range) as f32)) }).collect();
     let lane = ControllerLane::new(bend, events);
     (!lane.events.is_empty()).then_some((lane, range))
 }
@@ -132,17 +139,18 @@ pub(super) fn tempo_map_from_points(
 
 impl Engine {
     /// True when an imported song's own tempo (kept on its regions) differs from the
-    /// project's tempo map, e.g. it was imported without adopting it.
+    /// project's tempo map, e.g. it was imported without adopting it: its notes, on the
+    /// song's beats, then play at the project's tempo rather than the song's.
     pub fn song_tempo_differs(&self) -> bool {
         let map = self.project.tempo_map();
         self.project.tracks.iter().flat_map(|t| &t.midi_clips).any(|c| {
-            c.tempos.iter().filter(|m| m.start_secs < c.length_secs).any(|m| (map.tempo_at(c.position_secs + m.start_secs + 1e-6) - m.bpm).abs() > 0.05)
+            c.tempos.iter().filter(|m| m.start_beats < c.length_beats).any(|m| (map.tempo_at(c.secs_of(&map, m.start_beats) + 1e-6) - m.bpm).abs() > 0.05)
         })
     }
 
     /// Make the project's tempo map follow an imported song's tempo (from its regions'
-    /// tempo marks and tab bars), so bars, grid and metronome match the song. One undo step.
-    /// Returns false when there's no song tempo to adopt.
+    /// tempo marks and tab bars), so bars, grid and metronome match the song and its notes
+    /// play as written. One undo step. Returns false when there's no song tempo to adopt.
     pub fn adopt_song_tempo(&mut self) -> Result<bool> {
         let Some((position, bpm, sig, changes)) = song_tempo_of(&self.project) else {
             return Ok(false);
@@ -153,8 +161,7 @@ impl Engine {
                 e.project.time_signature = sig;
             }
             e.project.tempo_changes = changes;
-            let cmd = e.tempo_command();
-            e.send(cmd)
+            e.sync_tempo()
         })?;
         Ok(true)
     }
@@ -166,8 +173,12 @@ fn song_tempo_of(project: &opentake_project::Project) -> Option<(f64, f64, (u32,
     // Prefer a region with tab bars (they carry the time signatures).
     let regions = project.tracks.iter().flat_map(|t| &t.midi_clips).filter(|c| !c.tempos.is_empty());
     let clip = regions.clone().find(|c| c.tab.is_some()).or_else(|| regions.clone().next())?;
+    // The song's beats in its own seconds.
+    let song = clip.song_map()?;
+    // Where the region starts once the map is replaced: only the opening tempo is left before it.
+    let position = TempoMap::new(project.tempo_bpm, project.time_signature, &[]).secs_at(clip.position_beats);
     {
-        let mut points: Vec<(f64, Option<f64>, Option<(u32, u32)>)> = clip.tempos.iter().map(|m| (m.start_secs, Some(m.bpm), None)).collect();
+        let mut points: Vec<(f64, Option<f64>, Option<(u32, u32)>)> = clip.tempos.iter().map(|m| (song.secs_at(m.start_beats), Some(m.bpm), None)).collect();
         let mut first_sig = project.time_signature;
         if let Some(tab) = &clip.tab {
             let mut prev = None;
@@ -177,14 +188,14 @@ fn song_tempo_of(project: &opentake_project::Project) -> Option<(f64, f64, (u32,
                     first_sig = sig;
                 }
                 if prev != Some(sig) {
-                    points.push((bar.start_secs, None, Some(sig)));
+                    points.push((song.secs_at(bar.start_beats), None, Some(sig)));
                 }
                 prev = Some(sig);
             }
         }
         let first_bpm = clip.tempos[0].bpm;
-        let (bpm, sig, changes) = tempo_map_from_points(points, first_bpm, first_sig, clip.position_secs);
-        Some((clip.position_secs, bpm, sig, changes))
+        let (bpm, sig, changes) = tempo_map_from_points(points, first_bpm, first_sig, position);
+        Some((position, bpm, sig, changes))
     }
 }
 
@@ -271,14 +282,17 @@ impl Engine {
             score.title.clone()
         };
         let start = options.position_secs.max(0.0);
-        let length = perf.events.iter().map(|e| e.time + e.duration).fold(perf.duration, f64::max).max(0.1);
-        // Bar layout for the tablature view (repeats expanded, real-time positions).
+        // The song in its own beats: the regions follow the project's tempo map from there.
+        let clock = song_clock(&perf.tempos);
+        let q = |secs: f64| clock.quarters_at(secs);
+        let length = q(perf.events.iter().map(|e| e.time + e.duration).fold(perf.duration, f64::max)).max(0.1);
+        // Bar layout for the tablature view (repeats expanded).
         let tab_bars: Vec<TabBar> = perf
             .bars
             .iter()
             .map(|occ| {
                 let mb = &score.master_bars[occ.bar];
-                TabBar { start_secs: occ.time, number: occ.bar as u32 + 1, numerator: mb.numerator, denominator: mb.denominator, section: mb.section.clone() }
+                TabBar { start_beats: q(occ.time), number: occ.bar as u32 + 1, numerator: mb.numerator, denominator: mb.denominator, section: mb.section.clone() }
             })
             .collect();
 
@@ -289,12 +303,13 @@ impl Engine {
                 e.project.tempo_bpm = bpm;
                 e.project.time_signature = sig;
                 e.project.tempo_changes = changes;
-                let cmd = e.tempo_command();
-                e.send(cmd)?;
+                e.sync_tempo()?;
             }
+            let map = e.project.tempo_map();
+            let start = map.quarters_at(start);
             // Sections ("A Intro", "B Verse"...) become markers, on every pass through them;
             // once however many of the song's tracks come in.
-            e.project.merge_markers(tab_bars.iter().filter_map(|b| Some(Marker::new(start + b.start_secs, b.section.clone()?))));
+            e.project.merge_markers(tab_bars.iter().filter_map(|b| Some(Marker::new(map.secs_at(start + b.start_beats), b.section.clone()?))));
             let mut created = Vec::new();
             for (&gp_track, mut slot) in wanted.iter().zip(slots) {
                 let gp = &score.tracks[gp_track];
@@ -304,15 +319,15 @@ impl Engine {
                     .iter()
                     .filter(|ev| ev.track == gp_track)
                     .map(|ev| Note {
-                        start_secs: ev.time,
-                        length_secs: ev.duration.max(0.01),
+                        start_beats: q(ev.time),
+                        length_beats: (q(ev.time + ev.duration) - q(ev.time)).max(0.01),
                         pitch: ev.midi.min(127),
                         velocity: ev.velocity.clamp(1, 127),
                         tab: tabbed.then_some(TabPos { string: ev.string, fret: ev.fret }),
                     })
                     .collect();
                 let tab = tabbed.then(|| TabLayout { tuning: gp.tuning.clone(), capo: gp.capo, bars: tab_bars.clone() });
-                let bends = (gp.kind != TrackKind::Drums).then(|| bend_lane(&perf, gp_track)).flatten();
+                let bends = (gp.kind != TrackKind::Drums).then(|| bend_lane(&perf, &clock, gp_track)).flatten();
                 if let Some((_, range)) = &bends {
                     set_bend_range(&mut slot, *range);
                 }
@@ -323,7 +338,7 @@ impl Engine {
                 e.project.tracks[index].midi_clips.push(MidiClip {
                     notes: super::midi::sorted(notes),
                     tab,
-                    tempos: perf.tempos.iter().map(|&(t, bpm)| TempoMark { start_secs: t, bpm }).collect(),
+                    tempos: perf.tempos.iter().map(|&(t, bpm)| TempoMark { start_beats: q(t), bpm }).collect(),
                     controllers: bends.map(|b| b.0).into_iter().collect(),
                     ..MidiClip::new(format!("{song_name} — {name}"), start, length)
                 });
@@ -369,15 +384,19 @@ mod tests {
         assert!(guitar.is_instrument());
         let clip = &guitar.midi_clips[0];
         assert_eq!(clip.name, "Fixture Song — Guitar");
-        // The tied note is one 2 s note on each pass through the repeated bar.
-        let tied: Vec<(f64, f64)> = clip.notes.iter().filter(|n| n.pitch == 45).map(|n| (n.start_secs, n.length_secs)).take(2).collect();
-        assert_eq!(tied, vec![(0.0, 2.0), (4.0, 2.0)]);
+        // The tied note is one 2 s (4 beat) note on each pass through the repeated bar.
+        let tied: Vec<(f64, f64)> = clip.notes.iter().filter(|n| n.pitch == 45).map(|n| (n.start_beats, n.length_beats)).take(2).collect();
+        assert_eq!(tied, vec![(0.0, 4.0), (8.0, 4.0)]);
         assert_eq!(p.tracks[2].midi_clips[0].notes.len(), 2, "drum hits");
         assert_eq!(p.tracks[2].instrument.as_ref().map(|s| s.name.as_str()), Some(crate::drums::NAME), "drums default to the drum kit");
         // Tablature: string/fret kept on the notes, bars in playing order, no tab for drums.
         let tab = clip.tab.as_ref().expect("guitar region has a tab layout");
         assert_eq!(tab.tuning, vec![40, 45, 50, 55, 59, 64]);
-        assert_eq!(tab.bars.iter().map(|b| (b.number, b.start_secs)).collect::<Vec<_>>(), vec![(1, 0.0), (2, 2.0), (1, 4.0), (3, 6.0), (4, 8.0)]);
+        assert_eq!(tab.bars.iter().map(|b| (b.number, b.start_beats)).collect::<Vec<_>>(), vec![(1, 0.0), (2, 4.0), (1, 8.0), (3, 12.0), (4, 16.0)]);
+        // The tab bars line up with the project's bars (the song's map was adopted).
+        let bars: Vec<(i64, f64)> = tab.bars.iter().map(|b| { let secs = clip.secs_of(&map, b.start_beats); (map.position(secs).bar, secs) }).collect();
+        assert_eq!(bars, vec![(1, 0.0), (2, 2.0), (3, 4.0), (4, 6.0), (5, 8.0)]);
+        assert_eq!(clip.end_secs(&map), 12.0, "the slow last bar: 4 s");
         assert_eq!(tab.bars[0].section.as_deref(), Some("A Intro"));
         // Sections are markers, at each pass through the repeat.
         assert_eq!(p.markers.iter().map(|m| (m.time_secs, m.name.as_str())).collect::<Vec<_>>(), vec![(0.0, "A Intro"), (4.0, "A Intro")]);
@@ -448,7 +467,7 @@ mod tests {
         let created = e.import_guitar_pro(Path::new(FIXTURE), &opts).unwrap();
         assert_eq!(created.len(), 1);
         assert_eq!(e.project().tracks[0].name, "Drums");
-        assert_eq!(e.project().tracks[0].midi_clips[0].position_secs, 4.0);
+        assert_eq!(e.project().tracks[0].midi_clips[0].position_beats, 8.0, "4 s at the project's 120 bpm");
         assert_eq!(e.project().markers.iter().map(|m| m.time_secs).collect::<Vec<_>>(), vec![4.0, 8.0], "sections move with the song");
         // Importing the song's other track doesn't add its sections again.
         e.import_guitar_pro(Path::new(FIXTURE), &GuitarProImport { tracks: Some(vec![0]), ..opts }).unwrap();

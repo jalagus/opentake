@@ -364,7 +364,7 @@ mod tests {
         let mut mixer = e.attach_test_mixer(48_000);
         let k = e.add_instrument_track("Keys", "au:aumu:dls :appl").unwrap();
         let clip = e.add_midi_clip(k, 0.0, 2.0, None).unwrap();
-        let note = opentake_project::Note { start_secs: 0.0, length_secs: 1.0, pitch: 60, velocity: 110, tab: None };
+        let note = opentake_project::Note { start_beats: 0.0, length_beats: 2.0, pitch: 60, velocity: 110, tab: None };
         e.set_midi_notes(k, clip, vec![note]).unwrap();
         e.insert_plugin(k, "au:aufx:dely:appl", None).unwrap();
         e.play().unwrap();

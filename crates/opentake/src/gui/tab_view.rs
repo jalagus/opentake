@@ -1,9 +1,12 @@
 //! Tablature and standard notation in the editor area. Both draw with the arrangement's own
 //! time-to-screen mapping, so bars, notes and the playhead line up exactly with the regions
 //! above and scroll and zoom along with them (including while playing or recording).
-//! Notation is spaced proportionally to time, like the tab, rather than engraved.
+//! Notation is spaced proportionally to time, like the tab, rather than engraved. Regions,
+//! notes and tab bars are in quarter notes (they follow the tempo map); they're placed
+//! through the map, so a song imported without its tempo still lines its tab up with its
+//! notes (on the project's bars).
 
-use opentake_engine::project::{MidiClip, Note, Project, TabBar, TabLayout};
+use opentake_engine::project::{MidiClip, Note, Project, TabBar, TabLayout, TempoMap};
 use eframe::egui;
 use egui::{Align, Align2, Color32, FontId, Layout, Painter, Pos2, Rangef, Rect, RichText, Sense, Shape, Stroke, StrokeKind, pos2, vec2};
 
@@ -151,7 +154,7 @@ fn draw_body(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot, track: usize,
             (Some(Rect::from_min_max(body.min, pos2(body.right(), split))), Some(Rect::from_min_max(pos2(body.left(), split), body.max)))
         }
     };
-    let ctx = Ctx { app, content, playhead, color: theme::track_color(track), pal, scale };
+    let ctx = Ctx { app, content, playhead, color: theme::track_color(track), pal, scale, map: project.tempo_map() };
     draw_bar_header(&ctx, &painter, &clips, Rect::from_min_max(pos2(content.left(), full.top()), pos2(content.right(), body.top())));
     if let Some(r) = staff_rect {
         draw_staff(&ctx, &painter, &clips, r, gutter.x_range());
@@ -183,6 +186,7 @@ struct Ctx<'a> {
     pal: Palette,
     /// Size of the notation and tab (1.0 = normal).
     scale: f32,
+    map: TempoMap,
 }
 
 /// Colours for the notation and tab: the app's dark look, or ink on paper.
@@ -223,6 +227,11 @@ impl Ctx<'_> {
         self.app.view.x(t)
     }
 
+    /// Timeline seconds of `rel` quarter notes into `clip`.
+    fn secs(&self, clip: &MidiClip, rel: f64) -> f64 {
+        clip.secs_of(&self.map, rel)
+    }
+
     fn visible(&self, x0: f32, x1: f32) -> bool {
         x1 >= self.content.left() - 20.0 && x0 <= self.content.right() + 20.0
     }
@@ -232,17 +241,16 @@ impl Ctx<'_> {
     }
 }
 
-/// Bars inside a region, with their absolute start times.
-fn bar_times<'a>(clip: &MidiClip, layout: &'a TabLayout) -> impl Iterator<Item = (f64, &'a TabBar)> {
-    let (start, end) = (clip.position_secs, clip.position_secs + clip.length_secs);
-    layout.bars.iter().map(move |b| (start + b.start_secs, b)).take_while(move |(t, _)| *t <= end)
+/// Bars inside a region, with their absolute start times (seconds).
+fn bar_times<'a>(ctx: &'a Ctx, clip: &'a MidiClip, layout: &'a TabLayout) -> impl Iterator<Item = (f64, &'a TabBar)> {
+    layout.bars.iter().take_while(|b| b.start_beats <= clip.length_beats + 1e-9).map(move |b| (ctx.secs(clip, b.start_beats), b))
 }
 
 fn draw_bar_header(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], rect: Rect) {
     let p = painter.with_clip_rect(rect);
     for (clip, layout) in clips {
         let mut prev_sig = None;
-        for (t, bar) in bar_times(clip, layout) {
+        for (t, bar) in bar_times(ctx, clip, layout) {
             let sig = (bar.numerator, bar.denominator);
             let sig_changed = prev_sig != Some(sig);
             prev_sig = Some(sig);
@@ -262,10 +270,10 @@ fn draw_bar_header(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout
             }
         }
         // Tempo markings on a second line, the one at the playhead highlighted.
-        let marks: Vec<(f32, f64)> = clip.tempos.iter().filter(|m| m.start_secs < clip.length_secs).map(|m| (ctx.x(clip.position_secs + m.start_secs), m.bpm)).collect();
-        let current = clip.tempos.iter().rposition(|m| clip.position_secs + m.start_secs <= ctx.playhead + 1e-9);
+        let marks: Vec<(f32, f64)> = clip.tempos.iter().filter(|m| m.start_beats < clip.length_beats).map(|m| (ctx.x(ctx.secs(clip, m.start_beats)), m.bpm)).collect();
+        let current = clip.tempos.iter().rposition(|m| ctx.secs(clip, m.start_beats) <= ctx.playhead + 1e-9);
         // Within this region only, so the sticky label doesn't leak past its edges.
-        let span = Rangef::new(ctx.x(clip.position_secs).max(rect.left()), ctx.x(clip.position_secs + clip.length_secs).min(rect.right()));
+        let span = Rangef::new(ctx.x(clip.start_secs(&ctx.map)).max(rect.left()), ctx.x(clip.end_secs(&ctx.map)).min(rect.right()));
         if span.span() > 0.0 {
             let row = p.with_clip_rect(Rect::from_x_y_ranges(span, rect.y_range()));
             timeline::draw_tempo_labels(&row, span, rect.top() + HEADER_H + 4.0, &marks, current, ctx.pal.bg);
@@ -309,22 +317,22 @@ fn draw_tab(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], rec
     // readable at the normal size and grow with the spacing rather than separately from it.
     let mono = FontId::monospace((spacing * 1.05).max(11.5 * ctx.scale));
     for (clip, layout) in clips {
-        let (start, end) = (clip.position_secs, clip.position_secs + clip.length_secs);
-        let (x0, x1) = (ctx.x(start), ctx.x(end));
+        let end = clip.end_secs(&ctx.map);
+        let (x0, x1) = (ctx.x(clip.start_secs(&ctx.map)), ctx.x(end));
         if !ctx.visible(x0, x1) {
             continue;
         }
         for x in [x0, x1] {
             p.vline(x, Rangef::new(y_top - 6.0, y_bottom + 6.0), Stroke::new(1.0, theme::with_alpha(ctx.color, 90)));
         }
-        for (t, _) in bar_times(clip, layout) {
+        for (t, _) in bar_times(ctx, clip, layout) {
             p.vline(ctx.x(t), Rangef::new(y_top, y_bottom), Stroke::new(1.0, ctx.pal.faint));
         }
 
         // Fret numbers on their strings, with a faint line for how long they ring.
-        for n in clip.notes.iter().filter(|n| n.start_secs < clip.content_secs()) {
-            let t = start + n.start_secs;
-            let note_end = (t + n.length_secs).min(end);
+        for n in clip.notes.iter().filter(|n| n.start_beats < clip.content_beats()) {
+            let t = ctx.secs(clip, n.start_beats);
+            let note_end = ctx.secs(clip, n.start_beats + n.length_beats).min(end);
             let (nx, nx_end) = (ctx.x(t), ctx.x(note_end));
             if !ctx.visible(nx, nx_end) {
                 continue;
@@ -338,8 +346,8 @@ fn draw_tab(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], rec
             let gap = clip
                 .notes
                 .iter()
-                .filter(|m| (m.start_secs - n.start_secs).abs() > 1e-9 && layout.position(m).is_some_and(|q| q.string == pos.string))
-                .map(|m| (ctx.x(start + m.start_secs) - nx).abs())
+                .filter(|m| (m.start_beats - n.start_beats).abs() > 1e-9 && layout.position(m).is_some_and(|q| q.string == pos.string))
+                .map(|m| (ctx.x(ctx.secs(clip, m.start_beats)) - nx).abs())
                 .fold(f32::INFINITY, f32::min);
             let room = gap - 3.0;
             let digits = pos.fret.to_string().len() as f32;
@@ -465,16 +473,17 @@ fn written(quarters: f64) -> Written {
     Written { value, dotted, triplet }
 }
 
-/// The bar a region-relative time falls in: (index, start, seconds per quarter, beat length in quarters).
+/// The bar a region-relative time (quarter notes) falls in: (index, start, the length of a
+/// written quarter (1, unless the score's bar is cut short), beat length in quarters).
 fn bar_info(layout: &TabLayout, clip_len: f64, t: f64) -> (usize, f64, f64, f64) {
-    let i = layout.bars.partition_point(|b| b.start_secs <= t + 1e-6).saturating_sub(1);
-    let Some(bar) = layout.bars.get(i) else { return (0, 0.0, 0.5, 1.0) };
-    let end = layout.bars.get(i + 1).map_or(clip_len, |b| b.start_secs);
+    let i = layout.bars.partition_point(|b| b.start_beats <= t + 1e-6).saturating_sub(1);
+    let Some(bar) = layout.bars.get(i) else { return (0, 0.0, 1.0, 1.0) };
+    let end = layout.bars.get(i + 1).map_or(clip_len, |b| b.start_beats);
     let quarters = bar.numerator as f64 * 4.0 / bar.denominator.max(1) as f64;
-    let quarter = ((end - bar.start_secs) / quarters.max(0.25)).max(0.01);
+    let quarter = ((end - bar.start_beats) / quarters.max(0.25)).max(0.01);
     // Beams group by beat: dotted quarters in compound meters (6/8, 9/8, 12/8), else quarters.
     let beat = if bar.denominator == 8 && bar.numerator % 3 == 0 && bar.numerator > 3 { 1.5 } else { 1.0 };
-    (i, bar.start_secs, quarter, beat)
+    (i, bar.start_beats, quarter, beat)
 }
 
 /// A chord laid out on the staff.
@@ -488,6 +497,7 @@ struct Chord {
     written: Written,
     /// (bar index, beat index) for beaming.
     beat: (usize, i64),
+    /// How long a written quarter is (in the region's quarter notes: 1 unless the bar is cut short).
     quarter: f64,
     ink: Color32,
 }
@@ -643,33 +653,33 @@ impl Staff<'_> {
 
 /// Lay out a region's chords (notes starting together share a stem) around the visible area.
 fn chords_of(ctx: &Ctx, clip: &MidiClip, layout: &TabLayout, content: Rect) -> Vec<Chord> {
-    let notes: Vec<&Note> = clip.notes.iter().filter(|n| n.start_secs < clip.content_secs()).collect();
-    let start = clip.position_secs;
+    let notes: Vec<&Note> = clip.notes.iter().filter(|n| n.start_beats < clip.content_beats()).collect();
     let mut out = Vec::new();
     let mut i = 0;
     while i < notes.len() {
-        let onset = notes[i].start_secs;
+        let onset = notes[i].start_beats;
         let mut j = i;
-        while j < notes.len() && notes[j].start_secs - onset < 0.004 {
+        // A strummed chord's notes start a few ms apart.
+        while j < notes.len() && notes[j].start_beats - onset < 0.01 {
             j += 1;
         }
         let chord = &notes[i..j];
-        let next_onset = notes.get(j).map(|n| n.start_secs);
+        let next_onset = notes.get(j).map(|n| n.start_beats);
         i = j;
-        let x = ctx.x(start + onset);
+        let x = ctx.x(ctx.secs(clip, onset));
         // Some margin so beams reaching in from off-screen still draw.
         if x < content.left() - 400.0 || x > content.right() + 400.0 {
             continue;
         }
         // Written length: up to the next onset, so let-ring notes don't all read as whole notes.
-        let len = chord.iter().map(|n| n.length_secs).fold(0.0, f64::max);
+        let len = chord.iter().map(|n| n.length_beats).fold(0.0, f64::max);
         let len = next_onset.map_or(len, |next| len.min(next - onset));
-        let (bar, bar_start, quarter, beat_q) = bar_info(layout, clip.length_secs, onset);
+        let (bar, bar_start, quarter, beat_q) = bar_info(layout, clip.length_beats, onset);
         let beat = ((onset - bar_start) / (quarter * beat_q) + 1e-3).floor() as i64;
         let mut heads: Vec<(i32, bool)> = chord.iter().map(|n| diatonic(n.pitch.saturating_add(12))).collect();
         heads.sort();
         heads.dedup();
-        let sounding = chord.iter().any(|n| ctx.sounding(start + n.start_secs, start + n.start_secs + n.length_secs));
+        let sounding = chord.iter().any(|n| ctx.sounding(ctx.secs(clip, n.start_beats), ctx.secs(clip, n.start_beats + n.length_beats)));
         out.push(Chord {
             x,
             onset,
@@ -739,11 +749,10 @@ fn draw_staff(ctx: &Ctx, painter: &Painter, clips: &[(&MidiClip, &TabLayout)], r
     }
 
     for (clip, layout) in clips {
-        let (start, end) = (clip.position_secs, clip.position_secs + clip.length_secs);
-        if !ctx.visible(ctx.x(start), ctx.x(end)) {
+        if !ctx.visible(ctx.x(clip.start_secs(&ctx.map)), ctx.x(clip.end_secs(&ctx.map))) {
             continue;
         }
-        for (t, _) in bar_times(clip, layout) {
+        for (t, _) in bar_times(ctx, clip, layout) {
             p.vline(ctx.x(t), Rangef::new(y_top, y_bottom), Stroke::new(1.0, ctx.pal.faint));
         }
 

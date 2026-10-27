@@ -68,7 +68,7 @@ impl PitchStretch {
         out.clamp_fades();
         // So do the comp and the loop (timeline seconds).
         if let Some(l) = &mut out.looped {
-            (l.len_secs, l.phase_secs) = (l.len_secs * scale, l.phase_secs * scale);
+            (l.len, l.phase) = (l.len * scale, l.phase * scale);
         }
         out.scale_comp(scale);
         Ok(out)

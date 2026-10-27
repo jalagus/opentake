@@ -104,7 +104,7 @@ pub fn from_str(xml: &str, project_dir: &Path) -> Result<Imported, ImportError> 
             let arranged = seq.descendants().filter(|n| n.has_tag_name("ArrangerAutomation")).flat_map(|a| a.descendants());
             for clip in arranged.filter(|n| n.has_tag_name("AudioClip") || n.has_tag_name("MidiClip")) {
                 if clip.has_tag_name("MidiClip") {
-                    if let Some(c) = midi_clip(clip, &map) {
+                    if let Some(c) = midi_clip(clip) {
                         track.midi_clips.push(c);
                     }
                 } else if let Some(c) = audio_clips(clip, &map, project_dir, &mut warnings, &track.name) {
@@ -117,7 +117,7 @@ pub fn from_str(xml: &str, project_dir: &Path) -> Result<Imported, ImportError> 
             }
         }
         track.clips.sort_by(|a, b| a.position_secs.total_cmp(&b.position_secs));
-        track.midi_clips.sort_by(|a, b| a.position_secs.total_cmp(&b.position_secs));
+        track.midi_clips.sort_by(|a, b| a.position_beats.total_cmp(&b.position_beats));
         if midi && track.instrument.is_none() {
             track.instrument = Some(synth_slot());
         }
@@ -221,9 +221,9 @@ impl Span {
     }
 }
 
-fn midi_clip(clip: Node, map: &TempoMap) -> Option<MidiClip> {
+/// A MIDI clip: Live counts in beats (quarter notes), as MIDI regions do.
+fn midi_clip(clip: Node) -> Option<MidiClip> {
     let span = span(clip)?;
-    let pos = map.secs_at(span.start);
     let mut notes = Vec::new();
     // Live 11+: KeyTracks hold the pitch; each event has Time/Duration/Velocity.
     let events = clip.descendants().filter(|n| n.has_tag_name("MidiNoteEvent"));
@@ -234,17 +234,17 @@ fn midi_clip(clip: Node, map: &TempoMap) -> Option<MidiClip> {
             if ev.attribute("IsEnabled") == Some("false") || t < content - 1e-9 || t >= content + len - 1e-9 || !(0.0..=127.0).contains(&pitch) {
                 continue;
             }
-            let s = map.secs_at(pass_at + t - content);
-            let e = map.secs_at(pass_at + (t + d).min(content + len) - content);
+            let s = pass_at + t - content;
+            let e = pass_at + (t + d).min(content + len) - content;
             let velocity = attr(ev, "Velocity").unwrap_or(100.0).round().clamp(1.0, 127.0) as u8;
-            notes.push(Note { start_secs: s - pos, length_secs: (e - s).max(0.001), pitch: pitch as u8, velocity, tab: None });
+            notes.push(Note { start_beats: s - span.start, length_beats: (e - s).max(0.002), pitch: pitch as u8, velocity, tab: None });
         }
     }
-    notes.sort_by(|a, b| a.start_secs.total_cmp(&b.start_secs));
+    notes.sort_by(|a, b| a.start_beats.total_cmp(&b.start_beats));
     Some(MidiClip {
         name: value(clip, &["Name"]).unwrap_or_default().to_string(),
-        position_secs: pos,
-        length_secs: map.secs_at(span.end) - pos,
+        position_beats: span.start,
+        length_beats: span.end - span.start,
         mute: value(clip, &["Disabled"]) == Some("true"),
         notes,
         tab: None,
@@ -505,9 +505,10 @@ mod tests {
         assert!(keys.solo);
         assert_eq!(keys.instrument.as_ref().map(|i| (i.name.as_str(), i.format)), Some(("VST: Serum", PluginFormat::Vst2)));
         let m = &keys.midi_clips[0];
-        assert_eq!((m.name.as_str(), m.position_secs, m.length_secs), ("Chords", 0.0, 2.0));
-        let notes: Vec<(f64, f64, u8, u8)> = m.notes.iter().map(|n| (n.start_secs, n.length_secs, n.pitch, n.velocity)).collect();
-        assert_eq!(notes, vec![(0.0, 0.5, 60, 100), (1.5, 0.5, 60, 90)]);
+        // In beats, as Live stores them (at 120 bpm: 0..2 s, notes at 0 and 1.5 s).
+        assert_eq!((m.name.as_str(), m.position_beats, m.length_beats), ("Chords", 0.0, 4.0));
+        let notes: Vec<(f64, f64, u8, u8)> = m.notes.iter().map(|n| (n.start_beats, n.length_beats, n.pitch, n.velocity)).collect();
+        assert_eq!(notes, vec![(0.0, 1.0, 60, 100), (3.0, 1.0, 60, 90)]);
         assert_eq!(p.tracks[2].instrument.as_ref().map(|i| i.path.as_str()), Some("drums"));
 
         // Locators: beat 8 = 4 s; beat 24 is 8 beats past the drop to 60 bpm at beat 16 = 16 s.

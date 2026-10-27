@@ -292,8 +292,8 @@ impl Engine {
             self.sync_side_chains(None)?;
         }
         if (old.tempo_bpm, old.time_signature, &old.tempo_changes) != (self.project.tempo_bpm, self.project.time_signature, &self.project.tempo_changes) {
-            let cmd = self.tempo_command();
-            self.send(cmd)?;
+            // MIDI follows the tempo map: re-time all of it.
+            self.sync_tempo()?;
         }
         if old.master_volume != self.project.master_volume {
             self.send(Command::SetMasterGain(self.project.master_volume))?;

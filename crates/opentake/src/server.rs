@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use opentake_engine::project::{AutomationMode, AutomationPoint, AutomationTarget, Controller, ControllerEvent, Curve, Note};
+use opentake_engine::project::{AutomationMode, AutomationPoint, AutomationTarget, Controller, ControllerEvent, Curve, MidiClip, Note, Quantize, QuantizeGrid, TempoMap};
 use opentake_engine::midi_input::MidiSelection;
 use opentake_engine::{AudioConfig, Engine, MidiClipUpdate, SendUpdate, SlotRef, TrackUpdate};
 
@@ -37,8 +37,12 @@ Plugin parameters are normalized 0..1; list_plugin_params shows ids, current val
 Projects can be saved/loaded as native .otp, Reaper .rpp or .dawproject files; Ableton .als, Logic (via .fcpxml) and Ardour sessions can be imported.
 
 MIDI: add_instrument_track (\"synth\" = built-in synth, or a VST3 / AU instrument from list_instruments) -> \
-add_midi_clip -> set_midi_notes / add_midi_notes (times in seconds relative to the region start, \
-pitch 60 = middle C, velocity 1..127). Pitch bend, mod wheel and other controllers: \
+add_midi_clip -> set_midi_notes / add_midi_notes (pitch 60 = middle C, velocity 1..127). MIDI lives in \
+musical time: regions, notes and controllers are stored in beats (quarter notes; regions from the song start, \
+notes from the region start) and follow the tempo map. Give note times as start_beats/length_beats, or as \
+start_secs/length_secs (seconds from the region start, converted through the tempo map); get_project and \
+get_midi_notes show both, plus each note's bar and beat. quantize_midi snaps notes to a grid (1/16, 1/8T...) \
+with strength and swing; set_record_quantize quantizes recorded MIDI. Pitch bend, mod wheel and other controllers: \
 get_midi_controllers / set_midi_controllers (events at times relative to the region start; values in MIDI \
 units, or semitones for pitch bend with bend_range; the built-in synth bends ±2 semitones by default, set by its \
 Bend Range parameter). Every edit — yours or the user's — can be undone with undo/redo; \
@@ -46,8 +50,8 @@ get_history lists the steps. Songs: import_guitar_pro (.gp) and import_midi_file
 instrument tracks; export_midi_file writes the MIDI regions back out.
 
 Tempo: set_tempo sets the opening tempo/signature; set_tempo_map adds tempo and time-signature changes. \
-Region and note times are always seconds; get_tempo_map and convert_time translate between seconds and \
-bars/beats. Markers: list_markers, add_marker (seconds or bar/beat; sections like \"Verse\"), update_marker, \
+MIDI follows tempo changes (it stays on its bars); audio regions, automation, markers and the tempo changes \
+themselves are in seconds. get_tempo_map and convert_time translate between seconds and bars/beats. Markers: list_markers, add_marker (seconds or bar/beat; sections like \"Verse\"), update_marker, \
 remove_marker; goto_marker moves the playhead to one and cycle_marker loops its section (to the next marker). \
 Guitar Pro sections, MIDI file markers and the other DAWs' markers come in as markers. Effects: insert_plugin with \"eq\", \"comp\", \"multiband\", \"limiter\", \"delay\", \"reverb\", \"gate\", \"deesser\", \"chorus\" or \"phaser\" adds a built-in effect to a track (a reverb usually goes on a bus at 100% wet); \
 insert_master_plugin puts effects on the master bus (address them with master: true); VST3 and, on macOS, Audio Unit plug-ins work too (scan_plugins lists them). Plug-in delay \
@@ -147,6 +151,39 @@ pub struct GetMidiNotesArgs {
     pub from_secs: Option<f64>,
     /// Only notes starting before this time (seconds, relative to the region start).
     pub to_secs: Option<f64>,
+    /// Only notes starting at or after this many beats (quarter notes) into the region.
+    pub from_beats: Option<f64>,
+    /// Only notes starting before this many beats into the region.
+    pub to_beats: Option<f64>,
+}
+
+/// Round for agents (beats and seconds to 1e-6).
+fn r6(x: f64) -> f64 {
+    (x * 1e6).round() / 1e6
+}
+
+/// A MIDI region's place in both units: beats (as stored) and seconds (through the tempo map),
+/// and the bar it starts in.
+fn midi_span_json(map: &TempoMap, c: &MidiClip) -> serde_json::Value {
+    let (start, end) = (c.start_secs(map), c.end_secs(map));
+    let pos = map.position(start);
+    json!({ "position_beats": r6(c.position_beats), "length_beats": r6(c.length_beats), "position_secs": r6(start), "length_secs": r6(end - start), "bar": pos.bar, "beat": r6(pos.beat as f64 + pos.fraction) })
+}
+
+/// A note in both units, with the bar and beat it starts on (`index` is its place in the region).
+fn note_json(map: &TempoMap, c: &MidiClip, index: usize, n: &Note) -> serde_json::Value {
+    let (s, e) = (c.secs_of(map, n.start_beats), c.secs_of(map, n.start_beats + n.length_beats));
+    let pos = map.position(s);
+    let mut v = json!({
+        "index": index, "pitch": n.pitch, "velocity": n.velocity,
+        "start_beats": r6(n.start_beats), "length_beats": r6(n.length_beats),
+        "start_secs": r6(s - c.start_secs(map)), "length_secs": r6(e - s),
+        "bar": pos.bar, "beat": r6(pos.beat as f64 + pos.fraction),
+    });
+    if let Some(t) = n.tab {
+        v["tab"] = json!(t);
+    }
+    v
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -184,9 +221,19 @@ pub struct AnalyzeMixArgs {
 fn project_json(project: &opentake_engine::project::Project, include_notes: bool) -> serde_json::Value {
     let mut v = serde_json::to_value(project).unwrap_or_default();
     compact_lanes(v.get_mut("master_automation"));
+    let map = project.tempo_map();
     if let Some(tracks) = v.get_mut("tracks").and_then(|t| t.as_array_mut()) {
         for (i, t) in tracks.iter_mut().enumerate() {
             compact_track(t, include_notes);
+            // MIDI regions in beats and seconds (and notes too, when asked for).
+            for (c, clip) in t.get_mut("midi_clips").and_then(|c| c.as_array_mut()).into_iter().flatten().zip(&project.tracks[i].midi_clips) {
+                for (k, val) in midi_span_json(&map, clip).as_object().into_iter().flatten() {
+                    c[k] = val.clone();
+                }
+                if include_notes {
+                    c["notes"] = json!(clip.notes.iter().enumerate().map(|(k, n)| note_json(&map, clip, k, n)).collect::<Vec<_>>());
+                }
+            }
             t["index"] = json!(i);
             // Kind and output by index (the model stores buses by session id).
             let track = &project.tracks[i];
@@ -221,13 +268,14 @@ fn state_json(slot: Option<&mut serde_json::Value>) {
 fn loops_json(t: &mut serde_json::Value, track: &opentake_engine::project::Track) {
     let audio = track.clips.iter().map(|c| (c.looped, c.loop_passes().len()));
     let midi = track.midi_clips.iter().map(|c| (c.looped, c.loop_passes().len()));
-    for (list, info) in [("clips", audio.collect::<Vec<_>>()), ("midi_clips", midi.collect())] {
+    // Audio loops are in seconds, MIDI loops in beats.
+    for (list, unit, info) in [("clips", "secs", audio.collect::<Vec<_>>()), ("midi_clips", "beats", midi.collect())] {
         for (c, (looped, passes)) in t.get_mut(list).and_then(|c| c.as_array_mut()).into_iter().flatten().zip(info) {
             let (Some(l), Some(o)) = (looped, c.as_object_mut()) else { continue };
             o.remove("looped");
-            let mut info = json!({ "loop_length_secs": l.len_secs, "passes": passes });
-            if l.phase_secs != 0.0 {
-                info["starts_into_loop_secs"] = json!(l.phase_secs);
+            let mut info = json!({ format!("loop_length_{unit}"): l.len, "passes": passes });
+            if l.phase != 0.0 {
+                info[format!("starts_into_loop_{unit}")] = json!(l.phase);
             }
             o.insert("loop".into(), info);
         }
@@ -839,26 +887,103 @@ pub struct SetInstrumentArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AddMidiClipArgs {
     pub track: usize,
-    pub position_secs: f64,
-    pub length_secs: f64,
+    /// Where it starts, in seconds...
+    pub position_secs: Option<f64>,
+    /// ...or in beats (quarter notes) from the song start...
+    pub position_beats: Option<f64>,
+    /// ...or at the start of this bar (1-based).
+    pub bar: Option<i64>,
+    /// Length in seconds (from where it starts)...
+    pub length_secs: Option<f64>,
+    /// ...or in beats (quarter notes)...
+    pub length_beats: Option<f64>,
+    /// ...or in bars (of the time signature where it starts).
+    pub length_bars: Option<f64>,
     pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct NoteArg {
-    /// Seconds from the start of the region.
-    pub start_secs: f64,
-    pub length_secs: f64,
+    /// Start in beats (quarter notes) from the start of the region...
+    pub start_beats: Option<f64>,
+    /// ...or in seconds from the start of the region (converted through the tempo map).
+    pub start_secs: Option<f64>,
+    /// Length in beats (quarter notes: 1 = quarter, 0.5 = eighth)...
+    pub length_beats: Option<f64>,
+    /// ...or in seconds.
+    pub length_secs: Option<f64>,
     /// MIDI note number, 60 = middle C.
     pub pitch: u8,
     /// 1..=127 (default 100).
     pub velocity: Option<u8>,
 }
 
-impl From<&NoteArg> for Note {
-    fn from(n: &NoteArg) -> Self {
-        Note { start_secs: n.start_secs, length_secs: n.length_secs, pitch: n.pitch, velocity: n.velocity.unwrap_or(100), tab: None }
-    }
+/// Notes for region `clip` of `track`, their times given in beats or seconds.
+fn notes_from_args(e: &Engine, track: usize, clip: usize, args: &[NoteArg]) -> anyhow::Result<Vec<Note>> {
+    let c = midi_clip(e, track, clip)?;
+    let map = e.project().tempo_map();
+    let origin = c.start_secs(&map);
+    args.iter()
+        .map(|n| {
+            let start = match (n.start_beats, n.start_secs) {
+                (Some(b), _) => b,
+                (None, Some(s)) => c.beats_at(&map, origin + s),
+                (None, None) => anyhow::bail!("each note needs start_beats or start_secs"),
+            };
+            let length = match (n.length_beats, n.length_secs) {
+                (Some(b), _) => b,
+                (None, Some(s)) => c.beats_at(&map, c.secs_of(&map, start) + s) - start,
+                (None, None) => anyhow::bail!("each note needs length_beats or length_secs"),
+            };
+            Ok(Note { start_beats: start, length_beats: length, pitch: n.pitch, velocity: n.velocity.unwrap_or(100), tab: None })
+        })
+        .collect()
+}
+
+fn midi_clip(e: &Engine, track: usize, clip: usize) -> anyhow::Result<&MidiClip> {
+    let t = e.project().tracks.get(track).ok_or_else(|| anyhow::anyhow!("no track {track}"))?;
+    t.midi_clips.get(clip).ok_or_else(|| anyhow::anyhow!("track {track} has no MIDI region {clip}"))
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct QuantizeMidiArgs {
+    pub track: usize,
+    pub clip: usize,
+    /// "1/4", "1/8", "1/16" (default), "1/32", or triplets "1/4T", "1/8T", "1/16T".
+    pub grid: Option<String>,
+    /// How far notes move towards the grid, percent (default 100; 50 = halfway).
+    pub strength: Option<f64>,
+    /// Swing percent on straight grids (default 0): every second grid line moves later,
+    /// up to a third of a step at 100 (a triplet feel).
+    pub swing: Option<f64>,
+    /// Quantize note ends too (default false: lengths are kept).
+    #[serde(default)]
+    pub ends: bool,
+    /// Only notes within this percent of half a step from their grid line move (default 100:
+    /// every note); e.g. 50 fixes near misses and leaves deliberate pushes.
+    pub window: Option<f64>,
+    /// Note indices (as get_midi_notes lists them) to quantize; omit for all.
+    pub notes: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RecordQuantizeArgs {
+    /// Grid ("1/16", "1/8T"...) to quantize recorded MIDI to, or "off".
+    pub grid: String,
+    /// Percent (default 100).
+    pub strength: Option<f64>,
+    /// Percent (default 0).
+    pub swing: Option<f64>,
+}
+
+/// Quantize settings from tool arguments (percentages).
+fn quantize_from(grid: Option<&str>, strength: Option<f64>, swing: Option<f64>) -> anyhow::Result<Quantize> {
+    let grid = match grid {
+        None => QuantizeGrid::Sixteenth,
+        Some(g) => QuantizeGrid::parse(g).ok_or_else(|| anyhow::anyhow!("unknown grid '{g}': use 1/4, 1/8, 1/16, 1/32, 1/4T, 1/8T or 1/16T"))?,
+    };
+    let pct = |v: Option<f64>, default: f64| v.map_or(default, |p| (p / 100.0).clamp(0.0, 1.0));
+    Ok(Quantize { strength: pct(strength, 1.0), swing: pct(swing, 0.0), ..Quantize::new(grid) })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -880,8 +1005,10 @@ pub struct GetMidiControllersArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ControllerEventArg {
-    /// Seconds from the start of the region.
-    pub time_secs: f64,
+    /// Beats (quarter notes) from the start of the region...
+    pub time_beats: Option<f64>,
+    /// ...or seconds from the start of the region.
+    pub time_secs: Option<f64>,
     /// CC and pressure 0..127; pitch bend -8192..8191 (0 = centre), or semitones when
     /// bend_range is given.
     pub value: f64,
@@ -935,10 +1062,17 @@ fn natural_value(kind: Controller, value: f32) -> i32 {
     kind.raw(value) as i32 - if kind == Controller::PitchBend { 8192 } else { 0 }
 }
 
-fn controller_events(kind: Controller, events: &[ControllerEventArg], bend_range: Option<f64>) -> anyhow::Result<Vec<ControllerEvent>> {
+/// Controller events for a region (times in beats or seconds from its start).
+fn controller_events(clip: &MidiClip, map: &TempoMap, kind: Controller, events: &[ControllerEventArg], bend_range: Option<f64>) -> anyhow::Result<Vec<ControllerEvent>> {
+    let origin = clip.start_secs(map);
     events
         .iter()
         .map(|e| {
+            let time = match (e.time_beats, e.time_secs) {
+                (Some(b), _) => b,
+                (None, Some(s)) => clip.beats_at(map, origin + s),
+                (None, None) => anyhow::bail!("each event needs time_beats or time_secs"),
+            };
             let value = match (kind, bend_range) {
                 (Controller::PitchBend, Some(range)) if range > 0.0 => (e.value / range).clamp(-1.0, 1.0),
                 (Controller::PitchBend, None) => (e.value / 8192.0).clamp(-1.0, 1.0),
@@ -946,7 +1080,7 @@ fn controller_events(kind: Controller, events: &[ControllerEventArg], bend_range
                 _ if !(0.0..=127.0).contains(&e.value) => anyhow::bail!("{} values are 0..127 (got {})", controller_name(kind), e.value),
                 _ => e.value / 127.0,
             };
-            Ok(ControllerEvent { time_secs: e.time_secs, value: value as f32 })
+            Ok(ControllerEvent { time_beats: time, value: value as f32 })
         })
         .collect()
 }
@@ -956,8 +1090,12 @@ pub struct UpdateMidiClipArgs {
     pub track: usize,
     pub clip: usize,
     pub name: Option<String>,
+    /// New start in seconds (or position_beats: quarter notes from the song start).
     pub position_secs: Option<f64>,
+    pub position_beats: Option<f64>,
+    /// New length in seconds (or length_beats: quarter notes).
     pub length_secs: Option<f64>,
+    pub length_beats: Option<f64>,
     pub mute: Option<bool>,
     /// Move the region to this track.
     pub to_track: Option<usize>,
@@ -967,7 +1105,9 @@ pub struct UpdateMidiClipArgs {
 pub struct CopyMidiClipArgs {
     pub track: usize,
     pub clip: usize,
-    pub position_secs: f64,
+    /// Where the copy starts, in seconds (or position_beats: quarter notes from the song start).
+    pub position_secs: Option<f64>,
+    pub position_beats: Option<f64>,
     pub to_track: Option<usize>,
 }
 
@@ -1292,14 +1432,20 @@ impl DawServer {
         .await
     }
 
-    #[tool(description = "The notes of one MIDI region (times in seconds relative to the region start), optionally only a time range.")]
+    #[tool(description = "The notes of one MIDI region, each with its index, start and length in beats (quarter notes from the region start, as stored) and in seconds (from the region start, through the tempo map), and the bar and beat it starts on; optionally only a range (seconds or beats into the region).")]
     async fn get_midi_notes(&self, Parameters(a): Parameters<GetMidiNotesArgs>) -> ToolResult {
         self.with_engine(move |e| {
-            let track = e.project().tracks.get(a.track).ok_or_else(|| anyhow::anyhow!("no track {}", a.track))?;
-            let clip = track.midi_clips.get(a.clip).ok_or_else(|| anyhow::anyhow!("track {} has no MIDI region {}", a.track, a.clip))?;
-            let (from, to) = (a.from_secs.unwrap_or(f64::NEG_INFINITY), a.to_secs.unwrap_or(f64::INFINITY));
-            let notes: Vec<_> = clip.notes.iter().filter(|n| n.start_secs >= from && n.start_secs < to).collect();
-            Ok(json!({ "region": clip.name, "position_secs": clip.position_secs, "length_secs": clip.length_secs, "count": notes.len(), "notes": notes }))
+            let clip = midi_clip(e, a.track, a.clip)?;
+            let map = e.project().tempo_map();
+            let at = |s: f64| clip.beats_at(&map, clip.start_secs(&map) + s);
+            let from = a.from_beats.or(a.from_secs.map(at)).unwrap_or(f64::NEG_INFINITY);
+            let to = a.to_beats.or(a.to_secs.map(at)).unwrap_or(f64::INFINITY);
+            let notes: Vec<_> = clip.notes.iter().enumerate().filter(|(_, n)| n.start_beats >= from - 1e-9 && n.start_beats < to - 1e-9).map(|(i, n)| note_json(&map, clip, i, n)).collect();
+            let mut v = midi_span_json(&map, clip);
+            v["region"] = json!(clip.name);
+            v["count"] = json!(notes.len());
+            v["notes"] = json!(notes);
+            Ok(v)
         })
         .await
     }
@@ -1375,13 +1521,13 @@ impl DawServer {
         self.with_engine(move |e| e.save_project(a.path.as_deref().map(std::path::Path::new))).await
     }
 
-    #[tool(description = "Set the opening tempo and optionally the time signature (see set_tempo_map for changes later in the song).")]
+    #[tool(description = "Set the opening tempo and optionally the time signature (see set_tempo_map for changes later in the song). MIDI regions follow the tempo (they stay on their bars); audio regions keep their times.")]
     async fn set_tempo(&self, Parameters(a): Parameters<TempoArgs>) -> ToolResult {
         let sig = a.numerator.zip(a.denominator);
         self.with_engine(move |e| e.set_tempo(a.bpm, sig).map(|_| "ok")).await
     }
 
-    #[tool(description = "Replace the tempo map's changes: tempo and/or time-signature changes after the start. Bars, the grid, snapping, the metronome and plug-ins follow it; region times stay in seconds. Undoable.")]
+    #[tool(description = "Replace the tempo map's changes: tempo and/or time-signature changes after the start (at_secs). Bars, the grid, snapping, the metronome, plug-ins and MIDI regions (which are in beats) follow it; audio regions, automation and markers stay in seconds. Undoable.")]
     async fn set_tempo_map(&self, Parameters(a): Parameters<TempoMapArgs>) -> ToolResult {
         let changes = a
             .changes
@@ -1771,7 +1917,11 @@ impl DawServer {
             e.set_region_loop(&[r], to)?;
             Ok(json!({ "region": e.region_data(r).map(|d| match d {
                 opentake_engine::RegionData::Audio(c) => json!({ "position_secs": c.position_secs, "length_secs": c.length_secs, "looped": c.looped, "passes": c.loop_passes().len() }),
-                opentake_engine::RegionData::Midi(c) => json!({ "position_secs": c.position_secs, "length_secs": c.length_secs, "looped": c.looped, "passes": c.loop_passes().len() }),
+                opentake_engine::RegionData::Midi(c) => {
+                    let mut v = midi_span_json(&e.project().tempo_map(), &c);
+                    (v["looped"], v["passes"]) = (json!(c.looped), json!(c.loop_passes().len()));
+                    v
+                }
             })? }))
         })
         .await
@@ -1883,40 +2033,94 @@ impl DawServer {
         self.with_engine(move |e| e.set_instrument(a.track, a.instrument.as_deref())).await
     }
 
-    #[tool(description = "Add an empty MIDI region to an instrument track. Returns its index.")]
+    #[tool(description = "Add an empty MIDI region to an instrument track: start at position_secs, position_beats (quarter notes from the song start) or bar; length in length_secs, length_beats or length_bars. MIDI regions follow the tempo map (they're stored in beats). Returns its index and where it landed.")]
     async fn add_midi_clip(&self, Parameters(a): Parameters<AddMidiClipArgs>) -> ToolResult {
-        self.with_engine(move |e| e.add_midi_clip(a.track, a.position_secs, a.length_secs, a.name.as_deref()).map(|i| json!({ "clip": i })))
-            .await
+        self.with_engine(move |e| {
+            let map = e.project().tempo_map();
+            let start = match (a.position_beats, a.bar, a.position_secs) {
+                (Some(b), _, _) => b,
+                (None, Some(bar), _) => map.quarters_at(map.secs_of(bar.max(1), 1.0)),
+                (None, None, Some(s)) => map.quarters_at(s.max(0.0)),
+                _ => anyhow::bail!("give position_secs, position_beats or bar"),
+            };
+            let length = match (a.length_beats, a.length_bars, a.length_secs) {
+                (Some(b), _, _) => b,
+                (None, Some(bars), _) => bars * opentake_engine::project::tempo::bar_len_q(map.signature_at(map.secs_at(start))),
+                (None, None, Some(s)) => map.quarters_at(map.secs_at(start) + s) - start,
+                _ => anyhow::bail!("give length_secs, length_beats or length_bars"),
+            };
+            let i = e.add_midi_clip_beats(a.track, start, length, a.name.as_deref())?;
+            let mut v = midi_span_json(&e.project().tempo_map(), &e.project().tracks[a.track].midi_clips[i]);
+            v["clip"] = json!(i);
+            Ok(v)
+        })
+        .await
     }
 
-    #[tool(description = "Replace all notes in a MIDI region.")]
+    #[tool(description = "Replace all notes in a MIDI region. Each note gives start_beats/length_beats (quarter notes from the region start) or start_secs/length_secs (seconds, converted through the tempo map).")]
     async fn set_midi_notes(&self, Parameters(a): Parameters<MidiNotesArgs>) -> ToolResult {
-        let notes: Vec<Note> = a.notes.iter().map(Note::from).collect();
-        self.with_engine(move |e| e.set_midi_notes(a.track, a.clip, notes).map(|_| "ok")).await
+        self.with_engine(move |e| {
+            let notes = notes_from_args(e, a.track, a.clip, &a.notes)?;
+            e.set_midi_notes(a.track, a.clip, notes).map(|_| "ok")
+        })
+        .await
     }
 
-    #[tool(description = "Append notes to a MIDI region. Returns the new note count.")]
+    #[tool(description = "Append notes to a MIDI region (times in beats or seconds from the region start, as set_midi_notes). Returns the new note count.")]
     async fn add_midi_notes(&self, Parameters(a): Parameters<MidiNotesArgs>) -> ToolResult {
-        let notes: Vec<Note> = a.notes.iter().map(Note::from).collect();
-        self.with_engine(move |e| e.add_midi_notes(a.track, a.clip, notes).map(|n| json!({ "note_count": n }))).await
+        self.with_engine(move |e| {
+            let notes = notes_from_args(e, a.track, a.clip, &a.notes)?;
+            e.add_midi_notes(a.track, a.clip, notes).map(|n| json!({ "note_count": n }))
+        })
+        .await
     }
 
-    #[tool(description = "The controller lanes of a MIDI region: pitch bend (-8192..8191, 0 = centre), CCs and channel pressure (0..127), each event holding until the next; times in seconds relative to the region start.")]
+    #[tool(description = "Quantize a MIDI region's notes (all, or the indices in notes) to a grid: 1/4, 1/8, 1/16 (default), 1/32 or triplets 1/4T, 1/8T, 1/16T, aligned to the bars. strength (percent, default 100) moves notes part of the way; swing (percent) delays every second line of a straight grid; ends quantizes note ends too; window only moves notes already close to the grid. Undoable. Returns how many notes moved.")]
+    async fn quantize_midi(&self, Parameters(a): Parameters<QuantizeMidiArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let mut q = quantize_from(a.grid.as_deref(), a.strength, a.swing)?;
+            q.ends = a.ends;
+            q.window = a.window.map_or(1.0, |w| (w / 100.0).clamp(0.0, 1.0));
+            let moved = e.quantize_midi(a.track, a.clip, &q, a.notes.as_deref())?;
+            Ok(json!({ "moved": moved, "grid": q.grid.name() }))
+        })
+        .await
+    }
+
+    #[tool(description = "Quantize on record: MIDI recorded from now on snaps to this grid (\"1/16\", \"1/8T\"...) with the strength and swing given (percent) when recording stops; \"off\" records as played. Saved with the project; not an undoable edit.")]
+    async fn set_record_quantize(&self, Parameters(a): Parameters<RecordQuantizeArgs>) -> ToolResult {
+        self.with_engine(move |e| {
+            let q = if a.grid.eq_ignore_ascii_case("off") { None } else { Some(quantize_from(Some(&a.grid), a.strength, a.swing)?) };
+            e.set_record_quantize(q);
+            Ok(json!({ "record_quantize": e.project().record_quantize }))
+        })
+        .await
+    }
+
+    #[tool(description = "The controller lanes of a MIDI region: pitch bend (-8192..8191, 0 = centre), CCs and channel pressure (0..127), each event holding until the next; times in beats (quarter notes) and seconds from the region start.")]
     async fn get_midi_controllers(&self, Parameters(a): Parameters<GetMidiControllersArgs>) -> ToolResult {
         self.with_engine(move |e| {
             let only = a.kind.as_deref().map(parse_controller).transpose()?;
-            let track = e.project().tracks.get(a.track).ok_or_else(|| anyhow::anyhow!("no track {}", a.track))?;
-            let clip = track.midi_clips.get(a.clip).ok_or_else(|| anyhow::anyhow!("track {} has no MIDI region {}", a.track, a.clip))?;
+            let clip = midi_clip(e, a.track, a.clip)?;
+            let map = e.project().tempo_map();
+            let origin = clip.start_secs(&map);
             let lanes: Vec<_> = clip
                 .controllers
                 .iter()
                 .filter(|l| only.is_none_or(|k| k == l.kind))
                 .map(|l| {
-                    let events: Vec<_> = l.events.iter().map(|ev| json!({ "time_secs": ev.time_secs, "value": natural_value(l.kind, ev.value) })).collect();
+                    let events: Vec<_> = l
+                        .events
+                        .iter()
+                        .map(|ev| json!({ "time_beats": r6(ev.time_beats), "time_secs": r6(clip.secs_of(&map, ev.time_beats) - origin), "value": natural_value(l.kind, ev.value) }))
+                        .collect();
                     json!({ "kind": controller_name(l.kind), "name": l.kind.name(), "events": events })
                 })
                 .collect();
-            Ok(json!({ "region": clip.name, "length_secs": clip.length_secs, "lanes": lanes }))
+            let mut v = midi_span_json(&map, clip);
+            v["region"] = json!(clip.name);
+            v["lanes"] = json!(lanes);
+            Ok(v)
         })
         .await
     }
@@ -1930,33 +2134,42 @@ impl DawServer {
                 Some("add") => false,
                 Some(m) => anyhow::bail!("mode must be replace or add, not '{m}'"),
             };
-            let events = controller_events(kind, &a.events, a.bend_range)?;
+            let events = controller_events(midi_clip(e, a.track, a.clip)?, &e.project().tempo_map(), kind, &a.events, a.bend_range)?;
             e.set_midi_controllers(a.track, a.clip, kind, events, replace).map(|n| json!({ "kind": controller_name(kind), "event_count": n }))
         })
         .await
     }
 
-    #[tool(description = "Change a MIDI region: rename, move (optionally to another track), resize or mute.")]
+    #[tool(description = "Change a MIDI region: rename, move (position_secs or position_beats; optionally to another track), resize (length_secs or length_beats) or mute.")]
     async fn update_midi_clip(&self, Parameters(a): Parameters<UpdateMidiClipArgs>) -> ToolResult {
         self.with_engine(move |e| {
             let mut clip = a.clip;
             let mut track = a.track;
             if let Some(to) = a.to_track.filter(|&to| to != a.track) {
-                let pos = a.position_secs.unwrap_or(e.project().tracks.get(track).and_then(|t| t.midi_clips.get(clip)).map_or(0.0, |c| c.position_secs));
-                e.move_midi_clip(track, clip, pos, Some(to))?;
+                let current = midi_clip(e, track, clip)?.position_beats;
+                let pos = a.position_beats.or(a.position_secs.map(|s| e.beats_at(s.max(0.0)))).unwrap_or(current);
+                e.move_midi_clip_beats(track, clip, pos, Some(to))?;
                 track = to;
                 clip = e.project().tracks[to].midi_clips.len() - 1;
             }
-            let u = MidiClipUpdate { name: a.name, position_secs: a.position_secs, length_secs: a.length_secs, mute: a.mute };
-            e.update_midi_clip(track, clip, u).map(|c| json!({ "track": track, "clip": clip, "region": c }))
+            let u = MidiClipUpdate { name: a.name, position_secs: a.position_secs, length_secs: a.length_secs, position_beats: a.position_beats, length_beats: a.length_beats, mute: a.mute };
+            let c = e.update_midi_clip(track, clip, u)?;
+            Ok(json!({ "track": track, "clip": clip, "region": c, "span": midi_span_json(&e.project().tempo_map(), &c) }))
         })
         .await
     }
 
-    #[tool(description = "Copy a MIDI region (with its notes) to another position or track.")]
+    #[tool(description = "Copy a MIDI region (with its notes) to another position (position_secs, or position_beats from the song start) or track.")]
     async fn copy_midi_clip(&self, Parameters(a): Parameters<CopyMidiClipArgs>) -> ToolResult {
-        self.with_engine(move |e| e.copy_midi_clip(a.track, a.clip, a.position_secs, a.to_track).map(|(t, c)| json!({ "track": t, "clip": c })))
-            .await
+        self.with_engine(move |e| {
+            let pos = match (a.position_beats, a.position_secs) {
+                (Some(b), _) => b,
+                (None, Some(s)) => e.beats_at(s.max(0.0)),
+                (None, None) => anyhow::bail!("give position_secs or position_beats"),
+            };
+            e.copy_midi_clip_beats(a.track, a.clip, pos, a.to_track).map(|(t, c)| json!({ "track": t, "clip": c }))
+        })
+        .await
     }
 
     #[tool(description = "Delete a MIDI region.")]
@@ -2210,7 +2423,10 @@ mod compact_tests {
         t.midi_clips.push(MidiClip::new("plain", 4.0, 1.0));
         p.tracks.push(t);
         let v = project_json(&p, false);
-        assert_eq!(v["tracks"][0]["midi_clips"][0]["loop"], json!({ "loop_length_secs": 1.0, "passes": 3 }));
+        assert_eq!(v["tracks"][0]["midi_clips"][0]["loop"], json!({ "loop_length_beats": 1.0, "passes": 3 }), "MIDI loops are in beats");
+        // Regions in beats and seconds: 4 beats at 120 bpm is 2 s, bar 2.
+        let plain = &v["tracks"][0]["midi_clips"][1];
+        assert_eq!((plain["position_beats"].as_f64(), plain["position_secs"].as_f64(), plain["length_secs"].as_f64(), plain["bar"].as_i64()), (Some(4.0), Some(2.0), Some(0.5), Some(2)));
         assert!(v["tracks"][0]["midi_clips"][0].get("looped").is_none() && v["tracks"][0]["midi_clips"][1].get("loop").is_none());
     }
 
@@ -2235,10 +2451,10 @@ mod compact_tests {
         let mut t = Track::new("Keys");
         t.midi_clips.push(MidiClip {
             name: "r".into(),
-            position_secs: 0.0,
-            length_secs: 1.0,
+            position_beats: 0.0,
+            length_beats: 2.0,
             mute: false,
-            notes: vec![Note { start_secs: 0.0, length_secs: 0.5, pitch: 60, velocity: 100, tab: None }; 3],
+            notes: vec![Note { start_beats: 0.0, length_beats: 1.0, pitch: 60, velocity: 100, tab: None }; 3],
             tab: None,
             tempos: Vec::new(),
             controllers: Vec::new(),
@@ -2258,6 +2474,39 @@ mod compact_tests {
         assert_eq!(compact["tracks"][0]["index"], 0);
         let full = project_json(&p, true);
         assert_eq!(full["tracks"][0]["midi_clips"][0]["notes"].as_array().map(|n| n.len()), Some(3));
+        assert_eq!((full["tracks"][0]["midi_clips"][0]["notes"][0]["length_beats"].as_f64(), full["tracks"][0]["midi_clips"][0]["notes"][0]["length_secs"].as_f64()), (Some(1.0), Some(0.5)));
+    }
+
+    #[test]
+    fn midi_tools_take_seconds_or_beats_and_show_both() {
+        let mut e = Engine::new();
+        // 120 bpm, then 60 from 4 s (beat 8).
+        e.set_tempo_changes(vec![opentake_engine::project::TempoChange { at_secs: 4.0, bpm: 60.0, time_signature: None }], None).unwrap();
+        let t = e.add_instrument_track("Keys", "synth").unwrap();
+        let c = e.add_midi_clip_beats(t, 6.0, 4.0, None).unwrap(); // 3 s .. 6 s
+        let args: Vec<NoteArg> = serde_json::from_value(json!([
+            { "start_secs": 0.5, "length_secs": 1.0, "pitch": 60 },
+            { "start_beats": 3.0, "length_beats": 0.5, "pitch": 64, "velocity": 90 },
+            { "start_beats": 0.0, "length_secs": 0.25, "pitch": 67 },
+        ]))
+        .unwrap();
+        let notes = notes_from_args(&e, t, c, &args).unwrap();
+        // 3.5 s = beat 7, 1 s later = beat 8.5 (across the change); 0.25 s from beat 6 = half a beat.
+        assert_eq!(notes.iter().map(|n| (n.start_beats, n.length_beats)).collect::<Vec<_>>(), [(1.0, 1.5), (3.0, 0.5), (0.0, 0.5)]);
+        let bad: Vec<NoteArg> = serde_json::from_value(json!([{ "length_beats": 1.0, "pitch": 60 }])).unwrap();
+        assert!(notes_from_args(&e, t, c, &bad).is_err());
+        e.set_midi_notes(t, c, notes).unwrap();
+        let map = e.project().tempo_map();
+        let clip = &e.project().tracks[t].midi_clips[c];
+        let n = note_json(&map, clip, 1, &clip.notes[1]);
+        assert_eq!(n, json!({ "index": 1, "pitch": 60, "velocity": 100, "start_beats": 1.0, "length_beats": 1.5, "start_secs": 0.5, "length_secs": 1.0, "bar": 2, "beat": 4.0 }));
+        assert_eq!(midi_span_json(&map, clip), json!({ "position_beats": 6.0, "length_beats": 4.0, "position_secs": 3.0, "length_secs": 3.0, "bar": 2, "beat": 3.0 }));
+
+        // Quantize settings in percent.
+        let q = quantize_from(Some("1/8t"), Some(50.0), Some(250.0)).unwrap();
+        assert_eq!((q.grid, q.strength, q.swing), (QuantizeGrid::EighthTriplet, 0.5, 1.0));
+        assert_eq!(quantize_from(None, None, None).unwrap(), Quantize::new(QuantizeGrid::Sixteenth));
+        assert!(quantize_from(Some("1/5"), None, None).is_err());
     }
 
     #[test]
@@ -2266,18 +2515,21 @@ mod compact_tests {
         assert_eq!(parse_controller("cc74").unwrap(), Controller::Cc(74));
         assert_eq!(parse_controller("64").unwrap(), Controller::SUSTAIN);
         assert!(parse_controller("cc123").is_err(), "channel mode messages aren't controllers");
-        let ev = |t: f64, v: f64| ControllerEventArg { time_secs: t, value: v };
-        let bend = controller_events(Controller::PitchBend, &[ev(0.0, -8192.0), ev(0.5, 4096.0)], None).unwrap();
+        let ev = |t: f64, v: f64| ControllerEventArg { time_secs: Some(t), time_beats: None, value: v };
+        let (clip, map) = (MidiClip::new("r", 2.0, 4.0), opentake_engine::project::TempoMap::new(120.0, (4, 4), &[]));
+        let events = |kind, list: &[ControllerEventArg], range| controller_events(&clip, &map, kind, list, range);
+        let bend = events(Controller::PitchBend, &[ev(0.0, -8192.0), ev(0.5, 4096.0)], None).unwrap();
         assert_eq!(bend.iter().map(|e| e.value).collect::<Vec<_>>(), vec![-1.0, 0.5]);
-        let semis = controller_events(Controller::PitchBend, &[ev(0.0, 1.0)], Some(2.0)).unwrap();
-        assert_eq!(semis[0].value, 0.5);
-        assert!(controller_events(Controller::VOLUME, &[ev(0.0, 200.0)], None).is_err());
+        assert_eq!(bend[1].time_beats, 1.0, "half a second into the region: a beat");
+        let semis = events(Controller::PitchBend, &[ControllerEventArg { time_beats: Some(1.5), ..ev(9.0, 1.0) }], Some(2.0)).unwrap();
+        assert_eq!((semis[0].value, semis[0].time_beats), (0.5, 1.5), "beats win");
+        assert!(events(Controller::VOLUME, &[ev(0.0, 200.0)], None).is_err());
 
         let mut e = Engine::new();
         let t = e.add_instrument_track("Keys", "synth").unwrap();
         e.add_midi_clip(t, 0.0, 2.0, None).unwrap();
         e.set_midi_controllers(t, 0, Controller::PitchBend, bend, true).unwrap();
-        e.set_midi_controllers(t, 0, Controller::VOLUME, controller_events(Controller::VOLUME, &[ev(0.0, 100.0)], None).unwrap(), true).unwrap();
+        e.set_midi_controllers(t, 0, Controller::VOLUME, events(Controller::VOLUME, &[ev(0.0, 100.0)], None).unwrap(), true).unwrap();
         let v = project_json(e.project(), false);
         assert_eq!(v["tracks"][t]["midi_clips"][0]["controllers"], json!([{ "kind": "pitch_bend", "event_count": 2 }, { "kind": "cc7", "event_count": 1 }]));
         assert_eq!(natural_value(Controller::PitchBend, -1.0), -8192);

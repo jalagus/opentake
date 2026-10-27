@@ -12,8 +12,16 @@ use crate::marker::Marker;
 use crate::region_loop::RegionLoop;
 use crate::tempo::{TempoChange, TempoMap};
 
+/// The native file format's version. 1 (no field in the file): MIDI regions, notes,
+/// controllers, loops, tab bars and tempo marks in seconds. 2: those are in quarter-note
+/// beats (see [`MidiClip`]); older files are converted on load ([`Project::upgrade`]).
+pub const PROJECT_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Project {
+    /// Format version (see [`PROJECT_VERSION`]).
+    #[serde(default = "legacy_version")]
+    pub version: u32,
     pub name: String,
     pub tempo_bpm: f64,
     pub time_signature: (u32, u32),
@@ -60,6 +68,13 @@ pub struct Project {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub show_master_automation: bool,
     pub tracks: Vec<Track>,
+    /// Quantize recorded MIDI notes ("Quantize on record"; `None` = off). A setting, not an edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_quantize: Option<crate::quantize::Quantize>,
+}
+
+fn legacy_version() -> u32 {
+    1
 }
 
 fn default_click() -> f32 {
@@ -77,6 +92,7 @@ fn yes() -> bool {
 impl Default for Project {
     fn default() -> Self {
         Self {
+            version: PROJECT_VERSION,
             name: "Untitled".into(),
             tempo_bpm: 120.0,
             time_signature: (4, 4),
@@ -96,6 +112,7 @@ impl Default for Project {
             master_automation: Vec::new(),
             show_master_automation: false,
             tracks: Vec::new(),
+            record_quantize: None,
         }
     }
 }
@@ -109,18 +126,20 @@ impl Project {
     /// The song tempo playing at time `t`, from an unmuted region with tempo marks
     /// (e.g. an imported Guitar Pro song). `None` when only the project tempo applies.
     pub fn song_tempo_at(&self, t: f64) -> Option<f64> {
+        let q = self.tempo_map().quarters_at(t);
         self.tracks
             .iter()
             .filter(|tr| !tr.mute)
             .flat_map(|tr| &tr.midi_clips)
-            .filter(|c| !c.mute && !c.tempos.is_empty() && t >= c.position_secs && t < c.position_secs + c.length_secs)
-            .find_map(|c| c.tempo_at(t - c.position_secs))
+            .filter(|c| !c.mute && !c.tempos.is_empty() && q >= c.position_beats && q < c.end_beats())
+            .find_map(|c| c.tempo_at(q - c.position_beats))
     }
 
     /// End time (seconds) of the last audio or MIDI region in the project.
     pub fn length_secs(&self) -> f64 {
+        let map = self.tempo_map();
         let audio = self.tracks.iter().flat_map(|t| &t.clips).map(|c| c.position_secs + c.length_secs);
-        let midi = self.tracks.iter().flat_map(|t| &t.midi_clips).map(|c| c.position_secs + c.length_secs);
+        let midi = self.tracks.iter().flat_map(|t| &t.midi_clips).map(|c| c.end_secs(&map));
         audio.chain(midi).fold(0.0, f64::max)
     }
 }
@@ -377,20 +396,30 @@ impl Project {
     }
 }
 
-/// A MIDI region on the timeline. Note times are relative to the region start.
+/// A MIDI region on the timeline. Unlike an audio region it lives in musical time and so
+/// follows the tempo map (Logic stores ticks): its position and length, and its notes,
+/// controllers, loop, tab bars and tempo marks are in quarter-note beats (1.0 = a quarter
+/// note, whatever the time signature) — the position from the song start, the rest from the
+/// region start. Playback, renders and exports convert to seconds through the tempo map
+/// ([`MidiClip::secs_of`]), so a tempo change re-times the notes along with the bars.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MidiClip {
     pub name: String,
-    pub position_secs: f64,
-    pub length_secs: f64,
+    /// Quarter notes from the song start. (Files before version 2 hold seconds here; see
+    /// [`Project::upgrade`].)
+    #[serde(alias = "position_secs")]
+    pub position_beats: f64,
+    #[serde(alias = "length_secs")]
+    pub length_beats: f64,
     #[serde(default)]
     pub mute: bool,
     pub notes: Vec<Note>,
     /// Tablature layout when the region came from a tab (e.g. Guitar Pro import).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab: Option<TabLayout>,
-    /// The song's tempo changes when the region came from a score (e.g. Guitar Pro); the
-    /// notes are already timed by them. Shown so you can see what tempo is playing.
+    /// The song's own tempo changes when the region came from a score (Guitar Pro, a MIDI
+    /// file): the tempo it was written at. The notes play at the project's tempo map, which
+    /// "Use Song Tempo" makes follow these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tempos: Vec<TempoMark>,
     /// Pitch bend, CC and channel-pressure events, one lane per controller.
@@ -404,15 +433,39 @@ pub struct MidiClip {
 /// A tempo change inside a region, relative to the region start.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct TempoMark {
-    pub start_secs: f64,
+    /// Quarter notes from the region start.
+    #[serde(alias = "start_secs")]
+    pub start_beats: f64,
     /// Quarter notes per minute.
     pub bpm: f64,
 }
 
 impl MidiClip {
-    /// An empty region.
-    pub fn new(name: impl Into<String>, position_secs: f64, length_secs: f64) -> Self {
-        Self { name: name.into(), position_secs, length_secs, mute: false, notes: Vec::new(), tab: None, tempos: Vec::new(), controllers: Vec::new(), looped: None }
+    /// An empty region (position and length in quarter notes).
+    pub fn new(name: impl Into<String>, position_beats: f64, length_beats: f64) -> Self {
+        Self { name: name.into(), position_beats, length_beats, mute: false, notes: Vec::new(), tab: None, tempos: Vec::new(), controllers: Vec::new(), looped: None }
+    }
+
+    pub fn end_beats(&self) -> f64 {
+        self.position_beats + self.length_beats
+    }
+
+    /// Timeline seconds of `rel` quarter notes into the region.
+    pub fn secs_of(&self, map: &TempoMap, rel: f64) -> f64 {
+        map.secs_at(self.position_beats + rel)
+    }
+
+    /// Quarter notes into the region at timeline time `secs`.
+    pub fn beats_at(&self, map: &TempoMap, secs: f64) -> f64 {
+        map.quarters_at(secs) - self.position_beats
+    }
+
+    pub fn start_secs(&self, map: &TempoMap) -> f64 {
+        map.secs_at(self.position_beats)
+    }
+
+    pub fn end_secs(&self, map: &TempoMap) -> f64 {
+        map.secs_at(self.end_beats())
     }
 
     pub fn lane(&self, kind: Controller) -> Option<&ControllerLane> {
@@ -428,43 +481,57 @@ impl MidiClip {
         }
     }
 
-    /// Split at `cut` seconds into the region: notes crossing it are shortened on the left,
-    /// later ones move to the right part; tab bars, tempo marks and controllers are split
-    /// too (the right part starts with every controller's value at the cut). A looped
+    /// Split at `cut` quarter notes into the region: notes crossing it are shortened on the
+    /// left, later ones move to the right part; tab bars, tempo marks and controllers are
+    /// split too (the right part starts with every controller's value at the cut). A looped
     /// region's parts both keep looping (see `region_loop.rs`).
     pub fn split(&self, cut: f64) -> (MidiClip, MidiClip) {
         if let Some(l) = self.looped {
-            let left = MidiClip { length_secs: cut, ..self.clone() };
-            let right = MidiClip { position_secs: self.position_secs + cut, length_secs: self.length_secs - cut, ..self.rotated((l.phase_secs + cut).rem_euclid(l.len_secs)) };
+            let left = MidiClip { length_beats: cut, ..self.clone() };
+            let right = MidiClip { position_beats: self.position_beats + cut, length_beats: self.length_beats - cut, ..self.rotated((l.phase + cut).rem_euclid(l.len)) };
             return (left, right);
         }
-        let left_notes = self.notes.iter().filter(|n| n.start_secs < cut).map(|n| Note { length_secs: n.length_secs.min(cut - n.start_secs), ..*n }).collect();
-        let right_notes = self.notes.iter().filter(|n| n.start_secs >= cut).map(|n| Note { start_secs: n.start_secs - cut, ..*n }).collect();
+        let left_notes = self.notes.iter().filter(|n| n.start_beats < cut).map(|n| Note { length_beats: n.length_beats.min(cut - n.start_beats), ..*n }).collect();
+        let right_notes = self.notes.iter().filter(|n| n.start_beats >= cut).map(|n| Note { start_beats: n.start_beats - cut, ..*n }).collect();
         let mut left_tab = self.tab.clone();
         let right_tab = left_tab.as_mut().map(|t| t.split_off(cut));
         let mut left_ctrl = self.controllers.clone();
         let right_ctrl = left_ctrl.iter_mut().map(|l| l.split_off(cut)).filter(|l| !l.events.is_empty()).collect();
         left_ctrl.retain(|l| !l.events.is_empty());
-        let mut left = MidiClip { length_secs: cut, notes: left_notes, tab: left_tab, controllers: left_ctrl, ..self.clone() };
+        let mut left = MidiClip { length_beats: cut, notes: left_notes, tab: left_tab, controllers: left_ctrl, ..self.clone() };
         let tempos = left.split_tempos(cut);
-        let right = MidiClip { position_secs: self.position_secs + cut, length_secs: self.length_secs - cut, notes: right_notes, tab: right_tab, tempos, controllers: right_ctrl, ..self.clone() };
+        let right = MidiClip { position_beats: self.position_beats + cut, length_beats: self.length_beats - cut, notes: right_notes, tab: right_tab, tempos, controllers: right_ctrl, ..self.clone() };
         (left, right)
     }
 
-    /// The song tempo at `rel` seconds into the region, if the region carries tempo marks.
+    /// The song tempo at `rel` quarter notes into the region, if the region carries tempo marks.
     pub fn tempo_at(&self, rel: f64) -> Option<f64> {
-        let i = self.tempos.partition_point(|m| m.start_secs <= rel + 1e-9);
+        let i = self.tempos.partition_point(|m| m.start_beats <= rel + 1e-9);
         self.tempos.get(i.saturating_sub(1)).map(|m| m.bpm)
+    }
+
+    /// The song's own clock from the tempo marks: quarter notes into the region → seconds
+    /// at the song's tempo (`None` without marks).
+    pub fn song_map(&self) -> Option<TempoMap> {
+        let first = self.tempos.first()?;
+        let mut changes = Vec::new();
+        let (mut secs, mut q, mut bpm) = (0.0, 0.0, first.bpm);
+        for m in self.tempos.iter().skip(1) {
+            secs += (m.start_beats - q) * 60.0 / bpm;
+            (q, bpm) = (m.start_beats, m.bpm);
+            changes.push(TempoChange { at_secs: secs, bpm, time_signature: None });
+        }
+        Some(TempoMap::new(first.bpm, (4, 4), &changes))
     }
 
     /// Split the tempo marks at `cut`: marks from `cut` on move to the returned list,
     /// shifted to start at 0, led by the tempo in effect at the cut.
     pub fn split_tempos(&mut self, cut: f64) -> Vec<TempoMark> {
-        let mut right: Vec<TempoMark> = self.tempos.iter().filter(|m| m.start_secs >= cut - 1e-9).map(|m| TempoMark { start_secs: m.start_secs - cut, ..*m }).collect();
-        if let Some(bpm) = self.tempo_at(cut).filter(|_| right.first().is_none_or(|m| m.start_secs > 1e-9)) {
-            right.insert(0, TempoMark { start_secs: 0.0, bpm });
+        let mut right: Vec<TempoMark> = self.tempos.iter().filter(|m| m.start_beats >= cut - 1e-9).map(|m| TempoMark { start_beats: m.start_beats - cut, ..*m }).collect();
+        if let Some(bpm) = self.tempo_at(cut).filter(|_| right.first().is_none_or(|m| m.start_beats > 1e-9)) {
+            right.insert(0, TempoMark { start_beats: 0.0, bpm });
         }
-        self.tempos.retain(|m| m.start_secs < cut - 1e-9);
+        self.tempos.retain(|m| m.start_beats < cut - 1e-9);
         right
     }
 }
@@ -499,18 +566,19 @@ impl TabLayout {
             .min_by_key(|p| p.fret)
     }
 
-    /// Bars for the part of the region from `cut` seconds onwards, shifted to start at 0.
+    /// Bars for the part of the region from `cut` quarter notes onwards, shifted to start at 0.
     pub fn split_off(&mut self, cut: f64) -> TabLayout {
-        let right = self.bars.iter().filter(|b| b.start_secs >= cut - 1e-9).map(|b| TabBar { start_secs: b.start_secs - cut, ..b.clone() }).collect();
-        self.bars.retain(|b| b.start_secs < cut - 1e-9);
+        let right = self.bars.iter().filter(|b| b.start_beats >= cut - 1e-9).map(|b| TabBar { start_beats: b.start_beats - cut, ..b.clone() }).collect();
+        self.bars.retain(|b| b.start_beats < cut - 1e-9);
         TabLayout { tuning: self.tuning.clone(), capo: self.capo, bars: right }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TabBar {
-    /// Seconds from the region start.
-    pub start_secs: f64,
+    /// Quarter notes from the region start.
+    #[serde(alias = "start_secs")]
+    pub start_beats: f64,
     /// Bar number in the score (1-based).
     pub number: u32,
     pub numerator: u32,
@@ -528,9 +596,12 @@ pub struct TabPos {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct Note {
-    /// Seconds from the region start.
-    pub start_secs: f64,
-    pub length_secs: f64,
+    /// Quarter notes from the region start.
+    #[serde(alias = "start_secs")]
+    pub start_beats: f64,
+    /// In quarter notes.
+    #[serde(alias = "length_secs")]
+    pub length_beats: f64,
     /// MIDI note number (60 = middle C).
     pub pitch: u8,
     /// 1..=127
@@ -622,7 +693,7 @@ impl Clip {
     pub fn split(&self, cut: f64) -> (Clip, Clip) {
         if let Some(l) = self.looped {
             let mut left = Clip { length_secs: cut, fade_out: Fade::default(), ..self.clone() };
-            let looped = Some(RegionLoop { phase_secs: (l.phase_secs + cut).rem_euclid(l.len_secs), ..l });
+            let looped = Some(RegionLoop { phase: (l.phase + cut).rem_euclid(l.len), ..l });
             let mut right = Clip { position_secs: self.position_secs + cut, length_secs: self.length_secs - cut, fade_in: Fade::default(), looped, ..self.clone() };
             left.clamp_fades();
             right.clamp_fades();
@@ -806,7 +877,7 @@ mod tests {
     }
 
     fn note(pitch: u8, tab: Option<TabPos>) -> Note {
-        Note { start_secs: 0.0, length_secs: 1.0, pitch, velocity: 100, tab }
+        Note { start_beats: 0.0, length_beats: 1.0, pitch, velocity: 100, tab }
     }
 
     #[test]
@@ -890,13 +961,13 @@ mod tests {
     #[test]
     fn midi_split_partitions_controllers_and_old_files_load() {
         use crate::controller::ControllerEvent;
-        let ev = |t: f64, v: f32| ControllerEvent { time_secs: t, value: v };
+        let ev = |t: f64, v: f32| ControllerEvent { time_beats: t, value: v };
         let mut c = MidiClip::new("Riff", 1.0, 4.0);
-        c.notes = vec![note(60, None), Note { start_secs: 2.5, ..note(62, None) }];
+        c.notes = vec![note(60, None), Note { start_beats: 2.5, ..note(62, None) }];
         c.set_lane(ControllerLane::new(Controller::PitchBend, vec![ev(0.0, 0.0), ev(1.5, 0.5), ev(3.0, 0.0)]));
         c.set_lane(ControllerLane::new(Controller::MOD_WHEEL, vec![ev(3.0, 1.0)]));
         let (l, r) = c.split(2.0);
-        assert_eq!((l.length_secs, r.position_secs, r.length_secs), (2.0, 3.0, 2.0));
+        assert_eq!((l.length_beats, r.position_beats, r.length_beats), (2.0, 3.0, 2.0));
         assert_eq!((l.notes.len(), r.notes.len()), (1, 1));
         assert_eq!(l.controllers.len(), 1, "the mod wheel only moves later");
         assert_eq!(r.lane(Controller::PitchBend).unwrap().events, vec![ev(0.0, 0.5), ev(1.0, 0.0)], "carries the bend held at the cut");
@@ -914,10 +985,10 @@ mod tests {
 
     #[test]
     fn split_moves_later_bars_to_the_right_part() {
-        let bar = |s: f64, n: u32| TabBar { start_secs: s, number: n, numerator: 4, denominator: 4, section: None };
+        let bar = |s: f64, n: u32| TabBar { start_beats: s, number: n, numerator: 4, denominator: 4, section: None };
         let mut left = TabLayout { tuning: vec![40], capo: 0, bars: vec![bar(0.0, 1), bar(2.0, 2), bar(4.0, 3)] };
         let right = left.split_off(2.0);
         assert_eq!(left.bars.iter().map(|b| b.number).collect::<Vec<_>>(), vec![1]);
-        assert_eq!(right.bars.iter().map(|b| (b.number, b.start_secs)).collect::<Vec<_>>(), vec![(2, 0.0), (3, 2.0)]);
+        assert_eq!(right.bars.iter().map(|b| (b.number, b.start_beats)).collect::<Vec<_>>(), vec![(2, 0.0), (3, 2.0)]);
     }
 }

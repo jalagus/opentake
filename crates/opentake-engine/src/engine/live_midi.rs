@@ -11,7 +11,8 @@
 //! was earlier. Pitch bend, controllers (the sustain pedal too, like Logic: notes keep the
 //! length they were held) and channel pressure are recorded into the region's controller
 //! lanes the same way. There's no input monitoring switch: input always plays through the
-//! receiving track's instrument.
+//! receiving track's instrument. The take is timed in samples; on stop it becomes quarter
+//! notes through the tempo map (and, with "Quantize on record", snaps to its grid).
 
 use std::sync::atomic::Ordering;
 
@@ -20,7 +21,7 @@ use opentake_project::{Controller, ControllerEvent, ControllerLane, MidiClip, No
 use serde::Serialize;
 
 use super::Engine;
-use super::midi::MIN_NOTE_SECS;
+use super::midi::{MIN_NOTE_SECS, sorted};
 use super::recording::RecordPlacement;
 use crate::midi_input::{MidiMsg, MidiPortInfo, MidiSelection, port_names};
 use crate::mixer::{Command, MAX_MIDI_TARGETS, RecMidi};
@@ -75,17 +76,18 @@ pub(super) fn take_notes(events: &[RecMidi], cycle: Option<(i64, i64)>, end: i64
 }
 
 /// The controller lanes of a take for a region spanning timeline samples `from..to`: every
-/// controller message, at its time from the region start (earlier ones at the start, so the
-/// region opens with the value they left). Cycle passes merge; exact duplicates (an event at
-/// the same time, or repeating the value before it) are dropped.
-pub(super) fn take_controllers(events: &[RecMidi], from: i64, to: i64, sr: f64) -> Vec<ControllerLane> {
+/// controller message, at its time from the region start (`at` gives it for a sample time;
+/// earlier ones at the start, so the region opens with the value they left). Cycle passes
+/// merge; exact duplicates (an event at the same time, or repeating the value before it) are
+/// dropped.
+pub(super) fn take_controllers(events: &[RecMidi], from: i64, to: i64, at: impl Fn(i64) -> f64) -> Vec<ControllerLane> {
     let mut lanes: Vec<(Controller, Vec<ControllerEvent>)> = Vec::new();
     for e in events {
         let RecMidi::Msg(t, MidiMsg::Control(kind, raw)) = *e else { continue };
         if t >= to {
             continue;
         }
-        let ev = ControllerEvent { time_secs: (t.max(from) - from) as f64 / sr, value: kind.from_raw(raw) };
+        let ev = ControllerEvent { time_beats: at(t.max(from)), value: kind.from_raw(raw) };
         match lanes.iter_mut().find(|l| l.0 == kind) {
             Some(l) => l.1.push(ev),
             None => lanes.push((kind, vec![ev])),
@@ -114,6 +116,9 @@ pub struct RecordedMidi {
     pub name: String,
     pub position_secs: f64,
     pub length_secs: f64,
+    /// The region in quarter notes (as it's stored).
+    pub position_beats: f64,
+    pub length_beats: f64,
     pub notes: usize,
     /// Controller events (pitch bend, CCs, pressure) recorded.
     pub controller_events: usize,
@@ -242,7 +247,7 @@ impl Engine {
         }
     }
 
-    /// The notes recorded so far (start and length in timeline seconds), to draw while
+    /// The notes recorded so far (in quarter notes from the song start), to draw while
     /// recording.
     pub fn recording_notes(&mut self) -> Vec<Note> {
         self.drain_midi_take();
@@ -250,9 +255,11 @@ impl Engine {
         let sr = self.sample_rate() as f64;
         let now = self.shared.position.load(Ordering::Relaxed) as i64;
         let cycle = self.project.loop_enabled.then_some(((self.project.loop_start_secs * sr) as i64, (self.project.loop_end_secs * sr) as i64));
+        let map = self.project.tempo_map();
+        let q = |samples: i64| map.quarters_at(samples.max(0) as f64 / sr);
         take_notes(&take.events, cycle, now, 1)
             .iter()
-            .map(|n| Note { start_secs: n.start.max(0) as f64 / sr, length_secs: (n.end - n.start.max(0)).max(1) as f64 / sr, pitch: n.pitch, velocity: n.velocity, tab: None })
+            .map(|n| Note { start_beats: q(n.start), length_beats: q(n.end) - q(n.start), pitch: n.pitch, velocity: n.velocity, tab: None })
             .collect()
     }
 
@@ -270,13 +277,21 @@ impl Engine {
         };
         let from = from.max(0);
         let secs = |samples: i64| samples as f64 / sr;
-        let notes: Vec<Note> = notes
+        // Samples to quarter notes from the region start, through the tempo map.
+        let map = self.project.tempo_map();
+        let start_q = map.quarters_at(secs(from));
+        let q = |samples: i64| map.quarters_at(secs(samples)) - start_q;
+        let mut notes: Vec<Note> = notes
             .iter()
             .map(|n| (n.start.max(from), n.end.min(to), n))
             .filter(|(start, end, _)| end - start >= min_len)
-            .map(|(start, end, n)| Note { start_secs: secs(start - from), length_secs: secs(end - start), pitch: n.pitch, velocity: n.velocity.max(1), tab: None })
+            .map(|(start, end, n)| Note { start_beats: q(start), length_beats: q(end) - q(start), pitch: n.pitch, velocity: n.velocity.max(1), tab: None })
             .collect();
-        let controllers = take_controllers(&take.events, from, to, sr);
+        if let Some(quantize) = self.project.record_quantize {
+            quantize.apply(&mut notes, start_q, &map, |_| true);
+            notes = sorted(notes);
+        }
+        let controllers = take_controllers(&take.events, from, to, q);
         let controller_events = controllers.iter().map(|l| l.events.len()).sum();
         if notes.is_empty() && controller_events == 0 {
             return Ok(Vec::new());
@@ -285,11 +300,12 @@ impl Engine {
         for id in take.tracks {
             let Some(index) = self.project.track_by_id(id) else { continue };
             let name = self.project.tracks[index].name.clone();
-            let clip = MidiClip { notes: notes.clone(), controllers: controllers.clone(), ..MidiClip::new(name.clone(), secs(from), secs(to - from)) };
+            let clip = MidiClip { notes: notes.clone(), controllers: controllers.clone(), ..MidiClip::new(name.clone(), start_q, q(to)) };
             self.project.tracks[index].midi_clips.push(clip);
             self.resync_midi(index)?;
             let region = self.project.tracks[index].midi_clips.len() - 1;
-            added.push(RecordedMidi { track: index, region, name, position_secs: secs(from), length_secs: secs(to - from), notes: notes.len(), controller_events });
+            let (position_secs, length_secs) = (secs(from), secs(to - from));
+            added.push(RecordedMidi { track: index, region, name, position_secs, length_secs, position_beats: start_q, length_beats: q(to), notes: notes.len(), controller_events });
         }
         Ok(added)
     }
@@ -331,8 +347,8 @@ mod tests {
         let cc = |t, kind, v| RecMidi::Msg(t, MidiMsg::Control(kind, v));
         let bend = Controller::PitchBend;
         let events = [cc(500, bend, 9000), cc(900, bend, 10000), on(1000, 60), cc(1000, bend, 12000), cc(1500, bend, 12000), cc(1500, Controller::SUSTAIN, 127), cc(1700, bend, 8192), cc(3000, bend, 0)];
-        let lanes = take_controllers(&events, 1000, 2000, 1000.0);
-        let ev = |t: f64, v: f32| ControllerEvent { time_secs: t, value: v };
+        let lanes = take_controllers(&events, 1000, 2000, |t| (t - 1000) as f64 / 1000.0);
+        let ev = |t: f64, v: f32| ControllerEvent { time_beats: t, value: v };
         assert_eq!(lanes.len(), 2);
         assert_eq!(lanes[0].kind, bend);
         // Before the region: the latest lands at its start, then is overwritten by the event
@@ -454,6 +470,8 @@ mod tests {
     }
 
     const MS: f64 = 0.0005;
+    /// Half a millisecond in quarter notes at 120 bpm.
+    const QMS: f64 = 2.0 * MS;
 
     #[test]
     fn recording_places_notes_where_they_were_heard() {
@@ -475,14 +493,15 @@ mod tests {
         let r = stop(&mut e, &mut mixer);
         assert_eq!(r.midi_regions.len(), 2);
         let c = &e.project().tracks[0].midi_clips[0];
-        assert_eq!((c.position_secs, c.notes.len()), (1.0, 2));
+        // In quarter notes: two to the second at 120 bpm.
+        assert_eq!((c.position_beats, c.notes.len()), (2.0, 2));
         let n = c.notes[0];
-        assert!((n.start_secs - 0.995).abs() < MS && (n.length_secs - 0.5).abs() < MS, "{n:?}");
+        assert!((n.start_beats - 1.99).abs() < QMS && (n.length_beats - 1.0).abs() < QMS, "{n:?}");
         let held = c.notes[1];
         // The stop lands wherever the "device" thread was when it arrived: a callback or two
         // after 3.0 s on a slow machine.
-        assert!((held.start_secs - 1.495).abs() < MS && (1.995 - MS..1.995 + 0.03).contains(&c.length_secs), "{held:?} {c:?}");
-        assert!((held.start_secs + held.length_secs - c.length_secs).abs() < 1e-9, "the held note ends at the stop");
+        assert!((held.start_beats - 2.99).abs() < QMS && (3.99 - QMS..3.99 + 0.06).contains(&c.length_beats), "{held:?} {c:?}");
+        assert!((held.start_beats + held.length_beats - c.length_beats).abs() < 1e-9, "the held note ends at the stop");
         assert_eq!(e.project().tracks[1].midi_clips[0].notes, c.notes);
 
         // One undo step takes both regions away and the playhead back to the record point.
@@ -512,12 +531,13 @@ mod tests {
         let r = stop(&mut e, &mut mixer);
         assert_eq!((r.midi_regions[0].notes, r.midi_regions[0].controller_events), (1, 5));
         let c = &e.project().tracks[0].midi_clips[0];
-        let lane = |k| c.lane(k).unwrap().events.iter().map(|e| ((e.time_secs * 1000.0).round(), e.value)).collect::<Vec<_>>();
+        // In milliseconds (a beat is 500 ms).
+        let lane = |k| c.lane(k).unwrap().events.iter().map(|e| ((e.time_beats * 500.0).round(), e.value)).collect::<Vec<_>>();
         // Placed like the notes: 0.5 s less half a callback.
         assert_eq!(lane(Controller::PitchBend), vec![(495.0, Controller::PitchBend.from_raw(0x60 << 7)), (695.0, 0.0)]);
         assert_eq!(lane(Controller::MOD_WHEEL), vec![(595.0, 90.0 / 127.0)]);
         assert_eq!(lane(Controller::SUSTAIN), vec![(495.0, 1.0), (695.0, 0.0)]);
-        assert!((c.notes[0].length_secs - 0.1).abs() < MS, "the pedal doesn't lengthen the note: {:?}", c.notes[0]);
+        assert!((c.notes[0].length_beats - 0.2).abs() < QMS, "the pedal doesn't lengthen the note: {:?}", c.notes[0]);
     }
 
     #[test]
@@ -534,7 +554,7 @@ mod tests {
         stop(&mut e, &mut mixer);
         let n = e.project().tracks[0].midi_clips[0].notes[0];
         // 0.5 s less half a callback (5 ms) and the output latency (20 ms).
-        assert!((n.start_secs - 0.475).abs() < MS, "{n:?}");
+        assert!((n.start_beats - 0.95).abs() < QMS, "{n:?}");
     }
 
     #[test]
@@ -558,11 +578,11 @@ mod tests {
         let r = stop(&mut e, &mut mixer);
         assert_eq!(r.midi_regions.len(), 1);
         let c = &e.project().tracks[0].midi_clips[0];
-        assert_eq!((c.position_secs, c.length_secs), (0.5, 1.5));
-        let notes: Vec<(u8, f64)> = c.notes.iter().map(|n| (n.pitch, n.start_secs)).collect();
+        assert_eq!((c.position_beats, c.length_beats), (1.0, 3.0));
+        let notes: Vec<(u8, f64)> = c.notes.iter().map(|n| (n.pitch, n.start_beats)).collect();
         assert_eq!(notes.len(), 2);
-        assert!(notes[0].0 == 64 && (notes[0].1 - 0.645).abs() < MS, "both passes, relative to the region start: {notes:?}");
-        assert!(notes[1].0 == 60 && (notes[1].1 - 0.745).abs() < MS, "{notes:?}");
+        assert!(notes[0].0 == 64 && (notes[0].1 - 1.29).abs() < QMS, "both passes, relative to the region start: {notes:?}");
+        assert!(notes[1].0 == 60 && (notes[1].1 - 1.49).abs() < QMS, "{notes:?}");
     }
 
     #[test]
@@ -618,5 +638,31 @@ mod tests {
         let take = MidiTake { tracks: vec![id], events: vec![on(sr + 4800, 60), off(sr + 9600, 60), RecMidi::End(sr + 100)] };
         let added = e.add_midi_take(take, &p).unwrap();
         assert_eq!((added[0].position_secs, added[0].length_secs, added[0].notes), (1.0, 1.0, 1));
+    }
+
+    #[test]
+    fn a_take_becomes_beats_through_the_tempo_map_and_can_snap_to_the_grid() {
+        let mut e = Engine::new();
+        e.add_instrument_track("Keys", "synth").unwrap();
+        // 120 bpm, then 60 from 1.5 s (beat 3).
+        e.set_tempo_changes(vec![opentake_project::TempoChange { at_secs: 1.5, bpm: 60.0, time_signature: None }], None).unwrap();
+        let id = e.project().tracks[0].id;
+        let sr = 48_000;
+        let p = RecordPlacement { start: sr, origin: sr, latency: 0, cycle: None };
+        // Played 1.3..2.0 s (beats 2.6..3.5), stopped at 2.5 s (beat 4).
+        let take = || MidiTake { tracks: vec![id], events: vec![on(62_400, 60), off(96_000, 60), RecMidi::End(120_000)] };
+        let added = e.add_midi_take(take(), &p).unwrap();
+        assert_eq!((added[0].position_beats, added[0].length_beats), (2.0, 2.0));
+        let n = e.project().tracks[0].midi_clips[0].notes[0];
+        assert!((n.start_beats - 0.6).abs() < 1e-9 && (n.length_beats - 0.9).abs() < 1e-9, "{n:?}");
+        // Back in seconds through the map: where it was played.
+        let c = &e.project().tracks[0].midi_clips[0];
+        assert!((c.secs_of(&e.project().tempo_map(), n.start_beats) - 1.3).abs() < 1e-9);
+
+        // Quantize on record: the start snaps to the beat, the length stays.
+        e.set_record_quantize(Some(opentake_project::Quantize::new(opentake_project::QuantizeGrid::Quarter)));
+        e.add_midi_take(take(), &p).unwrap();
+        let n = e.project().tracks[0].midi_clips[1].notes[0];
+        assert!((n.start_beats - 1.0).abs() < 1e-9 && (n.length_beats - 0.9).abs() < 1e-9, "{n:?}");
     }
 }

@@ -122,8 +122,9 @@ impl<'a> RegionView<'a> {
     }
 }
 
-/// All regions of a track (audio first, then MIDI).
-pub(crate) fn regions_of(track: &Track, ti: usize) -> impl Iterator<Item = RegionView<'_>> {
+/// All regions of a track (audio first, then MIDI), placed in seconds (MIDI regions, stored
+/// in quarter notes, through `map`).
+pub(crate) fn regions_of<'a>(track: &'a Track, ti: usize, map: &TempoMap) -> impl Iterator<Item = RegionView<'a>> {
     let audio = track.clips.iter().enumerate().map(move |(i, c)| RegionView {
         r: RegionRef::audio(ti, i),
         name: &c.name,
@@ -132,20 +133,21 @@ pub(crate) fn regions_of(track: &Track, ti: usize) -> impl Iterator<Item = Regio
         mute: c.mute,
         content: Content::Audio(c),
     });
-    let midi = track.midi_clips.iter().enumerate().map(move |(i, c)| RegionView {
-        r: RegionRef::midi(ti, i),
-        name: &c.name,
-        position: c.position_secs,
-        length: c.length_secs,
-        mute: c.mute,
-        content: Content::Midi(c),
-    });
+    let midi: Vec<RegionView<'a>> = track
+        .midi_clips
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let (start, end) = (c.start_secs(map), c.end_secs(map));
+            RegionView { r: RegionRef::midi(ti, i), name: &c.name, position: start, length: end - start, mute: c.mute, content: Content::Midi(c) }
+        })
+        .collect();
     audio.chain(midi)
 }
 
 pub(crate) fn region_view(project: &Project, r: RegionRef) -> Option<RegionView<'_>> {
     let track = project.tracks.get(r.track)?;
-    regions_of(track, r.track).find(|v| v.r == r)
+    regions_of(track, r.track, &project.tempo_map()).find(|v| v.r == r)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -420,14 +422,6 @@ pub fn grid_at(mode: SnapMode, map: &TempoMap, t: f64, px_per_sec: f32) -> Optio
     })
 }
 
-/// Length in seconds of one grid step at `t`.
-pub fn grid_step_secs(grid: Grid, map: &TempoMap, t: f64) -> f64 {
-    match grid {
-        Grid::Bar => map.bar_secs_at(t.max(0.0)),
-        Grid::Quarters(q) => q * 60.0 / map.tempo_at(t.max(0.0)),
-    }
-}
-
 /// Snap `t` to the grid (unless snapping is off or Alt is held).
 pub fn snap_to(mode: SnapMode, ui: &egui::Ui, t: f64, project: &Project, px_per_sec: f32) -> f64 {
     let bypass = ui.input(|i| i.modifiers.alt);
@@ -586,7 +580,7 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
                 }
                 // The fades each audio region plays with, crossfades over overlaps included.
                 let fades = effective_fades(&track.clips);
-                for view in regions_of(track, ti) {
+                for view in regions_of(track, ti, &map) {
                     let f = if view.r.kind == RegionKind::Audio { fades.get(view.r.index).copied() } else { None };
                     if let Some(e) = region(app, ui, &painter, rect, view, f, snap) {
                         edit = Some(e);
@@ -653,7 +647,7 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
             if row.intersection(area.y_range()).span() <= 0.0 {
                 continue;
             }
-            for v in regions_of(track, ti) {
+            for v in regions_of(track, ti, &map) {
                 let span = Rangef::new(app.view.x_of(v.position), app.view.x_of(v.end()));
                 if span.intersection(area.x_range()).span() > 0.0 && !selection.contains(&v.r) {
                     selection.push(v.r);
@@ -740,7 +734,7 @@ fn handle_zoom_scroll(app: &mut DawApp, ui: &egui::Ui) {
 /// Draws one region and handles select / move / copy / trim / split.
 /// What an armed track is recording right now: a red region growing with the playhead (a
 /// cycle recording restarts it at the cycle start on every pass), with the notes played so
-/// far on an instrument track (timeline seconds).
+/// far on an instrument track (quarter notes from the song start).
 #[allow(clippy::too_many_arguments)]
 fn recording_region(painter: &Painter, row: Rect, view: &View, start: f64, playhead: f64, project: &Project, notes: &[Note], ui: &egui::Ui) {
     let start = if playhead < start && project.loop_enabled { project.loop_start_secs } else { start };
@@ -765,9 +759,10 @@ fn recording_region(painter: &Painter, row: Rect, view: &View, start: f64, playh
         let (lo, hi) = (lo.saturating_sub(2) as f32, hi.saturating_add(2) as f32);
         let h = (body.height() / (hi - lo + 1.0)).clamp(1.5, 5.0);
         let p = painter.with_clip_rect(body);
+        let map = project.tempo_map();
         for n in notes {
             let y = body.bottom() - (n.pitch as f32 - lo + 0.5) / (hi - lo + 1.0) * body.height();
-            let (x0, x1) = (view.x_of(n.start_secs), view.x_of((n.start_secs + n.length_secs).min(playhead)));
+            let (x0, x1) = (view.x_of(map.secs_at(n.start_beats)), view.x_of(map.secs_at(n.start_beats + n.length_beats).min(playhead)));
             p.rect_filled(Rect::from_min_max(pos2(x0, y - h / 2.0), pos2(x1.max(x0 + 2.0), y + h / 2.0)), 1.0, Color32::from_white_alpha(210));
         }
     }
@@ -871,7 +866,8 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
             _ => *fo = Fade { secs: d.fade, curve: c.fade_out.curve },
         }
     }
-    let painted = |start: f64, end: f64, mode: Option<DragMode>| Painted { view, start, end, mode, wf, waveforms: &snap.waveforms, fades: shown_fades };
+    let map = project.tempo_map();
+    let painted = |start: f64, end: f64, mode: Option<DragMode>| Painted { view, start, end, mode, wf, waveforms: &snap.waveforms, fades: shown_fades, map: &map };
     if copying {
         let orig = Rect::from_min_max(pos2(app.view.x_of(view.position), rect.top()), pos2(app.view.x_of(view.end()), rect.bottom()));
         paint_region(painter, row, orig, painted(view.position, view.end(), None), color, &app.view, RegionLook::default());
@@ -1043,7 +1039,7 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
                 DragMode::Move => (view.position, view.end()),
                 DragMode::TrimStart => {
                     // A looped region's start can't pass its loop's end.
-                    let loop_end = view.looped().map_or(f64::INFINITY, |l| orig_start + l.len_secs - MIN_REGION_SECS);
+                    let loop_end = view.looped().map_or(f64::INFINITY, |l| orig_start + l.len - MIN_REGION_SECS);
                     let s = snap_time(app, ui, t, project).max(source_start).max(0.0).min(orig_end - MIN_REGION_SECS).min(loop_end);
                     (s, orig_end)
                 }
@@ -1055,7 +1051,7 @@ fn region(app: &mut DawApp, ui: &mut egui::Ui, painter: &Painter, row: Rect, vie
                     let e = snap_time(app, ui, t, project).clamp(orig_start + min_len.max(MIN_REGION_SECS), orig_start + max_len);
                     (orig_start, e)
                 }
-                DragMode::LoopEnd => (orig_start, loops::drag_end(view, snap_time(app, ui, t, project))),
+                DragMode::LoopEnd => (orig_start, loops::drag_end(view, snap_time(app, ui, t, project), &project.tempo_map())),
                 // Fades stay within what the other fade leaves (unsnapped: they're often short).
                 DragMode::FadeIn | DragMode::FadeOut => {
                     let (fade_in, fade_out) = audio.map_or((0.0, 0.0), |c| (c.fade_in.secs, c.fade_out.secs));
@@ -1113,6 +1109,13 @@ fn region_context_menu(app: &mut DawApp, ui: &mut egui::Ui, view: RegionView, sn
     if r.kind == RegionKind::Midi && !many && ui.button("Open in Piano Roll").clicked() {
         app.open_piano_roll(r);
         ui.close();
+    }
+    if group.iter().any(|g| g.kind == RegionKind::Midi) {
+        let label = format!("Quantize ({})", app.piano.quantize.label());
+        if ui.add(egui::Button::new(label).shortcut_text("Q")).on_hover_text("Move every note of the selected MIDI regions to the grid (settings in the piano roll)").clicked() {
+            app.quantize_regions(&snap.project, &group);
+            ui.close();
+        }
     }
     if let (Some((takes, active)), Some(c), false) = (view.takes(), view.audio(), many) {
         widgets::section(ui, "Takes");
@@ -1264,6 +1267,7 @@ struct Painted<'a> {
     waveforms: &'a std::collections::HashMap<std::path::PathBuf, Arc<Waveform>>,
     /// An audio region's effective (fade-in, fade-out).
     fades: Option<(Fade, Fade)>,
+    map: &'a TempoMap,
 }
 
 fn paint_region(painter: &Painter, row: Rect, rect: Rect, p: Painted, color: Color32, view: &View, look: RegionLook) {
@@ -1321,10 +1325,12 @@ fn paint_region(painter: &Painter, row: Rect, rect: Rect, p: Painted, color: Col
             loops::notches(painter, rect, view, p.start, &passes, color);
         }
         Content::Midi(c) => {
-            let passes = loops::shown_midi_passes(c, &p);
-            loops::tint_repeats(painter, rect, view, p.start, &passes);
-            draw_note_preview(painter, body, row, view, c, p.start, &passes, ink);
-            loops::notches(painter, rect, view, p.start, &passes, color);
+            // Passes in quarter notes from where the region's drawn starting, and in seconds.
+            let (start_q, passes) = loops::shown_midi_passes(c, &p);
+            let secs = loops::passes_in_secs(&passes, start_q, p.map);
+            loops::tint_repeats(painter, rect, view, p.start, &secs);
+            draw_note_preview(painter, body, row, view, c, (start_q, p.map), &passes, ink);
+            loops::notches(painter, rect, view, p.start, &secs, color);
         }
     }
     let outline = if look.selected || look.lifted {
@@ -1343,9 +1349,10 @@ fn paint_region(painter: &Painter, row: Rect, rect: Rect, p: Painted, color: Col
     }
 }
 
-/// Miniature piano roll inside a MIDI region, once per loop pass (repeats fainter).
+/// Miniature piano roll inside a MIDI region, once per loop pass (repeats fainter). The
+/// passes are in quarter notes from `start` (where the region's drawn, and the tempo map).
 #[allow(clippy::too_many_arguments)]
-fn draw_note_preview(painter: &Painter, rect: Rect, clip_to: Rect, view: &View, clip: &MidiClip, start: f64, passes: &[opentake_engine::project::LoopPass], color: Color32) {
+fn draw_note_preview(painter: &Painter, rect: Rect, clip_to: Rect, view: &View, clip: &MidiClip, (start, map): (f64, &TempoMap), passes: &[opentake_engine::project::LoopPass], color: Color32) {
     if clip.notes.is_empty() || rect.height() < 6.0 {
         return;
     }
@@ -1356,15 +1363,16 @@ fn draw_note_preview(painter: &Painter, rect: Rect, clip_to: Rect, view: &View, 
     let row_h = (rect.height() - 4.0) / (span + 1.0);
     let painter = painter.with_clip_rect(rect.intersect(clip_to));
     let visible = painter.clip_rect().x_range();
+    let x = |q: f64| view.x_of(map.secs_at(q));
     for p in passes {
         let (from, to, at) = (p.from, p.from + p.len, start + p.at - p.from);
-        if view.x_of(start + p.at) > visible.max || view.x_of(start + p.at + p.len) < visible.min {
+        if x(start + p.at) > visible.max || x(start + p.at + p.len) < visible.min {
             continue;
         }
         let color = if p.index > 0 { theme::with_alpha(color, 150) } else { color };
-        for n in clip.notes.iter().filter(|n| n.start_secs >= from - 1e-9 && n.start_secs < to - 1e-9) {
-            let x0 = view.x_of(at + n.start_secs);
-            let x1 = view.x_of(at + (n.start_secs + n.length_secs).min(to)).max(x0 + 2.0);
+        for n in clip.notes.iter().filter(|n| n.start_beats >= from - 1e-9 && n.start_beats < to - 1e-9) {
+            let x0 = x(at + n.start_beats);
+            let x1 = x(at + (n.start_beats + n.length_beats).min(to)).max(x0 + 2.0);
             let y = rect.bottom() - 2.0 - (n.pitch as f32 - base + 1.0) * row_h;
             painter.rect_filled(Rect::from_min_max(pos2(x0, y), pos2(x1, y + row_h.max(2.0))), 1.0, color);
         }
@@ -1617,13 +1625,14 @@ fn draw_ruler(painter: &Painter, rect: Rect, view: &View, map: &TempoMap) {
 
 /// Imported songs' tempo marks (absolute seconds, bpm) from unmuted regions, merged.
 fn song_tempo_marks(project: &Project) -> Vec<(f64, f64)> {
+    let map = project.tempo_map();
     let mut marks: Vec<(f64, f64)> = project
         .tracks
         .iter()
         .filter(|t| !t.mute)
         .flat_map(|t| &t.midi_clips)
         .filter(|c| !c.mute)
-        .flat_map(|c| c.tempos.iter().filter(|m| m.start_secs < c.length_secs).map(|m| (c.position_secs + m.start_secs, m.bpm)))
+        .flat_map(|c| c.tempos.iter().filter(|m| m.start_beats < c.length_beats).map(|m| (c.secs_of(&map, m.start_beats), m.bpm)))
         .collect();
     marks.sort_by(|a, b| a.0.total_cmp(&b.0));
     marks.dedup_by(|b, a| (b.0 - a.0).abs() < 1e-3 && (b.1 - a.1).abs() < 1e-6);
@@ -2458,9 +2467,6 @@ mod tests {
         assert_eq!(grid_at(SnapMode::Off, &map, 1.0, 50.0), None);
         assert_eq!(grid_at(SnapMode::Beat, &map, 1.0, 50.0), Some(Grid::Quarters(1.0)));
         assert_eq!(grid_at(SnapMode::Beat, &map, 5.0, 50.0), Some(Grid::Quarters(0.5)), "eighth-note beats in 6/8");
-        assert_eq!(grid_step_secs(Grid::Bar, &map, 1.0), 2.0);
-        assert_eq!(grid_step_secs(Grid::Bar, &map, 5.0), 3.0, "6/8 at 60 bpm");
-        assert_eq!(grid_step_secs(Grid::Quarters(0.25), &map, 5.0), 0.25);
         assert_eq!(map.snap(5.6, Grid::Quarters(0.5)), 5.5);
         // Smart picks coarser grids when zoomed out.
         assert_eq!(grid_at(SnapMode::Smart, &map, 1.0, 2.0), Some(Grid::Bar));

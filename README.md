@@ -18,6 +18,7 @@ you watch the changes appear live — and undo anything you don't like.
 
 - 🎙️ Multitrack recording from any audio interface (CoreAudio, WASAPI, ALSA/JACK via cpal), latency-compensated with a built-in loopback measurement
 - 🎹 Instrument tracks, piano roll, a built-in synth and GM drum kit; VST3 instruments and effects, plus Audio Units on macOS
+- 🎼 MIDI in musical time: regions and notes are stored in beats and follow the tempo map, with quantize (straight and triplet grids, strength, swing, note ends, quantize on record)
 - 🎚️ Pitch bend, mod wheel and any CC or channel pressure: drawn in the piano roll's MIDI Draw lane, recorded from a keyboard, chased when playback starts mid-region
 - 🎛️ Built-in EQ, compressor, multiband compressor, limiter, delay, reverb, gate, de-esser, chorus and phaser on any track or the master bus; plug-in delay compensation
 - 🪟 Plug-ins' own editor windows (VST3 on macOS and Windows, Audio Units): what you turn there is undoable and writes automation
@@ -36,7 +37,7 @@ you watch the changes appear live — and undo anything you don't like.
   MIDI repeats, sample-exact, up to there; L loops up to the next region
 - 🎚️ Full mixer, metronome, undo/redo for everything
 - 💾 Export the mix and stems to WAV or FLAC, faster than real time
-- 🤖 MCP server (stdio or HTTP) with 101 tools — the agent and you share one session
+- 🤖 MCP server (stdio or HTTP) with 103 tools — the agent and you share one session
 - 📂 Its own `.otp` project files (double-click to open), Reaper `.rpp` and DAWproject (Bitwig, Studio One, Cubase) projects
 - 🔀 Imports Ableton Live sets (`.als`), Ardour sessions, and Logic Pro projects exported as Final Cut Pro XML
 - 🎸 Imports Guitar Pro 7/8 songs (`.gp`) as MIDI tracks for VST instruments or the built-in synth, with the tablature shown in sync with the timeline
@@ -129,6 +130,16 @@ agent.
   next marker. Guitar Pro sections and MIDI file markers become markers on import; Reaper
   (`MARKER`; regions as a marker at their start), DAWproject markers and Ableton locators too.
 - **MIDI**: a built-in synth and drum kit or any VST3 / Audio Unit instrument, edited in the piano roll.
+  MIDI regions live in beats (quarter notes, like Logic's ticks): change the tempo or add a tempo
+  change and they stay on their bars, notes and controllers re-timed with them (undo too).
+  Projects saved before this are converted on load, so they play exactly as they did.
+- **Quantize**: the piano roll toolbar's grid menu (Smart = the snap value, 1/4, 1/8, 1/16, 1/32,
+  1/4T, 1/8T, 1/16T), the **Quantize** button and **Q** quantize the selected notes, or all of
+  them; **Options** sets the strength (50 % moves notes halfway), swing (every second line of
+  a straight grid later, 100 % = triplet feel), quantizing note ends, and **Quantize on record**
+  (recorded MIDI snaps to the grid when you stop). With MIDI regions selected in the
+  arrangement, **Q**, the region menu's **Quantize** and the inspector's **Quantize · Apply**
+  quantize all their notes. One undo step each.
 - **Controllers (MIDI Draw)**: the piano roll's **MIDI Draw** button opens a lane under the notes
   for pitch bend, mod wheel (CC1), volume (CC7), expression (CC11), sustain (CC64), pan (CC10),
   channel pressure or any CC number. Drag on empty space to draw a curve with the pencil, click
@@ -280,13 +291,20 @@ of the tool calls behind them):
 `scan_plugins`, `insert_plugin`, `remove_plugin`, `insert_master_plugin`, `remove_master_plugin`, `set_plugin_bypass`, `open_plugin_editor`,
 `list_plugin_params`, `set_plugin_param`, `set_sidechain`, `save_plugin_preset`, `load_plugin_preset` (`"eq"` inserts the built-in EQ; `master: true` addresses the master bus; presets are VST3 `.vstpreset` files),
 `list_instruments`, `add_instrument_track`, `set_instrument`, `list_instrument_params`, `set_instrument_param`,
-`add_midi_clip`, `set_midi_notes`, `add_midi_notes`, `get_midi_controllers`, `set_midi_controllers`, `update_midi_clip`, `copy_midi_clip`, `remove_midi_clip`,
+`add_midi_clip`, `set_midi_notes`, `add_midi_notes`, `quantize_midi`, `set_record_quantize`, `get_midi_controllers`, `set_midi_controllers`, `update_midi_clip`, `copy_midi_clip`, `remove_midi_clip`,
 `inspect_guitar_pro`, `import_guitar_pro`, `inspect_midi_file`, `import_midi_file`, `export_midi_file`,
 `list_automation_params`, `get_automation`, `add_automation_lane`, `set_automation_points`, `clear_automation`,
 `set_automation_lane`, `remove_automation_lane`.
 
+MIDI times: notes, controllers and regions take beats (`start_beats`, `length_beats`,
+`position_beats`, `time_beats`: quarter notes) or seconds (`start_secs`... converted through the
+tempo map where they land), and `add_midi_clip` also a `bar` and `length_bars`; `get_project`,
+`get_midi_notes` and `get_midi_controllers` show both, plus each note's bar and beat.
+`quantize_midi` takes a grid (`1/16`, `1/8T`...), strength and swing (percent), `ends`, a `window`
+and optional note indices.
+
 Controllers: `set_midi_controllers` sets a MIDI region's pitch bend, CC or channel-pressure
-events (seconds from the region start; CC 0..127, pitch bend -8192..8191, or semitones with
+events (beats or seconds from the region start; CC 0..127, pitch bend -8192..8191, or semitones with
 `bend_range`), replacing the lane or adding to it; `get_midi_controllers` reads them back and
 `get_project` lists each region's lanes with their event counts.
 
@@ -398,9 +416,12 @@ automation other than tempo, sends/returns and fades aren't imported.
   mod wheel and pedal off, expression full) before its first event; volume and other CCs
   without a neutral value keep what they had. Live MIDI plays one audio buffer late (constant, no jitter) and
   through any plug-in delay compensation. MIDI recording merges cycle passes (no MIDI take
-  folders, no replace mode or quantize-on-input yet); a key held over the cycle end ends there.
-  Notes are in seconds, so changing the tempo map doesn't stretch existing regions (they keep
-  their real-time positions).
+  folders, no replace mode); a key held over the cycle end ends there. Quantize is
+  destructive (no non-destructive region Quantize parameter like Logic's, no groove templates).
+- Audio doesn't follow the tempo: audio regions, automation, markers and the tempo changes
+  themselves stay in seconds, so a tempo change moves MIDI against the audio (Logic's Flex
+  "follow tempo" for audio is a next step). A Guitar Pro or MIDI file imported without its
+  tempo plays its notes at the project's tempo; "Use Song Tempo" adopts the song's map.
 - Takes: one comp per folder (no alternative comps to switch between), and a new cycle pass
   replaces it; a region fade longer than the first or last comp segment is shortened to it.
 - Tempo map: steps only (no gradual tempo ramps); Reaper ramps are imported as steps.

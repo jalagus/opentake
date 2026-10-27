@@ -1,11 +1,15 @@
 //! Piano roll editor for the selected MIDI region, with a controller lane under the notes
 //! (Logic's MIDI Draw): pitch bend, mod wheel and any other CC or channel pressure.
+//!
+//! The grid shares the arrangement's time axis (seconds), while notes and controllers are in
+//! quarter notes from the region start: [`Geo`] converts through the tempo map, so notes sit
+//! on the bars whatever the tempo does.
 
-use opentake_engine::project::{Controller, ControllerEvent, ControllerLane, MidiClip, Note, Project};
+use opentake_engine::project::{Controller, ControllerEvent, ControllerLane, Grid, MidiClip, Note, Project, Quantize, QuantizeGrid, TempoMap};
 use eframe::egui;
 use egui::{Align, Align2, Color32, CursorIcon, FontId, Layout, Pos2, Rangef, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
 
-use super::timeline::{self, grid_at, grid_step_secs, snap_to};
+use super::timeline::{self, SnapMode, grid_at, snap_to};
 use super::widgets;
 use super::{Action, DawApp, Snapshot, theme};
 
@@ -48,7 +52,7 @@ struct NoteDrag {
     mode: DragMode,
     /// ⌘ held while moving: drop copies and keep the originals.
     copy: bool,
-    /// Pointer position at press, in (region seconds, pitch).
+    /// Pointer position at press, in (quarter notes into the region, pitch).
     origin_t: f64,
     origin_pitch: i32,
     /// Current offset applied to the selected notes.
@@ -62,8 +66,43 @@ struct CtrlDrag {
     events: Vec<ControllerEvent>,
     /// Moving the event at this index, else drawing with the pencil.
     moving: Option<usize>,
-    /// Pencil stroke so far: (seconds, value), in drawing order.
+    /// Pencil stroke so far: (quarter notes, value), in drawing order.
     stroke: Vec<(f64, f32)>,
+}
+
+/// Quantize settings, shared by the piano roll, the region menu and the inspector.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuantizeSettings {
+    /// `None` = Smart: the editor's snap value (1/16 when that isn't a note value).
+    pub grid: Option<QuantizeGrid>,
+    /// 0..1.
+    pub strength: f64,
+    /// 0..1, on straight grids.
+    pub swing: f64,
+    /// Quantize note ends too.
+    pub ends: bool,
+}
+
+impl Default for QuantizeSettings {
+    fn default() -> Self {
+        Self { grid: None, strength: 1.0, swing: 0.0, ends: false }
+    }
+}
+
+impl QuantizeSettings {
+    /// The grid this resolves to at timeline time `at` (Smart follows the snap setting).
+    pub fn resolve(&self, snap: SnapMode, map: &TempoMap, at: f64, px_per_sec: f32) -> Quantize {
+        let grid = self.grid.unwrap_or_else(|| match grid_at(snap, map, at, px_per_sec) {
+            Some(Grid::Quarters(q)) => QuantizeGrid::from_step(q).unwrap_or(QuantizeGrid::Sixteenth),
+            Some(Grid::Bar) => QuantizeGrid::Quarter,
+            None => QuantizeGrid::Sixteenth,
+        });
+        Quantize { grid, strength: self.strength, swing: self.swing, ends: self.ends, window: 1.0 }
+    }
+
+    pub fn label(&self) -> &'static str {
+        self.grid.map_or("Smart", QuantizeGrid::name)
+    }
 }
 
 /// Piano roll view state (lives in the app; the region itself lives in the engine).
@@ -87,9 +126,10 @@ pub struct PianoRoll {
     pub ctrl_kind: Controller,
     pub ctrl_sel: Option<usize>,
     ctrl_drag: Option<CtrlDrag>,
+    pub quantize: QuantizeSettings,
     /// Last frame's geometry, so tests can locate notes on screen.
     #[cfg(test)]
-    pub geo: Option<(Rect, f32, f32, f32, f64)>,
+    pub(crate) geo: Option<Geo>,
     #[cfg(test)]
     pub ctrl_rect: Option<Rect>,
 }
@@ -110,6 +150,7 @@ impl Default for PianoRoll {
             ctrl_kind: Controller::PitchBend,
             ctrl_sel: None,
             ctrl_drag: None,
+            quantize: QuantizeSettings::default(),
             #[cfg(test)]
             geo: None,
             #[cfg(test)]
@@ -130,12 +171,19 @@ impl PianoRoll {
     }
 }
 
-struct Geo {
+/// Where things are on screen: pitches down, and quarter notes into the region across (on
+/// the arrangement's seconds axis, through the tempo map).
+#[derive(Clone)]
+pub(crate) struct Geo {
     grid: Rect,
     top_pitch: f32,
     key_h: f32,
     px_per_sec: f32,
-    start: f64,
+    /// Timeline time (seconds) at the grid's left edge.
+    view_start: f64,
+    /// The region's start (quarter notes from the song start).
+    region_q: f64,
+    map: TempoMap,
 }
 
 impl Geo {
@@ -147,21 +195,24 @@ impl Geo {
         (self.top_pitch - (y - self.grid.top()) / self.key_h).ceil() as i32
     }
 
-    fn x_of(&self, t: f64) -> f32 {
-        self.grid.left() + ((t - self.start) * self.px_per_sec as f64) as f32
+    /// Screen x of `b` quarter notes into the region.
+    fn x_of(&self, b: f64) -> f32 {
+        let t = self.map.secs_at(self.region_q + b);
+        self.grid.left() + ((t - self.view_start) * self.px_per_sec as f64) as f32
     }
 
-    fn t_of(&self, x: f32) -> f64 {
-        self.start + ((x - self.grid.left()) / self.px_per_sec) as f64
+    /// Quarter notes into the region at screen x.
+    fn b_of(&self, x: f32) -> f64 {
+        self.map.quarters_at(self.view_start + ((x - self.grid.left()) / self.px_per_sec) as f64) - self.region_q
     }
 
     fn note_rect(&self, n: &Note) -> Rect {
         let y = self.y_of(n.pitch);
-        Rect::from_min_max(pos2(self.x_of(n.start_secs), y + 0.5), pos2(self.x_of(n.start_secs + n.length_secs), y + self.key_h - 0.5))
+        Rect::from_min_max(pos2(self.x_of(n.start_beats), y + 0.5), pos2(self.x_of(n.start_beats + n.length_beats), y + self.key_h - 0.5))
     }
 }
 
-/// Apply a drag offset to the selected notes.
+/// Apply a drag offset (quarter notes) to the selected notes.
 fn dragged_notes(notes: &[Note], selected: &[Note], drag: &NoteDrag, region_len: f64) -> Vec<Note> {
     notes
         .iter()
@@ -171,14 +222,31 @@ fn dragged_notes(notes: &[Note], selected: &[Note], drag: &NoteDrag, region_len:
             }
             match drag.mode {
                 DragMode::Move => Note {
-                    start_secs: (n.start_secs + drag.dt).clamp(0.0, (region_len - 0.005).max(0.0)),
+                    start_beats: (n.start_beats + drag.dt).clamp(0.0, (region_len - 0.01).max(0.0)),
                     pitch: (n.pitch as i32 + drag.dpitch).clamp(0, 127) as u8,
                     ..*n
                 },
-                DragMode::Resize => Note { length_secs: (n.length_secs + drag.dt).max(0.01), ..*n },
+                DragMode::Resize => Note { length_beats: (n.length_beats + drag.dt).max(0.02), ..*n },
             }
         })
         .collect()
+}
+
+/// Quantize `clip`'s selected notes (all when none are): one undo step, and the selection
+/// follows the notes.
+pub(crate) fn quantize_notes(app: &mut DawApp, project: &Project, track: usize, ci: usize) {
+    let Some(clip) = project.tracks.get(track).and_then(|t| t.midi_clips.get(ci)) else { return };
+    let map = project.tempo_map();
+    let q = app.piano.quantize.resolve(app.snap_mode, &map, clip.start_secs(&map), app.view.px_per_sec);
+    let picked: Vec<usize> = (0..clip.notes.len()).filter(|&i| app.piano.selected.is_empty() || app.piano.selected.contains(&clip.notes[i])).collect();
+    // The same quantize here tells which notes the selection becomes.
+    let mut notes = clip.notes.clone();
+    q.apply(&mut notes, clip.position_beats, &map, |i| picked.contains(&i));
+    if !app.piano.selected.is_empty() {
+        app.piano.selected = picked.iter().map(|&i| notes[i]).collect();
+    }
+    let all = picked.len() == clip.notes.len();
+    app.act(Action::Quantize { track, clip: ci, notes: (!all).then_some(picked), q });
 }
 
 pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
@@ -222,8 +290,9 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
         app.piano.top_pitch = (mid + grid.height() / app.piano.key_h / 2.0).clamp(20.0, 127.0);
         // Bring the region into view if it's scrolled off (the zoom stays shared).
         let (t0, t1) = (app.view.start, app.view.start + (grid.width() / app.view.px_per_sec) as f64);
-        if clip.position_secs < t0 || clip.position_secs > t1 {
-            app.view.start = (clip.position_secs - (20.0 / app.view.px_per_sec) as f64).max(0.0);
+        let at = clip.start_secs(&project.tempo_map());
+        if at < t0 || at > t1 {
+            app.view.start = (at - (20.0 / app.view.px_per_sec) as f64).max(0.0);
         }
         // A region with controllers opens with the lane shown, on one it has.
         if let Some(l) = clip.controllers.first() {
@@ -237,10 +306,10 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
     toolbar_ui(app, ui, toolbar, track, ci, clip, project, snap.status.position_secs);
     handle_scroll_zoom(app, ui, body);
 
-    let geo = Geo { grid, top_pitch: app.piano.top_pitch, key_h: app.piano.key_h, px_per_sec: app.view.px_per_sec, start: app.view.start - clip.position_secs };
+    let geo = Geo { grid, top_pitch: app.piano.top_pitch, key_h: app.piano.key_h, px_per_sec: app.view.px_per_sec, view_start: app.view.start, region_q: clip.position_beats, map: project.tempo_map() };
     #[cfg(test)]
     {
-        app.piano.geo = Some((geo.grid, geo.top_pitch, geo.key_h, geo.px_per_sec, geo.start));
+        app.piano.geo = Some(geo.clone());
     }
     let color = theme::track_color(track);
     if gutter.width() > 8.0 {
@@ -260,12 +329,12 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
     keyboard(app, ui, &geo, keys, track, held);
 
     if ctrl.height() > 0.0 {
-        let lane_geo = Geo { grid: ctrl, ..geo };
+        let lane_geo = Geo { grid: ctrl, ..geo.clone() };
         controller_lane(app, ui, &lane_geo, ctrl_keys, track, ci, clip, project, color);
     }
 
     // Playhead (relative to the region).
-    let rel = snap.status.position_secs - clip.position_secs;
+    let rel = clip.beats_at(&geo.map, snap.status.position_secs);
     let x = geo.x_of(rel);
     if rel >= 0.0 && x >= grid.left() && x <= grid.right() {
         ui.painter().vline(x, Rangef::new(grid.top(), ctrl.bottom().max(grid.bottom())), Stroke::new(1.0, theme::PLAYHEAD));
@@ -297,25 +366,11 @@ fn toolbar_ui(app: &mut DawApp, ui: &mut egui::Ui, rect: Rect, track: usize, ci:
         if (r.drag_stopped() || (r.changed() && !r.dragged())) && !sel.is_empty() {
             let v = vel.round().clamp(1.0, 127.0) as u8;
             let notes: Vec<Note> = clip.notes.iter().map(|n| if app.piano.selected.contains(n) { Note { velocity: v, ..*n } } else { *n }).collect();
-            app.piano.selected = notes.iter().filter(|n| n.velocity == v && sel.iter().any(|s| s.start_secs == n.start_secs && s.pitch == n.pitch)).copied().collect();
+            app.piano.selected = notes.iter().filter(|n| n.velocity == v && sel.iter().any(|s| s.start_beats == n.start_beats && s.pitch == n.pitch)).copied().collect();
             app.act(Action::SetNotes { track, clip: ci, notes });
         }
 
-        let map = project.tempo_map();
-        let grid = grid_at(app.snap_mode, &map, clip.position_secs, app.view.px_per_sec);
-        let quantize = ui.add_enabled(grid.is_some(), egui::Button::new("Quantize")).on_hover_text("Snap note starts to the grid (selected notes, or all)");
-        if quantize.clicked() {
-            if let Some(g) = grid {
-                let all = app.piano.selected.is_empty();
-                let q = |n: &Note| {
-                    let abs = clip.position_secs + n.start_secs;
-                    Note { start_secs: (map.snap(abs, g) - clip.position_secs).max(0.0), ..*n }
-                };
-                let notes: Vec<Note> = clip.notes.iter().map(|n| if all || app.piano.selected.contains(n) { q(n) } else { *n }).collect();
-                app.piano.selected.clear();
-                app.act(Action::SetNotes { track, clip: ci, notes });
-            }
-        }
+        quantize_controls(app, ui, track, ci, project);
         ui.separator();
         let r = ui.selectable_label(app.piano.show_ctrl, "MIDI Draw").on_hover_text("Show the controller lane: pitch bend, mod wheel, CCs");
         if r.clicked() {
@@ -328,10 +383,52 @@ fn toolbar_ui(app: &mut DawApp, ui: &mut egui::Ui, rect: Rect, track: usize, ci:
             timeline::zoom_controls(app, ui, "piano_zoom", playhead);
             // The hint only where it fits next to the controls.
             if ui.available_width() > 360.0 {
-                ui.label(RichText::new("Double-click: add note · Drag: move · Edge: resize · ⌫: delete").size(10.0).color(theme::TEXT_FAINT));
+                ui.label(RichText::new("Double-click: add note · Drag: move · Edge: resize · Q: quantize · ⌫: delete").size(10.0).color(theme::TEXT_FAINT));
             }
         });
     });
+}
+
+/// Quantize: the grid, the button (Q) and a menu with strength, swing, note ends and
+/// quantizing while recording.
+fn quantize_controls(app: &mut DawApp, ui: &mut egui::Ui, track: usize, ci: usize, project: &Project) {
+    let mut settings = app.piano.quantize;
+    let r = egui::ComboBox::from_id_salt("piano_quantize_grid").selected_text(settings.label()).width(62.0).show_ui(ui, |ui| {
+        ui.selectable_value(&mut settings.grid, None, "Smart").on_hover_text("The snap value");
+        for g in QuantizeGrid::ALL {
+            ui.selectable_value(&mut settings.grid, Some(g), g.name());
+        }
+    });
+    widgets::label(&r.response, egui::Role::ComboBox, "Quantize Grid");
+    r.response.on_hover_text("Quantize grid");
+    let what = if app.piano.selected.is_empty() { "all notes" } else { "the selected notes" };
+    if ui.button("Quantize").on_hover_text(format!("Move {what} to the grid (Q)")).clicked() {
+        app.piano.quantize = settings;
+        quantize_notes(app, project, track, ci);
+    }
+    let record = project.record_quantize;
+    ui.menu_button("Options", |ui| {
+        ui.set_min_width(190.0);
+        ui.label(RichText::new("Quantize").strong());
+        let mut strength = (settings.strength * 100.0).round();
+        ui.add(egui::Slider::new(&mut strength, 0.0..=100.0).fixed_decimals(0).suffix(" %").text("Strength")).on_hover_text("How far notes move towards the grid");
+        settings.strength = strength / 100.0;
+        let straight = settings.grid.is_none_or(|g| !g.is_triplet());
+        let mut swing = (settings.swing * 100.0).round();
+        ui.add_enabled(straight, egui::Slider::new(&mut swing, 0.0..=100.0).fixed_decimals(0).suffix(" %").text("Swing")).on_hover_text("Delay every second grid line (100 % = triplet feel)");
+        settings.swing = swing / 100.0;
+        ui.checkbox(&mut settings.ends, "Quantize note ends");
+        ui.separator();
+        let mut on = record.is_some();
+        if ui.checkbox(&mut on, "Quantize on record").on_hover_text("Recorded MIDI snaps to this grid when you stop").changed() {
+            let q = on.then(|| settings.resolve(app.snap_mode, &project.tempo_map(), 0.0, app.view.px_per_sec));
+            app.act(Action::SetRecordQuantize(q));
+        }
+        if let Some(q) = record {
+            ui.label(RichText::new(format!("Recording: {} at {:.0} %", q.grid.name(), q.strength * 100.0)).size(10.5).color(theme::TEXT_FAINT));
+        }
+    });
+    app.piano.quantize = settings;
 }
 
 fn handle_scroll_zoom(app: &mut DawApp, ui: &egui::Ui, body: Rect) {
@@ -390,20 +487,20 @@ fn draw_background(ui: &egui::Ui, geo: &Geo, clip: &MidiClip, project: &Project,
     timeline::draw_grid(&p, g, &app.view, &map, grid);
     // A looped region's repeats: shaded, with their notes as ghosts (edit the first pass).
     if let Some(l) = clip.looped {
-        let loop_x = geo.x_of(l.len_secs.min(clip.length_secs));
-        p.rect_filled(Rect::from_min_max(pos2(loop_x, g.top()), pos2(geo.x_of(clip.length_secs), g.bottom())), 0.0, Color32::from_black_alpha(40));
+        let loop_x = geo.x_of(l.len.min(clip.length_beats));
+        p.rect_filled(Rect::from_min_max(pos2(loop_x, g.top()), pos2(geo.x_of(clip.length_beats), g.bottom())), 0.0, Color32::from_black_alpha(40));
         let ghost = theme::with_alpha(theme::track_color(app.piano.region.map_or(0, |(t, _)| t)), 70);
-        for pass in l.passes(clip.length_secs).iter().filter(|p| p.at >= l.len_secs - 1e-9) {
+        for pass in l.passes(clip.length_beats).iter().filter(|p| p.at >= l.len - 1e-9) {
             let to = pass.from + pass.len;
-            for n in clip.notes.iter().filter(|n| n.start_secs >= pass.from - 1e-9 && n.start_secs < to - 1e-9) {
-                let shifted = Note { start_secs: n.start_secs - pass.from + pass.at, length_secs: n.length_secs.min(to - n.start_secs), ..*n };
+            for n in clip.notes.iter().filter(|n| n.start_beats >= pass.from - 1e-9 && n.start_beats < to - 1e-9) {
+                let shifted = Note { start_beats: n.start_beats - pass.from + pass.at, length_beats: n.length_beats.min(to - n.start_beats), ..*n };
                 p.rect_filled(geo.note_rect(&shifted), 2.0, ghost);
             }
             p.vline(geo.x_of(pass.at), g.y_range(), Stroke::new(1.0, theme::with_alpha(theme::TEXT_FAINT, 120)));
         }
     }
     // Shade outside the region.
-    let end_x = geo.x_of(clip.length_secs);
+    let end_x = geo.x_of(clip.length_beats);
     if end_x < g.right() {
         p.rect_filled(Rect::from_min_max(pos2(end_x, g.top()), g.max), 0.0, Color32::from_black_alpha(90));
         p.vline(end_x, g.y_range(), Stroke::new(1.0, theme::TEXT_FAINT));
@@ -426,7 +523,8 @@ fn notes_interaction(
     project: &Project,
     color: Color32,
 ) {
-    let snap = |app: &DawApp, ui: &egui::Ui, rel: f64| snap_to(app.snap_mode, ui, clip.position_secs + rel, project, geo.px_per_sec) - clip.position_secs;
+    // Snap quarter notes into the region (the grid is the timeline's, in seconds).
+    let snap = |app: &DawApp, ui: &egui::Ui, rel: f64| clip.beats_at(&geo.map, snap_to(app.snap_mode, ui, clip.secs_of(&geo.map, rel), project, geo.px_per_sec));
     let hit = |pos: Pos2| -> Option<(Note, bool)> {
         clip.notes.iter().rev().find_map(|n| {
             let r = geo.note_rect(n);
@@ -448,13 +546,17 @@ fn notes_interaction(
     let pointer = resp.interact_pointer_pos();
     if resp.double_clicked() {
         if let Some(p) = pointer.filter(|p| hit(*p).is_none()) {
-            let t = snap(app, ui, geo.t_of(p.x)).max(0.0);
-            if t < clip.content_secs() {
-                let map = project.tempo_map();
-                let at = clip.position_secs + t;
-                let len = grid_at(app.snap_mode, &map, at, geo.px_per_sec).map_or(map.beat_secs_at(at) / 4.0, |g| grid_step_secs(g, &map, at));
+            let t = snap(app, ui, geo.b_of(p.x)).max(0.0);
+            if t < clip.content_beats() {
+                // A grid step long (a sixteenth of the beat with snapping off).
+                let (map, at) = (&geo.map, clip.secs_of(&geo.map, t));
+                let len = match grid_at(app.snap_mode, map, at, geo.px_per_sec) {
+                    Some(Grid::Quarters(q)) => q,
+                    Some(Grid::Bar) => opentake_engine::project::tempo::bar_len_q(map.signature_at(at)),
+                    None => map.segment_at(at).beat_len_q() / 4.0,
+                };
                 let pitch = geo.pitch_at(p.y).clamp(0, 127) as u8;
-                let note = Note { start_secs: t, length_secs: len.min(clip.content_secs() - t).max(0.01), pitch, velocity: app.piano.velocity, tab: None };
+                let note = Note { start_beats: t, length_beats: len.min(clip.content_beats() - t).max(0.02), pitch, velocity: app.piano.velocity, tab: None };
                 let mut notes = clip.notes.clone();
                 notes.push(note);
                 app.piano.selected = vec![note];
@@ -486,7 +588,7 @@ fn notes_interaction(
                 app.piano.drag = Some(NoteDrag {
                     mode: if edge { DragMode::Resize } else { DragMode::Move },
                     copy: false,
-                    origin_t: geo.t_of(p.x),
+                    origin_t: geo.b_of(p.x),
                     origin_pitch: geo.pitch_at(p.y),
                     dt: 0.0,
                     dpitch: 0,
@@ -517,10 +619,10 @@ fn notes_interaction(
             // Snap the moved edge of the grabbed note, so notes land on the grid.
             let anchor = app.piano.selected.first().copied();
             let mode = app.piano.drag.as_ref().map(|d| d.mode);
-            let raw = geo.t_of(p.x) - origin_t;
+            let raw = geo.b_of(p.x) - origin_t;
             let dt = match (anchor, mode) {
-                (Some(a), Some(DragMode::Move)) => snap(app, ui, a.start_secs + raw) - a.start_secs,
-                (Some(a), Some(DragMode::Resize)) => snap(app, ui, a.start_secs + a.length_secs + raw) - (a.start_secs + a.length_secs),
+                (Some(a), Some(DragMode::Move)) => snap(app, ui, a.start_beats + raw) - a.start_beats,
+                (Some(a), Some(DragMode::Resize)) => snap(app, ui, a.start_beats + a.length_beats + raw) - (a.start_beats + a.length_beats),
                 _ => raw,
             };
             let pitch = geo.pitch_at(p.y);
@@ -544,11 +646,11 @@ fn notes_interaction(
         app.piano.marquee = None;
         if let Some(d) = app.piano.drag.take() {
             if d.dt != 0.0 || d.dpitch != 0 {
-                let moved: Vec<Note> = dragged_notes(&app.piano.selected, &app.piano.selected, &d, clip.content_secs());
+                let moved: Vec<Note> = dragged_notes(&app.piano.selected, &app.piano.selected, &d, clip.content_beats());
                 let notes = if d.copy {
                     clip.notes.iter().copied().chain(moved.iter().copied()).collect()
                 } else {
-                    dragged_notes(&clip.notes, &app.piano.selected, &d, clip.content_secs())
+                    dragged_notes(&clip.notes, &app.piano.selected, &d, clip.content_beats())
                 };
                 app.piano.selected = moved;
                 app.act(Action::SetNotes { track, clip: ci, notes });
@@ -559,12 +661,12 @@ fn notes_interaction(
     // Draw notes (with the drag preview applied).
     let shown = match &app.piano.drag {
         // Copying: originals stay, copies follow the pointer.
-        Some(d) if d.copy => clip.notes.iter().copied().chain(dragged_notes(&app.piano.selected, &app.piano.selected, d, clip.content_secs())).collect(),
-        Some(d) => dragged_notes(&clip.notes, &app.piano.selected, d, clip.content_secs()),
+        Some(d) if d.copy => clip.notes.iter().copied().chain(dragged_notes(&app.piano.selected, &app.piano.selected, d, clip.content_beats())).collect(),
+        Some(d) => dragged_notes(&clip.notes, &app.piano.selected, d, clip.content_beats()),
         None => clip.notes.clone(),
     };
     let preview_selected = match &app.piano.drag {
-        Some(d) => dragged_notes(&app.piano.selected, &app.piano.selected, d, clip.content_secs()),
+        Some(d) => dragged_notes(&app.piano.selected, &app.piano.selected, d, clip.content_beats()),
         None => app.piano.selected.clone(),
     };
     let p = ui.painter().with_clip_rect(geo.grid);
@@ -629,8 +731,8 @@ fn lane_y(kind: Controller, rect: Rect, v: f32) -> f32 {
 /// by the stroke's.
 fn with_stroke(events: &[ControllerEvent], stroke: &[(f64, f32)]) -> Vec<ControllerEvent> {
     let (lo, hi) = stroke.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
-    let mut out: Vec<ControllerEvent> = events.iter().filter(|e| e.time_secs < lo - 1e-9 || e.time_secs > hi + 1e-9).copied().collect();
-    out.extend(stroke.iter().map(|&(t, v)| ControllerEvent { time_secs: t, value: v }));
+    let mut out: Vec<ControllerEvent> = events.iter().filter(|e| e.time_beats < lo - 1e-9 || e.time_beats > hi + 1e-9).copied().collect();
+    out.extend(stroke.iter().map(|&(t, v)| ControllerEvent { time_beats: t, value: v }));
     out
 }
 
@@ -648,11 +750,11 @@ fn controller_lane(app: &mut DawApp, ui: &egui::Ui, geo: &Geo, keys: Rect, track
     let stored: Vec<ControllerEvent> = clip.lane(kind).map(|l| l.events.clone()).unwrap_or_default();
     let resp = ui.interact(rect, ui.make_persistent_id(("piano_ctrl_lane", track, ci)), Sense::click_and_drag());
     widgets::label(&resp, egui::Role::Group, "Controller Lane");
-    let max_t = clip.content_secs();
-    let point = |p: Pos2| (geo.t_of(p.x).clamp(0.0, max_t), lane_value(kind, rect, p.y));
+    let max_t = clip.content_beats();
+    let point = |p: Pos2| (geo.b_of(p.x).clamp(0.0, max_t), lane_value(kind, rect, p.y));
     let shown = |app: &DawApp| app.piano.ctrl_drag.as_ref().map_or(stored.clone(), |d| d.events.clone());
     let hit = |events: &[ControllerEvent], p: Pos2| {
-        events.iter().enumerate().rev().find(|(_, e)| (geo.x_of(e.time_secs) - p.x).abs() <= CTRL_GRAB && (lane_y(kind, rect, e.value) - p.y).abs() <= CTRL_GRAB * 1.5).map(|(i, _)| i)
+        events.iter().enumerate().rev().find(|(_, e)| (geo.x_of(e.time_beats) - p.x).abs() <= CTRL_GRAB && (lane_y(kind, rect, e.value) - p.y).abs() <= CTRL_GRAB * 1.5).map(|(i, _)| i)
     };
     let commit = |app: &mut DawApp, events: Vec<ControllerEvent>| {
         let events = ControllerLane::new(kind, events).events;
@@ -674,9 +776,9 @@ fn controller_lane(app: &mut DawApp, ui: &egui::Ui, geo: &Geo, keys: Rect, track
             Some(i) => app.piano.ctrl_sel = Some(i),
             None => {
                 let (t, v) = point(p);
-                let t = snap_to(app.snap_mode, ui, clip.position_secs + t, project, geo.px_per_sec) - clip.position_secs;
+                let t = clip.beats_at(&geo.map, snap_to(app.snap_mode, ui, clip.secs_of(&geo.map, t), project, geo.px_per_sec));
                 let mut events = stored.clone();
-                events.push(ControllerEvent { time_secs: t.clamp(0.0, max_t), value: v });
+                events.push(ControllerEvent { time_beats: t.clamp(0.0, max_t), value: v });
                 app.piano.ctrl_sel = None;
                 commit(app, events);
             }
@@ -698,13 +800,13 @@ fn controller_lane(app: &mut DawApp, ui: &egui::Ui, geo: &Geo, keys: Rect, track
         match d.moving {
             Some(i) => {
                 if let Some(e) = d.events.get_mut(i) {
-                    *e = ControllerEvent { time_secs: t, value: v };
+                    *e = ControllerEvent { time_beats: t, value: v };
                 }
             }
             None => {
-                // An event every few pixels (and at least 10 ms apart) along the stroke;
+                // An event every few pixels (and at least 1/50 beat apart) along the stroke;
                 // going back over it redraws that stretch.
-                let step = (4.0 / geo.px_per_sec as f64).max(0.01);
+                let step = (geo.b_of(geo.grid.left() + 4.0) - geo.b_of(geo.grid.left())).max(0.02);
                 let last = d.stroke.last().map_or(t, |l| l.0);
                 if (t - last).abs() >= step {
                     let (lo, hi) = (last.min(t), last.max(t));
@@ -740,8 +842,8 @@ fn controller_lane(app: &mut DawApp, ui: &egui::Ui, geo: &Geo, keys: Rect, track
     let base = lane_y(kind, rect, 0.0);
     let line = theme::shade(color, 1.1);
     for (i, e) in events.iter().enumerate() {
-        let x = geo.x_of(e.time_secs);
-        let next = events.get(i + 1).map_or(end_x, |n| geo.x_of(n.time_secs)).min(end_x);
+        let x = geo.x_of(e.time_beats);
+        let next = events.get(i + 1).map_or(end_x, |n| geo.x_of(n.time_beats)).min(end_x);
         let y = lane_y(kind, rect, e.value);
         if next > x {
             p.rect_filled(Rect::from_min_max(pos2(x, y.min(base)), pos2(next, y.max(base))), 0.0, theme::with_alpha(color, 46));
@@ -750,8 +852,9 @@ fn controller_lane(app: &mut DawApp, ui: &egui::Ui, geo: &Geo, keys: Rect, track
         p.vline(x, Rangef::new(y.min(base), y.max(base)), Stroke::new(1.0, theme::with_alpha(line, 160)));
         let selected = app.piano.ctrl_sel == Some(i) || app.piano.ctrl_drag.as_ref().is_some_and(|d| d.moving == Some(i));
         // Handles where events are far enough apart to grab one (a drawn curve is a line).
-        let prev = i.checked_sub(1).map_or(f32::MIN, |j| geo.x_of(events[j].time_secs));
-        if selected || (x - prev > 3.0 * CTRL_GRAB && geo.x_of(events.get(i + 1).map_or(f64::MAX, |n| n.time_secs)) - x > 3.0 * CTRL_GRAB) {
+        let prev = i.checked_sub(1).map_or(f32::MIN, |j| geo.x_of(events[j].time_beats));
+        let next = events.get(i + 1).map_or(f32::MAX, |n| geo.x_of(n.time_beats));
+        if selected || (x - prev > 3.0 * CTRL_GRAB && next - x > 3.0 * CTRL_GRAB) {
             p.circle_filled(pos2(x, y), if selected { 3.5 } else { 2.5 }, if selected { Color32::WHITE } else { line });
         }
     }
@@ -834,6 +937,54 @@ fn keyboard(app: &mut DawApp, ui: &egui::Ui, geo: &Geo, rect: Rect, track: usize
     }
 }
 
+impl DawApp {
+    /// Quantize every note of the MIDI regions among `regions` with the shared settings.
+    pub(crate) fn quantize_regions(&mut self, project: &Project, regions: &[timeline::RegionRef]) {
+        let midi: Vec<timeline::RegionRef> = regions.iter().copied().filter(|r| r.kind == timeline::RegionKind::Midi).collect();
+        let Some(first) = midi.iter().filter_map(|&r| timeline::region_view(project, r)).map(|v| v.position).min_by(f64::total_cmp) else { return };
+        let q = self.piano.quantize.resolve(self.snap_mode, &project.tempo_map(), first, self.view.px_per_sec);
+        self.act(Action::QuantizeRegions { regions: midi, q });
+    }
+
+    /// Q: quantize the piano roll's selected notes (or all its notes), else the selected
+    /// MIDI regions.
+    pub(crate) fn quantize_shortcut(&mut self, ui: &egui::Ui, snap: &Snapshot) {
+        if !ui.input(|i| i.key_pressed(egui::Key::Q) && !i.modifiers.any()) || ui.ctx().egui_wants_keyboard_input() {
+            return;
+        }
+        match self.piano.region {
+            Some((t, c)) if self.bottom == Some(super::BottomTab::PianoRoll) => quantize_notes(self, &snap.project, t, c),
+            _ => {
+                let selection = self.selection.clone();
+                self.quantize_regions(&snap.project, &selection);
+            }
+        }
+    }
+
+    /// The selected MIDI regions' Quantize in the inspector: the grid and a button.
+    pub(crate) fn quantize_inspector(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
+        let midi: Vec<timeline::RegionRef> = self.selection.iter().copied().filter(|r| r.kind == timeline::RegionKind::Midi).collect();
+        if midi.is_empty() {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Quantize").color(theme::TEXT_DIM));
+            let mut grid = self.piano.quantize.grid;
+            let r = egui::ComboBox::from_id_salt("inspector_quantize_grid").selected_text(self.piano.quantize.label()).width(62.0).show_ui(ui, |ui| {
+                ui.selectable_value(&mut grid, None, "Smart");
+                for g in QuantizeGrid::ALL {
+                    ui.selectable_value(&mut grid, Some(g), g.name());
+                }
+            });
+            widgets::label(&r.response, egui::Role::ComboBox, "Region Quantize Grid");
+            self.piano.quantize.grid = grid;
+            if ui.button("Apply").on_hover_text("Quantize every note of the selected regions (Q)").clicked() {
+                self.quantize_regions(&snap.project, &midi);
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -847,19 +998,19 @@ pub(crate) mod tests {
 
     #[test]
     fn drag_moves_only_selected_notes() {
-        let a = Note { start_secs: 0.0, length_secs: 0.5, pitch: 60, velocity: 100, tab: None };
-        let b = Note { start_secs: 1.0, length_secs: 0.5, pitch: 62, velocity: 100, tab: None };
+        let a = Note { start_beats: 0.0, length_beats: 0.5, pitch: 60, velocity: 100, tab: None };
+        let b = Note { start_beats: 1.0, length_beats: 0.5, pitch: 62, velocity: 100, tab: None };
         let d = NoteDrag { mode: DragMode::Move, copy: false, origin_t: 0.0, origin_pitch: 0, dt: 0.25, dpitch: 2 };
         let out = dragged_notes(&[a, b], &[b], &d, 4.0);
         assert_eq!(out[0], a);
-        assert_eq!((out[1].start_secs, out[1].pitch), (1.25, 64));
+        assert_eq!((out[1].start_beats, out[1].pitch), (1.25, 64));
         let r = NoteDrag { mode: DragMode::Resize, ..d };
-        assert_eq!(dragged_notes(&[a], &[a], &r, 4.0)[0].length_secs, 0.75);
+        assert_eq!(dragged_notes(&[a], &[a], &r, 4.0)[0].length_beats, 0.75);
     }
 
     #[test]
     fn a_stroke_replaces_the_events_it_passes_over() {
-        let ev = |t: f64, v: f32| ControllerEvent { time_secs: t, value: v };
+        let ev = |t: f64, v: f32| ControllerEvent { time_beats: t, value: v };
         let lane = [ev(0.0, 0.1), ev(1.0, 0.2), ev(2.0, 0.3)];
         let out = with_stroke(&lane, &[(0.5, 0.9), (1.5, 0.8)]);
         assert_eq!(out, vec![ev(0.0, 0.1), ev(2.0, 0.3), ev(0.5, 0.9), ev(1.5, 0.8)]);
@@ -870,8 +1021,23 @@ pub(crate) mod tests {
 
     /// Screen centre of a note, from the geometry the piano roll last drew with.
     pub(crate) fn note_center(app: &DawApp, n: &Note) -> egui::Pos2 {
-        let (grid, top_pitch, key_h, pps, start) = app.piano.geo.expect("piano roll drawn");
-        let geo = Geo { grid, top_pitch, key_h, px_per_sec: pps, start };
-        geo.note_rect(n).center()
+        app.piano.geo.as_ref().expect("piano roll drawn").note_rect(n).center()
+    }
+
+    /// Screen x of `b` quarter notes into the open region.
+    pub(crate) fn x_of(app: &DawApp, b: f64) -> f32 {
+        app.piano.geo.as_ref().expect("piano roll drawn").x_of(b)
+    }
+
+    #[test]
+    fn smart_quantize_follows_the_snap_value() {
+        let map = TempoMap::new(120.0, (4, 4), &[]);
+        let s = QuantizeSettings { strength: 0.5, ..Default::default() };
+        assert_eq!(s.resolve(SnapMode::Eighth, &map, 0.0, 100.0).grid, QuantizeGrid::Eighth);
+        assert_eq!(s.resolve(SnapMode::Off, &map, 0.0, 100.0).grid, QuantizeGrid::Sixteenth);
+        assert_eq!(s.resolve(SnapMode::Bar, &map, 0.0, 100.0).grid, QuantizeGrid::Quarter);
+        let fixed = QuantizeSettings { grid: Some(QuantizeGrid::EighthTriplet), ..s };
+        assert_eq!(fixed.resolve(SnapMode::Eighth, &map, 0.0, 100.0), Quantize { strength: 0.5, ..Quantize::new(QuantizeGrid::EighthTriplet) });
+        assert_eq!((s.label(), fixed.label()), ("Smart", "1/8T"));
     }
 }

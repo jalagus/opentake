@@ -220,6 +220,11 @@ pub(crate) enum Action {
     ExportMidiFile(PathBuf),
     AddMidiRegion { track: usize, position: f64, length: f64 },
     SetNotes { track: usize, clip: usize, notes: Vec<Note> },
+    /// Quantize a region's notes (these indices, or all).
+    Quantize { track: usize, clip: usize, notes: Option<Vec<usize>>, q: opentake_engine::project::Quantize },
+    /// Quantize every note of the MIDI regions among these.
+    QuantizeRegions { regions: Vec<RegionRef>, q: opentake_engine::project::Quantize },
+    SetRecordQuantize(Option<opentake_engine::project::Quantize>),
     /// Replace one controller lane of a MIDI region.
     SetControllers { track: usize, clip: usize, kind: opentake_engine::project::Controller, events: Vec<opentake_engine::project::ControllerEvent> },
     LiveNote { track: usize, pitch: u8, velocity: u8 },
@@ -829,8 +834,9 @@ impl DawApp {
                 RegionKind::Audio => drop(e.trim_clip(r.track, r.index, start, end)?),
                 RegionKind::Midi => {
                     if let Some(end) = end {
-                        let pos = e.project().tracks[r.track].midi_clips[r.index].position_secs;
-                        let u = opentake_engine::MidiClipUpdate { length_secs: Some(end - pos), ..Default::default() };
+                        // To the beat the end lands on.
+                        let pos = e.project().tracks[r.track].midi_clips[r.index].position_beats;
+                        let u = opentake_engine::MidiClipUpdate { length_beats: Some(e.beats_at(end) - pos), ..Default::default() };
                         e.update_midi_clip(r.track, r.index, u)?;
                     }
                 }
@@ -862,6 +868,7 @@ impl DawApp {
             Action::Paste { track, position } => {
                 if let Some(clip) = self.clipboard.clone() {
                     let last = e.project().tracks.len().saturating_sub(1);
+                    let at_beats = e.beats_at(position);
                     let items = clip
                         .items
                         .into_iter()
@@ -869,7 +876,7 @@ impl DawApp {
                             let target = (track + dt).min(last);
                             let placed = match data {
                                 RegionData::Audio(c) => RegionData::Audio(opentake_engine::project::Clip { position_secs: position + c.position_secs, ..c }),
-                                RegionData::Midi(c) => RegionData::Midi(opentake_engine::project::MidiClip { position_secs: position + c.position_secs, ..c }),
+                                RegionData::Midi(c) => RegionData::Midi(opentake_engine::project::MidiClip { position_beats: at_beats + c.position_beats, ..c }),
                             };
                             (target, placed)
                         })
@@ -915,6 +922,15 @@ impl DawApp {
                 self.open_piano_roll(RegionRef::midi(track, i));
             }
             Action::SetNotes { track, clip, notes } => e.set_midi_notes(track, clip, notes)?,
+            Action::Quantize { track, clip, notes, q } => {
+                let n = e.quantize_midi(track, clip, &q, notes.as_deref())?;
+                self.info(format!("Quantized {n} note(s) to {}", q.grid.name()));
+            }
+            Action::QuantizeRegions { regions, q } => {
+                let n = e.quantize_regions(&regions, &q)?;
+                self.info(format!("Quantized {n} note(s) to {}", q.grid.name()));
+            }
+            Action::SetRecordQuantize(q) => e.set_record_quantize(q),
             Action::SetControllers { track, clip, kind, events } => drop(e.set_midi_controllers(track, clip, kind, events, true)?),
             Action::LiveNote { track, pitch, velocity } => e.live_note(track, pitch, velocity)?,
             Action::ScanPlugins => {
@@ -1207,6 +1223,7 @@ impl DawApp {
             self.toggle_bottom(BottomTab::Tab);
         }
         self.loop_shortcut(ui, snap);
+        self.quantize_shortcut(ui, snap);
     }
 
     /// Show automation under every track, or hide it if any track shows it (Logic's "A").
@@ -1257,7 +1274,8 @@ impl DawApp {
     /// Zoom the shared timeline to the selected regions, or to the whole song.
     pub(crate) fn zoom_to_fit(&mut self, snap: &Snapshot) {
         let views: Vec<_> = if self.selection.is_empty() {
-            snap.project.tracks.iter().enumerate().flat_map(|(i, t)| timeline::regions_of(t, i)).collect()
+            let map = snap.project.tempo_map();
+            snap.project.tracks.iter().enumerate().flat_map(|(i, t)| timeline::regions_of(t, i, &map)).collect()
         } else {
             self.selection.iter().filter_map(|&r| timeline::region_view(&snap.project, r)).collect()
         };
@@ -1606,12 +1624,14 @@ impl DawApp {
         let views: Vec<_> = self.selection.iter().filter_map(|&r| timeline::region_view(project, r)).collect();
         let Some(top) = views.iter().map(|v| v.r.track).min() else { return };
         let start = views.iter().map(|v| v.position).fold(f64::INFINITY, f64::min);
+        // Offsets from the first region: seconds, or quarter notes for MIDI (pasted on the beat).
+        let start_beats = project.tempo_map().quarters_at(start);
         let items = views
             .iter()
             .map(|v| {
                 let data = match v.to_data() {
                     RegionData::Audio(c) => RegionData::Audio(opentake_engine::project::Clip { position_secs: c.position_secs - start, ..c }),
-                    RegionData::Midi(c) => RegionData::Midi(opentake_engine::project::MidiClip { position_secs: c.position_secs - start, ..c }),
+                    RegionData::Midi(c) => RegionData::Midi(opentake_engine::project::MidiClip { position_beats: c.position_beats - start_beats, ..c }),
                 };
                 (v.r.track - top, data)
             })
@@ -1816,7 +1836,7 @@ impl DawApp {
                 .iter()
                 .enumerate()
                 .filter(|(t, _)| self.selected_track.is_none_or(|sel| sel == *t))
-                .flat_map(|(t, tr)| timeline::regions_of(tr, t).map(|v| v.r).collect::<Vec<_>>())
+                .flat_map(|(t, tr)| timeline::regions_of(tr, t, &snap.project.tempo_map()).map(|v| v.r).collect::<Vec<_>>())
                 .collect()
         } else {
             self.selection.clone()
@@ -2251,6 +2271,7 @@ impl DawApp {
         }
         self.region_inspector(ui, snap);
         self.loop_inspector(ui, snap);
+        self.quantize_inspector(ui, snap);
         ui.add_space(6.0);
         ui.separator();
 
@@ -3655,10 +3676,11 @@ mod tests {
     #[test]
     fn piano_roll_marquee_selection_and_cmd_drag_copy() {
         let (mut harness, engine) = harness_with_track();
+        // In beats: at 120 bpm 0, 0.5 and 1.5 s.
         let notes = vec![
-            Note { start_secs: 0.0, length_secs: 0.25, pitch: 60, velocity: 100, tab: None },
-            Note { start_secs: 0.5, length_secs: 0.25, pitch: 62, velocity: 100, tab: None },
-            Note { start_secs: 1.5, length_secs: 0.25, pitch: 72, velocity: 100, tab: None },
+            Note { start_beats: 0.0, length_beats: 0.5, pitch: 60, velocity: 100, tab: None },
+            Note { start_beats: 1.0, length_beats: 0.5, pitch: 62, velocity: 100, tab: None },
+            Note { start_beats: 3.0, length_beats: 0.5, pitch: 72, velocity: 100, tab: None },
         ];
         {
             let mut e = engine.lock().unwrap();
@@ -3683,26 +3705,83 @@ mod tests {
         sel.sort_by_key(|n| n.pitch);
         assert_eq!(sel, notes[..2].to_vec(), "marquee selects the two notes it covers");
 
-        // ⌘-drag one of them: both are copied 0.5 s later, originals stay.
-        let pps = harness.state().piano.geo.unwrap().3;
-        press_drag(&mut harness, a, a + egui::vec2(0.5 * pps, 0.0), egui::Modifiers::COMMAND);
+        // ⌘-drag one of them: both are copied 0.5 s (a beat) later, originals stay.
+        let beat = piano_roll::tests::x_of(harness.state(), 1.0) - piano_roll::tests::x_of(harness.state(), 0.0);
+        press_drag(&mut harness, a, a + egui::vec2(beat, 0.0), egui::Modifiers::COMMAND);
         let after = engine.lock().unwrap().project().tracks[1].midi_clips[0].notes.clone();
         assert_eq!(after.len(), 5, "two copies added: {after:?}");
         for n in &notes {
             assert!(after.contains(n), "original {n:?} kept");
         }
-        assert!(after.iter().any(|n| n.pitch == 60 && (n.start_secs - 0.5).abs() < 0.02));
-        assert!(after.iter().any(|n| n.pitch == 62 && (n.start_secs - 1.0).abs() < 0.02));
+        assert!(after.iter().any(|n| n.pitch == 60 && (n.start_beats - 1.0).abs() < 0.04));
+        assert!(after.iter().any(|n| n.pitch == 62 && (n.start_beats - 2.0).abs() < 0.04));
     }
 
-    /// A Keys track with a 2 s region of three notes, open in the piano roll at 400 px/s.
+    #[test]
+    fn piano_roll_q_quantizes_the_selection_or_everything_and_notes_follow_the_tempo() {
+        use opentake_engine::project::QuantizeGrid;
+        let (mut harness, engine) = harness_with_track();
+        let note = |start: f64, pitch: u8| Note { start_beats: start, length_beats: 0.5, pitch, velocity: 100, tab: None };
+        {
+            let mut e = engine.lock().unwrap();
+            let t = e.add_instrument_track("Keys", "synth").unwrap();
+            let c = e.add_midi_clip_beats(t, 0.0, 8.0, None).unwrap();
+            e.set_midi_notes(t, c, vec![note(0.1, 60), note(1.2, 64), note(2.9, 67)]).unwrap();
+        }
+        harness.state_mut().snap_mode = timeline::SnapMode::Off;
+        harness.state_mut().view.px_per_sec = 300.0;
+        harness.state_mut().piano.quantize.grid = Some(QuantizeGrid::Quarter);
+        harness.state_mut().open_piano_roll(RegionRef::midi(1, 0));
+        harness.step();
+        harness.step();
+        let starts = |e: &SharedEngine| e.lock().unwrap().project().tracks[1].midi_clips[0].notes.iter().map(|n| (n.start_beats * 1e6).round() / 1e6).collect::<Vec<_>>();
+
+        // Click the middle note, Q: only it moves (to beat 1), and stays selected.
+        let at = piano_roll::tests::note_center(harness.state(), &note(1.2, 64));
+        harness.hover_at(at);
+        harness.step();
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+            harness.step();
+        }
+        assert_eq!(harness.state().piano.selected, vec![note(1.2, 64)]);
+        harness.key_press(egui::Key::Q);
+        harness.step();
+        harness.step();
+        assert_eq!(starts(&engine), [0.1, 1.0, 2.9]);
+        assert_eq!(harness.state().piano.selected, vec![note(1.0, 64)], "the selection follows the note");
+        assert_eq!(engine.lock().unwrap().history_info().undo.as_deref(), Some("Quantize"));
+
+        // Nothing selected: Q quantizes every note; the toolbar names the grid.
+        harness.key_press(egui::Key::Escape);
+        harness.step();
+        harness.key_press(egui::Key::Q);
+        harness.step();
+        harness.step();
+        assert_eq!(starts(&engine), [0.0, 1.0, 3.0]);
+        assert!(harness.query_by_label("Quantize Grid").is_some());
+
+        // Half the tempo: the note on beat 3 is drawn at 3 s (it was at 1.5 s), with the bars.
+        let before = piano_roll::tests::x_of(harness.state(), 3.0);
+        assert!((before - harness.state().view.x(1.5)).abs() < 0.5, "{before}");
+        engine.lock().unwrap().set_tempo(60.0, None).unwrap();
+        harness.step();
+        harness.step();
+        let after = piano_roll::tests::x_of(harness.state(), 3.0);
+        assert!((after - harness.state().view.x(3.0)).abs() < 0.5, "{after} vs {}", harness.state().view.x(3.0));
+        let center = piano_roll::tests::note_center(harness.state(), &note(3.0, 67)).x;
+        assert!((center - harness.state().view.x(3.25)).abs() < 0.5, "half a beat long: 0.5 s");
+    }
+
+    /// A Keys track with a 2 s (4 beat) region of three notes, open in the piano roll at 400 px/s.
     fn harness_with_piano_roll() -> (Harness<'static, DawApp>, SharedEngine) {
         let (mut harness, engine) = harness_with_track();
         {
             let mut e = engine.lock().unwrap();
             let t = e.add_instrument_track("Keys", "synth").unwrap();
             let c = e.add_midi_clip(t, 0.0, 2.0, None).unwrap();
-            let note = |start: f64, pitch: u8| Note { start_secs: start, length_secs: 0.4, pitch, velocity: 100, tab: None };
+            // At 0, 0.5 and 1 s, 0.4 s long.
+            let note = |start: f64, pitch: u8| Note { start_beats: 2.0 * start, length_beats: 0.8, pitch, velocity: 100, tab: None };
             e.set_midi_notes(t, c, vec![note(0.0, 60), note(0.5, 64), note(1.0, 67)]).unwrap();
         }
         harness.state_mut().snap_mode = timeline::SnapMode::Off;
@@ -3721,11 +3800,9 @@ mod tests {
         click(&mut harness, "MIDI Draw");
         assert_eq!(harness.state().piano.ctrl_kind, Controller::PitchBend, "the lane shows pitch bend first");
         let lane = harness.state().piano.ctrl_rect.expect("controller lane drawn");
-        let (geo_left, pps, start) = {
-            let g = harness.state().piano.geo.unwrap();
-            (g.0.left(), g.3, g.4)
-        };
-        let x = |t: f64| geo_left + ((t - start) * pps as f64) as f32;
+        // Seconds into the region (two beats a second) on screen.
+        let xs: Vec<f32> = [0.2, 0.8, 1.5].iter().map(|t| piano_roll::tests::x_of(harness.state(), 2.0 * t)).collect();
+        let x = |t: f64| xs[[0.2, 0.8, 1.5].iter().position(|&s| s == t).unwrap()];
         // Pencil from the top (full bend up) at 0.2 s down to the bottom at 0.8 s.
         let (from, to) = (egui::pos2(x(0.2), lane.top() + 4.0), egui::pos2(x(0.8), lane.bottom() - 4.0));
         harness.hover_at(from);
@@ -3745,9 +3822,9 @@ mod tests {
             e.project().tracks[1].midi_clips[0].lane(Controller::PitchBend).expect("a bend lane").events.clone()
         };
         assert!(events.len() >= 10, "a curve of events: {events:?}");
-        assert!((events[0].time_secs - 0.2).abs() < 0.02 && events[0].value > 0.9, "{:?}", events[0]);
-        assert!(events.last().unwrap().value < -0.9 && (events.last().unwrap().time_secs - 0.8).abs() < 0.02);
-        assert!(events.windows(2).all(|w| w[1].time_secs > w[0].time_secs && w[1].value <= w[0].value), "falls left to right");
+        assert!((events[0].time_beats - 0.4).abs() < 0.04 && events[0].value > 0.9, "{:?}", events[0]);
+        assert!(events.last().unwrap().value < -0.9 && (events.last().unwrap().time_beats - 1.6).abs() < 0.04);
+        assert!(events.windows(2).all(|w| w[1].time_beats > w[0].time_beats && w[1].value <= w[0].value), "falls left to right");
 
         // A click adds one event; right-click on it deletes it; each is one step.
         let click_at = egui::pos2(x(1.5), lane.center().y);
@@ -3771,6 +3848,48 @@ mod tests {
         assert!(engine.lock().unwrap().project().tracks[1].midi_clips[0].controllers.is_empty(), "three gestures, three steps");
     }
 
+    /// Renders MIDI across a tempo change (a note on every beat, a looped region) with the
+    /// piano roll's quantize menu open, to a PNG for visual review:
+    /// `OPENTAKE_SCREENSHOT=/tmp/tempo.png cargo test -p opentake render_midi_following_the_tempo -- --ignored`
+    #[test]
+    #[ignore = "renders with wgpu; run manually for visual checks"]
+    fn render_midi_following_the_tempo() {
+        let out = std::env::var("OPENTAKE_SCREENSHOT").unwrap_or_else(|_| "opentake-tempo.png".into());
+        let engine: SharedEngine = Arc::new(Mutex::new(Engine::new()));
+        {
+            let mut e = engine.lock().unwrap();
+            // 120 bpm, slowing to 80 at bar 3 (4 s).
+            e.set_tempo_changes(vec![opentake_engine::project::TempoChange { at_secs: 4.0, bpm: 80.0, time_signature: None }], None).unwrap();
+            let t = e.add_instrument_track("Keys", "synth").unwrap();
+            let c = e.add_midi_clip_beats(t, 0.0, 16.0, Some("Beats")).unwrap();
+            let notes = (0..16).map(|b| Note { start_beats: b as f64 + if b % 2 == 1 { 0.12 } else { 0.0 }, length_beats: 0.5, pitch: 60 + (b % 4) as u8 * 4, velocity: 100, tab: None }).collect();
+            e.set_midi_notes(t, c, notes).unwrap();
+            let l = e.add_midi_clip_beats(t, 16.0, 4.0, Some("Loop")).unwrap();
+            e.set_midi_notes(t, l, vec![Note { start_beats: 0.0, length_beats: 1.0, pitch: 67, velocity: 100, tab: None }, Note { start_beats: 2.0, length_beats: 1.0, pitch: 72, velocity: 100, tab: None }]).unwrap();
+            e.set_region_loop(&[RegionRef::midi(t, l)], opentake_engine::LoopTo::Passes(2)).unwrap();
+        }
+        let app_engine = engine.clone();
+        let mut harness = Harness::builder()
+            .with_size([1200.0, 700.0])
+            .with_pixels_per_point(2.0)
+            .with_step_dt(1.0 / 60.0)
+            .wgpu()
+            .build_eframe(move |cc| {
+                theme::apply(&cc.egui_ctx);
+                DawApp::new(app_engine, None)
+            });
+        harness.state_mut().view.px_per_sec = 60.0;
+        harness.state_mut().open_piano_roll(RegionRef::midi(0, 0));
+        for _ in 0..4 {
+            harness.step();
+        }
+        harness.get_by_label("Options").click();
+        for _ in 0..4 {
+            harness.step();
+        }
+        harness.render().expect("render").save(&out).expect("save png");
+    }
+
     /// Renders the piano roll with a drawn pitch-bend curve to a PNG for visual review:
     /// `OPENTAKE_SCREENSHOT=/tmp/bend.png cargo test -p opentake render_controller_lane -- --ignored`
     #[test]
@@ -3783,14 +3902,15 @@ mod tests {
             let mut e = engine.lock().unwrap();
             let t = e.add_instrument_track("Lead", "synth").unwrap();
             let c = e.add_midi_clip(t, 0.0, 4.0, None).unwrap();
-            let note = |start: f64, len: f64, pitch: u8| Note { start_secs: start, length_secs: len, pitch, velocity: 100, tab: None };
+            // Times in seconds, at 120 bpm: two beats each.
+            let note = |start: f64, len: f64, pitch: u8| Note { start_beats: 2.0 * start, length_beats: 2.0 * len, pitch, velocity: 100, tab: None };
             e.set_midi_notes(t, c, vec![note(0.0, 0.9, 64), note(1.0, 1.4, 67), note(2.5, 1.2, 69)]).unwrap();
             let bend: Vec<ControllerEvent> = (0..=60).map(|i| {
                 let t = 1.0 + i as f64 * 0.02;
-                ControllerEvent { time_secs: t, value: (((t - 1.0) / 0.6).min(1.0) * 0.5) as f32 + if t > 1.6 { 0.08 * ((t - 1.6) * 35.0).sin() as f32 } else { 0.0 } }
-            }).chain([ControllerEvent { time_secs: 2.4, value: 0.0 }]).collect();
+                ControllerEvent { time_beats: 2.0 * t, value: (((t - 1.0) / 0.6).min(1.0) * 0.5) as f32 + if t > 1.6 { 0.08 * ((t - 1.6) * 35.0).sin() as f32 } else { 0.0 } }
+            }).chain([ControllerEvent { time_beats: 4.8, value: 0.0 }]).collect();
             e.set_midi_controllers(t, c, Controller::PitchBend, bend, true).unwrap();
-            e.set_midi_controllers(t, c, Controller::MOD_WHEEL, vec![ControllerEvent { time_secs: 2.5, value: 0.6 }], true).unwrap();
+            e.set_midi_controllers(t, c, Controller::MOD_WHEEL, vec![ControllerEvent { time_beats: 5.0, value: 0.6 }], true).unwrap();
         }
         let app_engine = engine.clone();
         let mut harness = Harness::builder()
@@ -3870,7 +3990,7 @@ mod tests {
         for (name, inst, pitch) in [("Keys", "synth", 60), ("Beat", "drums", 36)] {
             let t = src.add_instrument_track(name, inst).unwrap();
             let c = src.add_midi_clip(t, 0.0, 2.0, None).unwrap();
-            src.set_midi_notes(t, c, vec![Note { start_secs: 0.0, length_secs: 0.5, pitch, velocity: 100, tab: None }]).unwrap();
+            src.set_midi_notes(t, c, vec![Note { start_beats: 0.0, length_beats: 1.0, pitch, velocity: 100, tab: None }]).unwrap();
         }
         src.export_midi_file(&path).unwrap();
 
@@ -4060,7 +4180,8 @@ mod tests {
     #[test]
     fn piano_roll_shares_the_arrangement_zoom() {
         let (mut harness, engine) = harness_with_track();
-        let note = Note { start_secs: 0.5, length_secs: 0.5, pitch: 60, velocity: 100, tab: None };
+        // 0.5 s into the region, 0.5 s long, at 120 bpm.
+        let note = Note { start_beats: 1.0, length_beats: 1.0, pitch: 60, velocity: 100, tab: None };
         {
             let mut e = engine.lock().unwrap();
             let t = e.add_instrument_track("Keys", "synth").unwrap();
@@ -4340,7 +4461,7 @@ mod tests {
             let mut e = engine.lock().unwrap();
             let t = e.add_instrument_track("Keys", "synth").unwrap();
             let c = e.add_midi_clip(t, 0.0, 1.0, None).unwrap();
-            e.set_midi_notes(t, c, vec![Note { start_secs: 0.0, length_secs: 0.8, pitch: 60, velocity: 100, tab: None }]).unwrap();
+            e.set_midi_notes(t, c, vec![Note { start_beats: 0.0, length_beats: 1.6, pitch: 60, velocity: 100, tab: None }]).unwrap();
         }
         click(&mut harness, "File");
         click(&mut harness, &menu_label(MenuCommand::ExportAudio));
@@ -4442,10 +4563,9 @@ mod tests {
             let mut notes = Vec::new();
             for (bar, chord) in [[60u8, 64, 67], [57, 60, 64], [53, 57, 60], [55, 59, 62]].iter().enumerate() {
                 for (k, &p) in chord.iter().enumerate() {
-                    let start = bar as f64 * 4.0 * beat;
-                    notes.push(Note { start_secs: start, length_secs: 3.5 * beat, pitch: p, velocity: 80 + 15 * k as u8, tab: None });
+                    notes.push(Note { start_beats: bar as f64 * 4.0, length_beats: 3.5, pitch: p, velocity: 80 + 15 * k as u8, tab: None });
                 }
-                notes.push(Note { start_secs: (bar as f64 * 4.0 + 2.0) * beat, length_secs: beat, pitch: chord[2] + 5, velocity: 110, tab: None });
+                notes.push(Note { start_beats: bar as f64 * 4.0 + 2.0, length_beats: 1.0, pitch: chord[2] + 5, velocity: 110, tab: None });
             }
             e.set_midi_notes(keys, clip, notes).unwrap();
             e.update_track(keys, TrackUpdate { armed: Some(true), ..Default::default() }).unwrap();

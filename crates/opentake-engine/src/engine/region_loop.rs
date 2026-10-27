@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Result, bail};
-use opentake_project::{MAX_LOOP_PASSES, MIN_LOOP_SECS, Project, RegionLoop};
+use opentake_project::{MAX_LOOP_PASSES, MIN_LOOP_LEN, Project, RegionLoop};
 use serde::Deserialize;
 
 use super::Engine;
@@ -29,8 +29,9 @@ const FILL_PASSES: usize = 4;
 
 impl Engine {
     /// Loop regions, or stop looping them (one undo step). A region that doesn't loop yet loops
-    /// all of itself: its length (rounded to whole samples, so every pass plays the same
-    /// samples) becomes the loop length.
+    /// all of itself: its length becomes the loop length (an audio region's rounded to whole
+    /// samples, so every pass plays the same samples; a MIDI region's in quarter notes, so
+    /// the repeats stay on the beat whatever the tempo does).
     pub fn set_region_loop(&mut self, regions: &[RegionRef], to: LoopTo) -> Result<()> {
         if let LoopTo::Until(t) = to
             && !t.is_finite()
@@ -38,23 +39,29 @@ impl Engine {
             bail!("loop end must be a time in seconds");
         }
         let sr = self.sample_rate() as f64;
+        let map = self.project.tempo_map();
         let mut changed = Vec::new();
         for &r in regions {
             let data = self.region_data(r)?;
-            let (pos, len, looped) = match &data {
-                RegionData::Audio(c) => (c.position_secs, c.length_secs, c.looped),
-                RegionData::Midi(c) => (c.position_secs, c.length_secs, c.looped),
+            // In the region's units: seconds, or quarter notes for MIDI (timeline times convert).
+            let (pos, len, looped, units): (f64, f64, _, &dyn Fn(f64) -> f64) = match &data {
+                RegionData::Audio(c) => (c.position_secs, c.length_secs, c.looped, &|t| t),
+                RegionData::Midi(c) => (c.position_beats, c.length_beats, c.looped, &|t| map.quarters_at(t)),
             };
-            let l = looped.unwrap_or_else(|| RegionLoop::new(((len * sr).round() / sr).max(MIN_LOOP_SECS)));
-            let first = l.len_secs - l.phase_secs.rem_euclid(l.len_secs);
+            let whole = match &data {
+                RegionData::Audio(_) => (len * sr).round() / sr,
+                RegionData::Midi(_) => len,
+            };
+            let l = looped.unwrap_or_else(|| RegionLoop::new(whole.max(MIN_LOOP_LEN)));
+            let first = l.len - l.phase.rem_euclid(l.len);
             let end = match to {
                 LoopTo::Off => None,
-                LoopTo::Fill => Some(next_start(&self.project, r, pos).unwrap_or(pos + FILL_PASSES as f64 * l.len_secs - (l.len_secs - first))),
-                LoopTo::Until(t) => Some(t),
-                LoopTo::Passes(n) => Some(pos + n.max(1) as f64 * l.len_secs - (l.len_secs - first)),
+                LoopTo::Fill => Some(next_start(&self.project, r, data.position(&map)).map(units).unwrap_or(pos + FILL_PASSES as f64 * l.len - (l.len - first))),
+                LoopTo::Until(t) => Some(units(t)),
+                LoopTo::Passes(n) => Some(pos + n.max(1) as f64 * l.len - (l.len - first)),
             };
             // At least the first pass, at most as many passes as play.
-            let length = end.map(|e| (e - pos).max(first.min(len)).min(MAX_LOOP_PASSES as f64 * l.len_secs - (l.len_secs - first)));
+            let length = end.map(|e| (e - pos).max(first.min(len)).min(MAX_LOOP_PASSES as f64 * l.len - (l.len - first)));
             changed.push((r, match data {
                 RegionData::Audio(mut c) => {
                     match length {
@@ -68,8 +75,8 @@ impl Engine {
                 }
                 RegionData::Midi(mut c) => {
                     match length {
-                        None => (c.looped, c.length_secs) = (None, len.min(l.len_secs)),
-                        Some(length) => (c.looped, c.length_secs) = (Some(l), length),
+                        None => (c.looped, c.length_beats) = (None, len.min(l.len)),
+                        Some(length) => (c.looped, c.length_beats) = (Some(l), length),
                     }
                     RegionData::Midi(c)
                 }
@@ -128,7 +135,7 @@ impl Engine {
     /// source's end, plays plain.
     pub(super) fn resolve_source_loops(&mut self, project: &mut Project) {
         let sr = self.sample_rate();
-        for c in project.tracks.iter_mut().flat_map(|t| &mut t.clips).filter(|c| c.looped.is_some_and(|l| l.len_secs <= 0.0)) {
+        for c in project.tracks.iter_mut().flat_map(|t| &mut t.clips).filter(|c| c.looped.is_some_and(|l| l.len <= 0.0)) {
             match self.load_media(&c.file, sr) {
                 Ok(data) => c.loop_whole_source(data.frames() as f64 / sr as f64),
                 Err(_) => c.looped = None,
@@ -137,11 +144,12 @@ impl Engine {
     }
 }
 
-/// Where the next region on `r`'s track after `pos` starts, if one does.
+/// Where (seconds) the next region on `r`'s track after `pos` seconds starts, if one does.
 fn next_start(project: &Project, r: RegionRef, pos: f64) -> Option<f64> {
     let t = &project.tracks[r.track];
+    let map = project.tempo_map();
     let audio = t.clips.iter().enumerate().filter(|(i, _)| !(r.kind == RegionKind::Audio && *i == r.index)).map(|(_, c)| c.position_secs);
-    let midi = t.midi_clips.iter().enumerate().filter(|(i, _)| !(r.kind == RegionKind::Midi && *i == r.index)).map(|(_, c)| c.position_secs);
+    let midi = t.midi_clips.iter().enumerate().filter(|(i, _)| !(r.kind == RegionKind::Midi && *i == r.index)).map(|(_, c)| c.start_secs(&map));
     audio.chain(midi).filter(|&s| s > pos + 1e-9).min_by(f64::total_cmp)
 }
 
@@ -188,7 +196,7 @@ mod tests {
         e.trim_clip(0, 0, None, Some(3.25)).unwrap();
         assert_eq!(e.build_clips(0, 48_000).len(), 5);
         let t = e.trim_clip(0, 0, Some(1.1), None).unwrap();
-        assert_eq!((t.position_secs, t.looped.map(|l| (l.len_secs * 1e6).round()), t.position_secs + t.length_secs), (1.1, Some(400_000.0), 3.25));
+        assert_eq!((t.position_secs, t.looped.map(|l| (l.len * 1e6).round()), t.position_secs + t.length_secs), (1.1, Some(400_000.0), 3.25));
         // Fill runs up to the next region; off goes back to the first pass. All undoable.
         e.undo().unwrap();
         let copy = e.copy_clip(0, 0, 4.0, None).unwrap();
@@ -229,7 +237,7 @@ mod tests {
         let mut e = Engine::new();
         e.load_project(&dir.join("p.rpp")).unwrap();
         let clips = &e.project().tracks[0].clips;
-        assert_eq!((clips[0].source_offset_secs, clips[0].looped), (0.0, Some(RegionLoop { len_secs: 2.0, phase_secs: 0.5 })));
+        assert_eq!((clips[0].source_offset_secs, clips[0].looped), (0.0, Some(RegionLoop { len: 2.0, phase: 0.5 })));
         assert_eq!((clips[1].source_offset_secs, clips[1].looped), (0.5, None), "never reaches the end: plain");
         assert_eq!(e.build_clips(0, 48_000).len(), 4);
         std::fs::remove_dir_all(dir).ok();
@@ -239,10 +247,11 @@ mod tests {
     fn midi_passes_repeat_notes_and_controllers() {
         let mut e = Engine::new();
         let t = e.add_instrument_track("Keys", "synth").unwrap();
+        // 1 s for 1 s at 120 bpm: beats 2..4.
         let c = e.add_midi_clip(t, 1.0, 1.0, None).unwrap();
         // The second note runs past the loop end: cut there in every pass.
-        e.set_midi_notes(t, c, vec![Note { start_secs: 0.0, length_secs: 0.25, pitch: 60, velocity: 100, tab: None }, Note { start_secs: 0.75, length_secs: 1.0, pitch: 64, velocity: 90, tab: None }]).unwrap();
-        e.set_midi_controllers(t, c, Controller::PitchBend, vec![ControllerEvent { time_secs: 0.5, value: 1.0 }], true).unwrap();
+        e.set_midi_notes(t, c, vec![Note { start_beats: 0.0, length_beats: 0.5, pitch: 60, velocity: 100, tab: None }, Note { start_beats: 1.5, length_beats: 2.0, pitch: 64, velocity: 90, tab: None }]).unwrap();
+        e.set_midi_controllers(t, c, Controller::PitchBend, vec![ControllerEvent { time_beats: 1.0, value: 1.0 }], true).unwrap();
         e.set_region_loop(&[RegionRef::midi(t, c)], LoopTo::Until(3.5)).unwrap();
         let rt = e.build_midi(t, 1000);
         assert_eq!(rt.iter().map(|r| (r.start, r.end)).collect::<Vec<_>>(), [(1000, 2000), (2000, 3000), (3000, 3500)]);
@@ -257,7 +266,16 @@ mod tests {
         let notes: Vec<_> = rt.iter().flat_map(|r| r.notes.iter().map(|n| (n.start, n.end, n.pitch))).collect();
         assert_eq!(notes, [(1000, 1250, 60), (1750, 2000, 64), (2000, 2250, 60), (2750, 3000, 64), (3000, 3250, 60)]);
         let right = &e.project().tracks[t].midi_clips[1];
-        assert_eq!((right.position_secs, right.looped.map(|l| l.len_secs)), (2.5, Some(1.0)));
-        assert_eq!(right.lane(Controller::PitchBend).unwrap(), &ControllerLane::new(Controller::PitchBend, vec![ControllerEvent { time_secs: 0.0, value: 1.0 }, ControllerEvent { time_secs: 0.5, value: 0.0 }]));
+        assert_eq!((right.position_beats, right.looped.map(|l| l.len)), (5.0, Some(2.0)));
+        assert_eq!(right.lane(Controller::PitchBend).unwrap(), &ControllerLane::new(Controller::PitchBend, vec![ControllerEvent { time_beats: 0.0, value: 1.0 }, ControllerEvent { time_beats: 1.0, value: 0.0 }]));
+
+        // The loop is in beats: at half the tempo every pass takes twice as long.
+        e.undo().unwrap();
+        e.set_tempo(60.0, None).unwrap();
+        let rt = e.build_midi(t, 1000);
+        assert_eq!(rt.iter().map(|r| (r.start, r.end)).collect::<Vec<_>>(), [(2000, 4000), (4000, 6000), (6000, 7000)]);
+        // Trimming and looping to a time convert it through the map.
+        e.set_region_loop(&[RegionRef::midi(t, c)], LoopTo::Until(9.0)).unwrap();
+        assert_eq!(e.project().tracks[t].midi_clips[c].length_beats, 7.0);
     }
 }

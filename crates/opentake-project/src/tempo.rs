@@ -1,6 +1,7 @@
 //! Tempo map: converts between seconds, quarter notes and bars/beats across tempo and
-//! time-signature changes. Region and note times stay in seconds; the map decides where
-//! bars and beats fall (ruler, grid, snapping, metronome, plug-in transport).
+//! time-signature changes. Audio regions, automation and markers are in seconds; MIDI regions
+//! are in quarter notes and so follow it. The map decides where bars and beats fall (ruler,
+//! grid, snapping, metronome, plug-in transport) and when MIDI plays.
 
 use serde::{Deserialize, Serialize};
 

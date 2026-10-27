@@ -346,7 +346,7 @@ fn import_item(node: &Node, base_dir: &Path) -> Option<Clip> {
         show_takes: false,
         // Reaper loops the whole source; how long that is is known once it's read (see
         // `Clip::loop_whole_source`).
-        looped: (node.value::<u8>("LOOP", 0).unwrap_or(0) != 0).then_some(RegionLoop { len_secs: 0.0, phase_secs: 0.0 }),
+        looped: (node.value::<u8>("LOOP", 0).unwrap_or(0) != 0).then_some(RegionLoop { len: 0.0, phase: 0.0 }),
     })
 }
 
@@ -819,10 +819,10 @@ mod tests {
         let base = Path::new("/proj");
         let p = from_str(&SAMPLE.replace("LOOP 0", "LOOP 1"), base).unwrap();
         // How long the source is (what Reaper loops) is known once the file is read.
-        assert_eq!(p.tracks[0].clips[0].looped, Some(RegionLoop { len_secs: 0.0, phase_secs: 0.0 }));
+        assert_eq!(p.tracks[0].clips[0].looped, Some(RegionLoop { len: 0.0, phase: 0.0 }));
         let mut c = p.tracks[0].clips[0].clone();
         c.loop_whole_source(4.0);
-        assert_eq!((c.source_offset_secs, c.looped), (0.0, Some(RegionLoop { len_secs: 4.0, phase_secs: 1.25 })));
+        assert_eq!((c.source_offset_secs, c.looped), (0.0, Some(RegionLoop { len: 4.0, phase: 1.25 })));
         let mut short = p.tracks[0].clips[0].clone();
         short.loop_whole_source(20.0);
         assert!(short.looped.is_none() && short.source_offset_secs == 1.25, "never wraps: plain");

@@ -12,7 +12,7 @@ use opentake_project::{Controller, ControllerEvent, ControllerLane, Marker, Midi
 use serde::Serialize;
 
 use super::Engine;
-use super::guitarpro::tempo_map_from_points;
+use super::guitarpro::{song_clock, tempo_map_from_points};
 
 /// MIDI channel 10 (0-based 9) is the General MIDI drum channel.
 const DRUM_CHANNEL: u8 = 9;
@@ -74,7 +74,8 @@ pub struct MidiFileTrackInfo {
     pub notes: usize,
 }
 
-/// One importable part: the notes of one channel of one MIDI track, in song seconds.
+/// One importable part: the notes of one channel of one MIDI track, in quarter notes from
+/// the song start.
 struct Part {
     name: String,
     channel: u8,
@@ -91,8 +92,9 @@ struct Song {
     /// (seconds, signature) in order.
     signatures: Vec<(f64, (u32, u32))>,
     parts: Vec<Part>,
-    /// Marker meta events: (seconds, name).
+    /// Marker meta events: (quarter notes, name).
     markers: Vec<(f64, String)>,
+    /// Seconds.
     duration: f64,
 }
 
@@ -184,12 +186,18 @@ fn parse(bytes: &[u8]) -> Result<Song> {
             _ => signatures.push((at, sig)),
         }
     }
+    // Quarter notes: ticks over the resolution, or (SMPTE time) through the tempos.
+    let song_map = song_clock(&tempos);
+    let quarters = |tick: u64| match smf.header.timing {
+        Timing::Metrical(tpq) => tick as f64 / tpq.as_int().max(1) as f64,
+        Timing::Timecode(..) => song_map.quarters_at(clock.secs(tick)),
+    };
 
     let mut markers: Vec<(f64, String)> = tracks
         .iter()
         .flatten()
         .filter_map(|&(tick, kind)| match kind {
-            TrackEventKind::Meta(MetaMessage::Marker(n)) => Some((clock.secs(tick), String::from_utf8_lossy(n).trim().to_string())),
+            TrackEventKind::Meta(MetaMessage::Marker(n)) => Some((quarters(tick), String::from_utf8_lossy(n).trim().to_string())),
             _ => None,
         })
         .collect();
@@ -208,9 +216,9 @@ fn parse(bytes: &[u8]) -> Result<Song> {
         // Sounding notes by (channel, key): start tick and velocity.
         let mut open: HashMap<(u8, u8), (u64, u8)> = HashMap::new();
         let close = |notes: &mut Vec<Vec<Note>>, (ch, key): (u8, u8), (start, vel): (u64, u8), end: u64| {
-            let start_secs = clock.secs(start);
-            let length_secs = (clock.secs(end) - start_secs).max(0.01);
-            notes[ch as usize].push(Note { start_secs, length_secs, pitch: key, velocity: vel.clamp(1, 127), tab: None });
+            let start_beats = quarters(start);
+            let length_beats = (quarters(end) - start_beats).max(0.01);
+            notes[ch as usize].push(Note { start_beats, length_beats, pitch: key, velocity: vel.clamp(1, 127), tab: None });
         };
         for &(tick, kind) in events {
             match kind {
@@ -242,7 +250,7 @@ fn parse(bytes: &[u8]) -> Result<Song> {
                                 MidiMessage::ChannelAftertouch { vel } => (Controller::ChannelPressure, vel.as_int() as u16),
                                 _ => continue,
                             };
-                            ctrl[ch as usize].push((kind, ControllerEvent { time_secs: clock.secs(tick), value: kind.from_raw(raw) }));
+                            ctrl[ch as usize].push((kind, ControllerEvent { time_beats: quarters(tick), value: kind.from_raw(raw) }));
                         }
                     }
                 }
@@ -270,7 +278,7 @@ fn parse(bytes: &[u8]) -> Result<Song> {
                 (false, true) => format!("{name} — {label}"),
             };
             let part_notes = std::mem::take(&mut notes[ch as usize]);
-            duration = part_notes.iter().map(|n| n.start_secs + n.length_secs).fold(duration, f64::max);
+            duration = part_notes.iter().map(|n| song_map.secs_at(n.start_beats + n.length_beats)).fold(duration, f64::max);
             let controllers = lanes(std::mem::take(&mut ctrl[ch as usize]));
             parts.push(Part { name: part_name, channel: ch, program, notes: part_notes, controllers });
         }
@@ -358,8 +366,10 @@ impl Engine {
         }
         let song_name = if song.name.is_empty() { path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default() } else { song.name.clone() };
         let start = options.position_secs.max(0.0);
-        let length = song.duration.max(0.1);
-        let marks: Vec<TempoMark> = song.tempos.iter().map(|&(t, bpm)| TempoMark { start_secs: t, bpm }).collect();
+        let clock = song_clock(&song.tempos);
+        let length = clock.quarters_at(song.duration).max(0.1);
+        // The song's own tempo, on its beats (the notes play at the project's tempo map).
+        let marks: Vec<TempoMark> = song.tempos.iter().map(|&(t, bpm)| TempoMark { start_beats: clock.quarters_at(t), bpm }).collect();
 
         self.record("Import MIDI File", None, |e| {
             if options.set_tempo {
@@ -367,11 +377,12 @@ impl Engine {
                 e.project.tempo_bpm = bpm;
                 e.project.time_signature = sig;
                 e.project.tempo_changes = changes;
-                let cmd = e.tempo_command();
-                e.send(cmd)?;
+                e.sync_tempo()?;
             }
-            // The song's markers, once however many of its parts come in.
-            e.project.merge_markers(song.markers.iter().map(|(t, name)| Marker::new(start + t, if name.is_empty() { "Marker" } else { name })));
+            let map = e.project.tempo_map();
+            let start = map.quarters_at(start);
+            // The song's markers, on its beats, once however many of its parts come in.
+            e.project.merge_markers(song.markers.iter().map(|(q, name)| Marker::new(map.secs_at(start + q), if name.is_empty() { "Marker" } else { name })));
             let mut created = Vec::new();
             for (&i, slot) in wanted.iter().zip(slots) {
                 let part = &song.parts[i];
@@ -407,7 +418,8 @@ impl Engine {
 /// Encode the project's MIDI regions as an SMF; returns the bytes and the note-track count.
 fn smf_bytes(project: &Project) -> Result<(Vec<u8>, usize)> {
     let map = project.tempo_map();
-    let tick = |secs: f64| (map.quarters_at(secs.max(0.0)) * EXPORT_PPQ as f64).round().max(0.0) as u64;
+    let tick_q = |q: f64| (q * EXPORT_PPQ as f64).round().max(0.0) as u64;
+    let tick = |secs: f64| tick_q(map.quarters_at(secs.max(0.0)));
     let meta = TrackEventKind::Meta;
 
     // Tempo track: tempo and time signature at every tempo-map segment.
@@ -441,23 +453,24 @@ fn smf_bytes(project: &Project) -> Result<(Vec<u8>, usize)> {
         for clip in track.midi_clips.iter().filter(|c| !c.mute) {
             // Loops written out as their repeats.
             let clip = clip.unrolled();
-            for n in clip.notes.iter().filter(|n| n.start_secs < clip.length_secs) {
-                let on = tick(clip.position_secs + n.start_secs);
-                let end = n.start_secs + n.length_secs.min(clip.length_secs - n.start_secs);
-                let off = tick(clip.position_secs + end).max(on + 1);
+            // Regions are in quarter notes already.
+            let at = |rel: f64| tick_q(clip.position_beats + rel);
+            for n in clip.notes.iter().filter(|n| n.start_beats < clip.length_beats) {
+                let on = at(n.start_beats);
+                let off = at(n.start_beats + n.length_beats.min(clip.length_beats - n.start_beats)).max(on + 1);
                 let key = u7::new(n.pitch.min(127));
                 events.push((on, TrackEventKind::Midi { channel: ch, message: MidiMessage::NoteOn { key, vel: u7::new(n.velocity.clamp(1, 127)) } }));
                 events.push((off, TrackEventKind::Midi { channel: ch, message: MidiMessage::NoteOff { key, vel: u7::new(0) } }));
             }
             for lane in &clip.controllers {
-                for e in lane.events.iter().filter(|e| e.time_secs < clip.length_secs) {
+                for e in lane.events.iter().filter(|e| e.time_beats < clip.length_beats) {
                     let raw = lane.kind.raw(e.value);
                     let message = match lane.kind {
                         Controller::Cc(n) => MidiMessage::Controller { controller: u7::new(n & 0x7F), value: u7::new(raw as u8) },
                         Controller::PitchBend => MidiMessage::PitchBend { bend: PitchBend(u14::new(raw)) },
                         Controller::ChannelPressure => MidiMessage::ChannelAftertouch { vel: u7::new(raw as u8) },
                     };
-                    events.push((tick(clip.position_secs + e.time_secs), TrackEventKind::Midi { channel: ch, message }));
+                    events.push((at(e.time_beats), TrackEventKind::Midi { channel: ch, message }));
                 }
             }
         }
@@ -595,12 +608,14 @@ mod tests {
         assert_eq!(song.parts.len(), 2);
         let bass = &song.parts[0];
         assert_eq!((bass.name.as_str(), bass.channel, bass.program), ("Bass", 1, Some(33)));
-        let notes: Vec<(f64, f64, u8, u8)> = bass.notes.iter().map(|n| (n.start_secs, n.length_secs, n.pitch, n.velocity)).collect();
-        assert_eq!(notes, vec![(0.0, 0.5, 40, 100), (1.5, 1.0, 43, 90), (4.0, 1.0, 45, 80), (5.0, 1.0, 45, 70)]);
+        // In quarter notes (ticks / 480), whatever the tempo.
+        let notes: Vec<(f64, f64, u8, u8)> = bass.notes.iter().map(|n| (n.start_beats, n.length_beats, n.pitch, n.velocity)).collect();
+        assert_eq!(notes, vec![(0.0, 1.0, 40, 100), (3.0, 1.5, 43, 90), (6.0, 1.0, 45, 80), (7.0, 1.0, 45, 70)]);
         let drums = &song.parts[1];
         assert_eq!((drums.name.as_str(), drums.channel), ("Drums", 9));
-        assert_eq!(drums.notes.iter().map(|n| (n.start_secs, n.pitch)).collect::<Vec<_>>(), vec![(0.0, 36), (1.0, 38)]);
-        assert!((song.duration - 7.0).abs() < 1e-9);
+        assert_eq!(drums.notes.iter().map(|n| (n.start_beats, n.pitch)).collect::<Vec<_>>(), vec![(0.0, 36), (2.0, 38)]);
+        assert_eq!(song.markers, vec![(0.0, "Intro".to_string()), (4.0, "Verse".to_string())]);
+        assert!((song.duration - 7.0).abs() < 1e-9, "seconds");
 
         let s = summarize(&song);
         assert_eq!((s.format, s.tempo_bpm, s.time_signature, s.tempo_changes), (1, 120.0, (4, 4), 1));
@@ -622,8 +637,9 @@ mod tests {
         let bytes = smf(Format::SingleTrack, Timing::Timecode(midly::Fps::Fps25, 40), vec![track]);
         let song = parse(&bytes).unwrap();
         assert_eq!(song.format, 0);
-        let parts: Vec<(&str, u8, f64)> = song.parts.iter().map(|p| (p.name.as_str(), p.channel, p.notes[0].length_secs)).collect();
-        assert_eq!(parts, vec![("Acoustic Grand Piano", 0, 0.2), ("Drums", 9, 0.1)]);
+        // 0.2 s and 0.1 s, in beats of the reported 240 bpm.
+        let parts: Vec<(&str, u8, f64)> = song.parts.iter().map(|p| (p.name.as_str(), p.channel, (p.notes[0].length_beats * 1e9).round() / 1e9)).collect();
+        assert_eq!(parts, vec![("Acoustic Grand Piano", 0, 0.8), ("Drums", 9, 0.4)]);
         assert_eq!(song.tempos, vec![(0.0, 240.0)], "tempo is still reported");
     }
 
@@ -654,10 +670,17 @@ mod tests {
         let opts = MidiFileImport { tracks: Some(vec![1]), set_tempo: false, position_secs: 4.0, ..Default::default() };
         let created = e.import_midi_file(&path, &opts).unwrap();
         assert_eq!(e.project().tracks[created[0]].name, "Drums");
-        assert_eq!(e.project().tracks[created[0]].midi_clips[0].position_secs, 4.0);
+        assert_eq!(e.project().tracks[created[0]].midi_clips[0].position_beats, 8.0, "4 s at 120 bpm");
         assert!(e.project().tempo_changes.is_empty());
         assert_eq!(e.project().markers.iter().map(|m| m.time_secs).collect::<Vec<_>>(), vec![4.0, 6.0], "markers move with the song");
-        e.import_midi_file(&path, &opts).unwrap();
+        // The song's notes are on its beats and follow the project's tempo (120 throughout,
+        // where the file slows to 60): the bass note on beat 6 plays at 4 + 3 s, not 4 + 4 s.
+        let bass = e.import_midi_file(&path, &MidiFileImport { tracks: Some(vec![0]), ..opts.clone() }).unwrap()[0];
+        let clip = &e.project().tracks[bass].midi_clips[0];
+        assert_eq!(clip.notes[2].start_beats, 6.0);
+        assert_eq!(clip.secs_of(&e.project().tempo_map(), clip.notes[2].start_beats), 7.0);
+        assert_eq!(clip.tempos.iter().map(|m| (m.start_beats, m.bpm)).collect::<Vec<_>>(), [(0.0, 120.0), (4.0, 60.0)]);
+        assert!(e.song_tempo_differs());
         assert_eq!(e.project().markers.len(), 2, "importing another part doesn't repeat them");
         let bad = MidiFileImport { tracks: Some(vec![5]), ..Default::default() };
         assert!(e.import_midi_file(&path, &bad).is_err());
@@ -675,13 +698,21 @@ mod tests {
         let again = read(&out).unwrap();
         assert_eq!(again.tempos, vec![(0.0, 120.0), (2.0, 60.0)]);
         assert_eq!(again.signatures, vec![(0.0, (4, 4)), (2.0, (3, 4))]);
-        assert_eq!(again.markers, vec![(0.0, "Intro".to_string()), (2.0, "Verse".to_string())]);
+        assert_eq!(again.markers, vec![(0.0, "Intro".to_string()), (4.0, "Verse".to_string())]);
         let original = parse(&song()).unwrap();
         for (a, b) in again.parts.iter().zip(&original.parts) {
             assert_eq!((a.name.as_str(), a.channel == DRUM_CHANNEL), (b.name.as_str(), b.channel == DRUM_CHANNEL));
-            let times = |p: &Part| p.notes.iter().map(|n| (n.pitch, (n.start_secs * 1e3).round(), (n.length_secs * 1e3).round(), n.velocity)).collect::<Vec<_>>();
-            assert_eq!(times(a), times(b));
+            let times = |p: &Part| p.notes.iter().map(|n| (n.pitch, n.start_beats, n.length_beats, n.velocity)).collect::<Vec<_>>();
+            assert_eq!(times(a), times(b), "beats exactly");
         }
+
+        // A different tempo map: the notes keep their beats (ticks); the file gets the new map
+        // (the change stays at 2 s, now beat 3).
+        e.set_tempo(90.0, None).unwrap();
+        e.export_midi_file(&out).unwrap();
+        let slower = read(&out).unwrap();
+        assert_eq!(slower.tempos.iter().map(|t| ((t.0 * 1e4).round() / 1e4, (t.1 * 1e3).round() / 1e3)).collect::<Vec<_>>(), [(0.0, 90.0), (2.0, 60.0)]);
+        assert_eq!(slower.parts[0].notes, again.parts[0].notes);
         assert!(Engine::new().export_midi_file(&out).is_err(), "nothing to export");
         std::fs::remove_file(path).ok();
         std::fs::remove_file(out).ok();
@@ -704,12 +735,12 @@ mod tests {
             (960, cc(64, 0)),
         ];
         let song = parse(&smf(Format::SingleTrack, Timing::Metrical(u15::new(480)), vec![track])).unwrap();
-        let summary = |lanes: &[ControllerLane]| lanes.iter().map(|l| (l.kind, l.events.iter().map(|e| (e.time_secs, l.kind.raw(e.value))).collect::<Vec<_>>())).collect::<Vec<_>>();
+        let summary = |lanes: &[ControllerLane]| lanes.iter().map(|l| (l.kind, l.events.iter().map(|e| (e.time_beats, l.kind.raw(e.value))).collect::<Vec<_>>())).collect::<Vec<_>>();
         let want = vec![
-            (Controller::PitchBend, vec![(0.25, 12288), (0.5, 8192)]),
+            (Controller::PitchBend, vec![(0.5, 12288), (1.0, 8192)]),
             (Controller::Cc(7), vec![(0.0, 100)]),
-            (Controller::SUSTAIN, vec![(0.5, 127), (1.0, 0)]),
-            (Controller::ChannelPressure, vec![(0.75, 80)]),
+            (Controller::SUSTAIN, vec![(1.0, 127), (2.0, 0)]),
+            (Controller::ChannelPressure, vec![(1.5, 80)]),
         ];
         assert_eq!(summary(&song.parts[0].controllers), want);
 
@@ -718,7 +749,7 @@ mod tests {
         e.import_midi_file(&path, &MidiFileImport::default()).unwrap();
         let clip = &e.project().tracks[0].midi_clips[0];
         assert_eq!(clip.lane(Controller::PitchBend).map(|l| l.events.len()), Some(1));
-        e.set_midi_controllers(0, 0, Controller::ChannelPressure, vec![ControllerEvent { time_secs: 0.75, value: 1.0 }], true).unwrap();
+        e.set_midi_controllers(0, 0, Controller::ChannelPressure, vec![ControllerEvent { time_beats: 1.5, value: 1.0 }], true).unwrap();
         let out = std::env::temp_dir().join(format!("opentake-midi-{}-cc-out.mid", std::process::id()));
         e.export_midi_file(&out).unwrap();
         let again = read(&out).unwrap();

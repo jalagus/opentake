@@ -36,7 +36,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use opentake_project::{Clip, Fade, MAX_LOOP_PASSES, MIN_LOOP_SECS, Project, TempoChange, Track, played_clips};
+use opentake_project::{Clip, Fade, MAX_LOOP_PASSES, MIN_LOOP_LEN, Project, TempoChange, Track, played_clips};
 use opentake_vst3::{Module, ScannedPlugin};
 use rtrb::{Consumer, Producer};
 use serde::Serialize;
@@ -812,8 +812,7 @@ impl Engine {
             if let Some(sig) = time_signature {
                 e.project.time_signature = sig;
             }
-            let cmd = e.tempo_command();
-            e.send(cmd)
+            e.sync_tempo()
         })
     }
 
@@ -869,8 +868,7 @@ impl Engine {
         changes.sort_by(|a, b| a.at_secs.total_cmp(&b.at_secs));
         self.record("Tempo Change", merge, |e| {
             e.project.tempo_changes = changes;
-            let cmd = e.tempo_command();
-            e.send(cmd)
+            e.sync_tempo()
         })
     }
 
@@ -1127,13 +1125,13 @@ impl Engine {
         let source_end = source_start + source * c.stretch;
         let end = end_secs.unwrap_or(c.position_secs + c.length_secs);
         let end = match c.looped {
-            Some(l) => end.min(c.position_secs + l.len_secs * MAX_LOOP_PASSES as f64),
+            Some(l) => end.min(c.position_secs + l.len * MAX_LOOP_PASSES as f64),
             None => end.min(source_end),
         };
         let mut start = start_secs.unwrap_or(c.position_secs).max(source_start).max(0.0);
         if let Some(l) = c.looped {
             // The loop can't shrink to nothing.
-            start = start.min(c.position_secs + l.len_secs - MIN_LOOP_SECS);
+            start = start.min(c.position_secs + l.len - MIN_LOOP_LEN);
         }
         if end - start < Self::MIN_CLIP_SECS {
             bail!("trim would leave clip '{}' shorter than {} ms", c.name, Self::MIN_CLIP_SECS * 1000.0);
@@ -1255,6 +1253,8 @@ impl Engine {
         project.prune_automation();
         project.tidy_markers();
 
+        // Older files keep MIDI in seconds: to beats through the tempo map they were saved with.
+        project.upgrade();
         if guitarpro::upgrade_song_tempo(&mut project) {
             warnings.push("The imported song's tempo changes were added to the project's tempo map".into());
         }

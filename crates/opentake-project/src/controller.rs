@@ -91,10 +91,11 @@ impl Controller {
     }
 }
 
-/// A controller value at a time (seconds from the region start; value normalized).
+/// A controller value at a time (quarter notes from the region start; value normalized).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ControllerEvent {
-    pub time_secs: f64,
+    #[serde(alias = "time_secs")]
+    pub time_beats: f64,
     pub value: f32,
 }
 
@@ -118,14 +119,14 @@ impl ControllerLane {
         let (lo, hi) = if self.kind.is_bipolar() { (-1.0, 1.0) } else { (0.0, 1.0) };
         for e in &mut self.events {
             e.value = e.value.clamp(lo, hi);
-            e.time_secs = e.time_secs.max(0.0);
+            e.time_beats = e.time_beats.max(0.0);
         }
-        self.events.sort_by(|a, b| a.time_secs.total_cmp(&b.time_secs));
+        self.events.sort_by(|a, b| a.time_beats.total_cmp(&b.time_beats));
         // Same time: the later one wins.
         let mut out: Vec<ControllerEvent> = Vec::with_capacity(self.events.len());
         for e in self.events.drain(..) {
             match out.last_mut() {
-                Some(last) if (last.time_secs - e.time_secs).abs() < 1e-9 => *last = e,
+                Some(last) if (last.time_beats - e.time_beats).abs() < 1e-9 => *last = e,
                 _ => out.push(e),
             }
         }
@@ -135,7 +136,7 @@ impl ControllerLane {
 
     /// The value in effect at `t` (the last event at or before it).
     pub fn value_at(&self, t: f64) -> Option<f32> {
-        let i = self.events.partition_point(|e| e.time_secs <= t + 1e-9);
+        let i = self.events.partition_point(|e| e.time_beats <= t + 1e-9);
         i.checked_sub(1).map(|i| self.events[i].value)
     }
 
@@ -143,12 +144,12 @@ impl ControllerLane {
     /// and led by the value in effect at the cut, so the right part starts where the left
     /// left off.
     pub fn split_off(&mut self, cut: f64) -> ControllerLane {
-        let at = self.events.partition_point(|e| e.time_secs < cut - 1e-9);
-        let mut right: Vec<ControllerEvent> = self.events.split_off(at).into_iter().map(|e| ControllerEvent { time_secs: (e.time_secs - cut).max(0.0), ..e }).collect();
-        if right.first().is_none_or(|e| e.time_secs > 1e-9)
+        let at = self.events.partition_point(|e| e.time_beats < cut - 1e-9);
+        let mut right: Vec<ControllerEvent> = self.events.split_off(at).into_iter().map(|e| ControllerEvent { time_beats: (e.time_beats - cut).max(0.0), ..e }).collect();
+        if right.first().is_none_or(|e| e.time_beats > 1e-9)
             && let Some(last) = self.events.last()
         {
-            right.insert(0, ControllerEvent { time_secs: 0.0, value: last.value });
+            right.insert(0, ControllerEvent { time_beats: 0.0, value: last.value });
         }
         ControllerLane { kind: self.kind, events: right }
     }
@@ -159,7 +160,7 @@ mod tests {
     use super::*;
 
     fn ev(t: f64, v: f32) -> ControllerEvent {
-        ControllerEvent { time_secs: t, value: v }
+        ControllerEvent { time_beats: t, value: v }
     }
 
     #[test]

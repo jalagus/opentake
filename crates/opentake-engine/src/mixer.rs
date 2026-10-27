@@ -656,6 +656,13 @@ impl Mixer {
             .collect()
     }
 
+    /// Test view of the MIDI the audio thread plays: (track id, its notes as (start, end,
+    /// pitch) in samples).
+    #[cfg(test)]
+    pub(crate) fn debug_midi(&self) -> Vec<(u64, Vec<(u64, u64, u8)>)> {
+        self.tracks.iter().map(|t| (t.id, t.midi.iter().flat_map(|c| c.notes.iter().map(|n| (n.start, n.end, n.pitch))).collect())).collect()
+    }
+
     /// Test view of the automation: (track id or `MASTER`, envelope targets).
     #[cfg(test)]
     pub(crate) fn debug_automation(&self) -> Vec<(u64, Vec<EnvTarget>)> {

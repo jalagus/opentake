@@ -246,7 +246,7 @@ mod tests {
         for (name, pitch) in [("Bass", 40u8), ("Lead", 64)] {
             let t = e.add_instrument_track(name, "synth").unwrap();
             let c = e.add_midi_clip(t, 0.0, 2.0, None).unwrap();
-            let notes = (0..4).map(|i| Note { start_secs: i as f64 * 0.5, length_secs: 0.4, pitch, velocity: 100, tab: None }).collect();
+            let notes = (0..4).map(|i| Note { start_beats: i as f64, length_beats: 0.8, pitch, velocity: 100, tab: None }).collect();
             e.set_midi_notes(t, c, notes).unwrap();
         }
         e
