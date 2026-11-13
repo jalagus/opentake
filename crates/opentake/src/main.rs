@@ -1,7 +1,9 @@
 mod gui;
+mod main_thread;
 mod open_files;
 mod server;
 mod settings;
+mod shutdown;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

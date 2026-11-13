@@ -40,6 +40,8 @@ fn app_icon() -> egui::IconData {
 }
 
 pub fn run(engine: SharedEngine, mcp_url: Option<String>, settings_path: Option<PathBuf>) -> anyhow::Result<()> {
+    // From here MCP calls queue for the main thread, which the event loop below runs.
+    crate::main_thread::enable();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("OpenTake")
@@ -49,13 +51,14 @@ pub fn run(engine: SharedEngine, mcp_url: Option<String>, settings_path: Option<
             .with_icon(std::sync::Arc::new(app_icon())),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "OpenTake",
         options,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
             crate::open_files::set_context(&cc.egui_ctx);
             crate::open_files::install();
+            crate::shutdown::install(&engine);
             let has_tracks = !engine.lock().map(|e| e.project().tracks.is_empty()).unwrap_or(true);
             let mut app = DawApp::new(engine, mcp_url);
             let settings = settings_path.as_deref().map(crate::settings::Settings::load).unwrap_or_default();
@@ -75,7 +78,10 @@ pub fn run(engine: SharedEngine, mcp_url: Option<String>, settings_path: Option<
             Ok(Box::new(app))
         }),
     )
-    .map_err(|e| anyhow::anyhow!("GUI failed: {e}"))
+    .map_err(|e| anyhow::anyhow!("GUI failed: {e}"));
+    // The window was closed (Quit goes through shutdown's terminate observer instead).
+    crate::shutdown::run();
+    result
 }
 
 /// Everything the UI needs for one frame, copied out of the engine.

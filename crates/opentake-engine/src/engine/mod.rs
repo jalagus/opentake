@@ -544,6 +544,19 @@ impl Engine {
         Ok(())
     }
 
+    /// Release audio and every plug-in before the process exits: stops the devices, drops
+    /// the plug-in instances and then their modules (calling each one's `bundleExit` /
+    /// `ModuleExit`). Without this a plug-in's static destructors run at `exit()` while its
+    /// own threads are still alive, which crashes some (Kontakt) on quit. Call it on the
+    /// main thread; the engine is unusable for plug-ins afterwards.
+    pub fn shutdown(&mut self) {
+        if let Err(e) = self.stop_audio() {
+            tracing::warn!("stopping audio on shutdown: {e:#}");
+        }
+        self.pool.clear();
+        self.modules.clear();
+    }
+
     fn tempo_command(&self) -> Command {
         Command::SetTempoMap(Box::new(self.project.tempo_map()))
     }

@@ -3524,6 +3524,7 @@ dependencies = [
  "axum",
  "clap",
  "dirs",
+ "dispatch2",
  "eframe",
  "egui",
  "egui_kittest",

@@ -101,9 +101,12 @@ impl DawServer {
         F: FnOnce(&mut Engine) -> anyhow::Result<T> + Send + 'static,
     {
         let engine = self.engine.clone();
+        // On the main thread with the GUI: plug-ins may be instantiated (see main_thread).
         let result = tokio::task::spawn_blocking(move || {
-            let mut e = engine.lock().map_err(|_| anyhow::anyhow!("engine lock poisoned"))?;
-            f(&mut e)
+            crate::main_thread::run(move || {
+                let mut e = engine.lock().map_err(|_| anyhow::anyhow!("engine lock poisoned"))?;
+                f(&mut e)
+            })
         })
         .await
         .map_err(|e| format!("engine task failed: {e}"))?;
@@ -1459,7 +1462,8 @@ impl DawServer {
         };
         let engine = self.engine.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let (job, options) = {
+            // The snapshot instantiates plug-in copies: on the main thread (see main_thread).
+            let (job, options) = crate::main_thread::run(move || {
                 let mut e = engine.lock().map_err(|_| anyhow::anyhow!("engine lock poisoned"))?;
                 let p = e.project();
                 let range = if a.cycle {
@@ -1481,8 +1485,8 @@ impl DawServer {
                     range,
                     tail_secs: a.tail_secs.unwrap_or(1.0),
                 };
-                (e.export_job(&options)?, options)
-            };
+                anyhow::Ok((e.export_job(&options)?, options))
+            })?;
             // Render and write without holding the engine.
             job.export(&options)
         })
@@ -1497,7 +1501,8 @@ impl DawServer {
         // Snapshot under the engine lock, then render without holding it.
         let engine = self.engine.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let job = engine.lock().map_err(|_| anyhow::anyhow!("engine lock poisoned"))?.mix_job();
+            // The snapshot instantiates plug-in copies: on the main thread (see main_thread).
+            let job = crate::main_thread::run(move || anyhow::Ok(engine.lock().map_err(|_| anyhow::anyhow!("engine lock poisoned"))?.mix_job()))?;
             job.analyze(a.from_secs, a.to_secs)
         })
         .await
