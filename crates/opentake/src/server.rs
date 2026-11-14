@@ -2387,12 +2387,45 @@ impl DawServer {
     }
 }
 
+/// Arguments a tool's input schema doesn't declare, as the error to report. Serde ignores
+/// unknown fields (and `deny_unknown_fields` can't be combined with the `flatten` some
+/// argument structs use), so a misspelt argument such as `volume` for `volume_db` would
+/// otherwise be dropped silently while the call reports success.
+fn unknown_arguments(schema: &rmcp::model::JsonObject, args: Option<&rmcp::model::JsonObject>) -> Option<String> {
+    let props = schema.get("properties").and_then(|p| p.as_object());
+    let known = |k: &str| props.is_some_and(|p| p.contains_key(k));
+    let unknown: Vec<&str> = args.into_iter().flat_map(|a| a.keys()).map(String::as_str).filter(|k| !known(k)).collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    let mut expected: Vec<&str> = props.into_iter().flat_map(|p| p.keys()).map(String::as_str).collect();
+    expected.sort_unstable();
+    let list = |v: &[&str]| v.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ");
+    Some(format!(
+        "failed to deserialize parameters: unknown argument{} {} (expected: {})",
+        if unknown.len() == 1 { "" } else { "s" },
+        list(&unknown),
+        if expected.is_empty() { "none".to_string() } else { list(&expected) },
+    ))
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for DawServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("opentake", env!("CARGO_PKG_VERSION")).with_title("OpenTake"))
             .with_instructions(INSTRUCTIONS)
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        if let Some(msg) = self.tool_router.get(&request.name).and_then(|t| unknown_arguments(&t.input_schema, request.arguments.as_ref())) {
+            return Ok(rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(msg)]).into());
+        }
+        self.tool_router.call(rmcp::handler::server::tool::ToolCallContext::new(self, request, context)).await
     }
 }
 
@@ -2607,5 +2640,36 @@ mod compact_tests {
         assert_eq!(v["master_plugins"][0]["side_chain"]["track"], json!(pad));
         let clear: SideChainArgs = serde_json::from_value(json!({ "slot": 0, "master": true, "source": null })).unwrap();
         assert!(clear.source.is_none() && clear.master);
+    }
+
+    #[test]
+    fn unknown_arguments_are_rejected_against_the_tool_schema() {
+        let router = DawServer::tool_router();
+        let check = |tool: &str, args: serde_json::Value| {
+            let schema = &router.get(tool).unwrap_or_else(|| panic!("no tool {tool}")).input_schema;
+            unknown_arguments(schema, args.as_object())
+        };
+        // The misspelling that used to be dropped silently.
+        let err = check("update_track", json!({ "track": 1, "volume": -8.3 })).expect("volume is not an argument");
+        assert!(err.starts_with("failed to deserialize parameters: unknown argument `volume`"), "{err}");
+        assert!(err.contains("`volume_db`"), "lists what is accepted: {err}");
+        assert!(check("update_track", json!({ "track": 1, "volume_db": -8.3, "pan": 0.1 })).is_none());
+        // Flattened argument structs expose their fields as top-level properties.
+        assert!(check("add_marker", json!({ "bar": 3, "beat": 1.0, "name": "Verse" })).is_none());
+        assert!(check("update_marker", json!({ "marker_name": "Verse", "time_secs": 2.0 })).is_none());
+        assert!(check("add_marker", json!({ "bars": 3 })).is_some());
+        // No arguments, or none at all for a tool that takes none.
+        assert!(check("get_project", json!({})).is_none());
+        assert!(check("play", json!({})).is_none());
+        let none = check("play", json!({ "from": 0 })).unwrap();
+        assert!(none.contains("unknown argument `from`"), "{none}");
+        // Every tool's schema declares its properties, so the check never rejects a valid call.
+        for tool in router.list_all() {
+            let props = tool.input_schema.get("properties").and_then(|p| p.as_object());
+            let required = tool.input_schema.get("required").and_then(|r| r.as_array()).into_iter().flatten();
+            for r in required {
+                assert!(props.is_some_and(|p| p.contains_key(r.as_str().unwrap())), "{}: required {r} not in properties", tool.name);
+            }
+        }
     }
 }
