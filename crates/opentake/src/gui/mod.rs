@@ -308,6 +308,7 @@ pub(crate) struct DawApp {
     /// Input channel for the loopback latency measurement.
     latency_channel: usize,
     show_mcp_info: bool,
+    show_about: bool,
     pub show_plugin_manager: bool,
     show_instrument_picker: bool,
     /// Open "Import Guitar Pro" dialog.
@@ -328,6 +329,10 @@ pub(crate) struct DawApp {
     #[cfg(target_os = "macos")]
     native_menu: Option<menu::NativeMenu>,
     name_buf: (Option<usize>, String),
+    /// The tempo being typed into the LCD (click the tempo to start).
+    tempo_edit: Option<String>,
+    /// When TAP was pressed (UI seconds), for tap tempo.
+    tap_times: Vec<f64>,
     message: Option<(String, bool, Instant)>,
     actions: Vec<Action>,
     /// Automatable parameters per track id: (slot ids they were listed for, when, list).
@@ -406,6 +411,7 @@ impl DawApp {
             show_audio_settings: false,
             latency_channel: 0,
             show_mcp_info: false,
+            show_about: false,
             show_plugin_manager: false,
             show_instrument_picker: false,
             gp_import: None,
@@ -419,6 +425,8 @@ impl DawApp {
             #[cfg(target_os = "macos")]
             native_menu: None,
             name_buf: (None, String::new()),
+            tempo_edit: None,
+            tap_times: Vec::new(),
             message: None,
             actions: Vec::new(),
             auto_params: HashMap::new(),
@@ -654,7 +662,7 @@ impl DawApp {
             Action::SetAutoMonitor(on) => e.set_auto_input_monitoring(on)?,
             Action::InsertMasterPlugin(query) => {
                 let slot = e.insert_master_plugin(&query, None)?;
-                self.open_plugins.push((MASTER_UI, SlotRef::Master(slot)));
+                self.apply(e, Action::OpenEditor(MASTER_UI, SlotRef::Master(slot)))?;
             }
             Action::SetParams(t, s, values, label) => {
                 // Automated parameters go through their lanes, the rest as one step.
@@ -961,7 +969,7 @@ impl DawApp {
             }
             Action::InsertPlugin(t, query) => {
                 let slot = e.insert_plugin(t, &query, None)?;
-                self.open_plugins.push((t, SlotRef::Effect(slot)));
+                self.apply(e, Action::OpenEditor(t, SlotRef::Effect(slot)))?;
             }
             Action::SetInstrument { track, query } => {
                 e.set_instrument(track, query.as_deref())?;
@@ -1979,6 +1987,7 @@ impl DawApp {
             MenuCommand::RescanPlugins => self.act(Action::ScanPlugins),
             MenuCommand::PluginManager => self.show_plugin_manager = true,
             MenuCommand::McpInfo => self.show_mcp_info = true,
+            MenuCommand::About => self.show_about = true,
         }
     }
 
@@ -2141,6 +2150,29 @@ impl DawApp {
         self.show_mcp_info = open;
     }
 
+    /// The build's version (it grows with every commit), to quote in bug reports.
+    fn about_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_about;
+        egui::Window::new("About OpenTake").pivot(Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
+            ui.set_max_width(360.0);
+            ui.label(RichText::new("OpenTake").size(18.0).strong());
+            ui.label(RichText::new("A DAW you can drive from an AI agent over MCP.").color(theme::TEXT_FAINT));
+            ui.add_space(8.0);
+            widgets::section(ui, "Version");
+            ui.horizontal(|ui| {
+                let version = env!("OPENTAKE_VERSION_LONG");
+                ui.label(RichText::new(version).monospace().size(14.0));
+                if ui.button("Copy").clicked() {
+                    ui.ctx().copy_text(format!("OpenTake {version}"));
+                    self.info("Copied to clipboard");
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(RichText::new("Please include this when reporting an issue.").size(11.0).color(theme::TEXT_FAINT));
+        });
+        self.show_about = open;
+    }
+
     fn transport(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
         use widgets::TransportButton as B;
         let s = &snap.status;
@@ -2226,6 +2258,26 @@ impl DawApp {
         });
     }
 
+    /// Set the tempo at the playhead: the project's, or its tempo-track section's. Rounds to
+    /// 0.1 BPM; repeated changes merge into one undo step.
+    fn set_tempo_at_playhead(&mut self, snap: &Snapshot, bpm: f64) {
+        let pos = snap.status.position_secs;
+        let current = snap.project.tempo_map().tempo_at(pos.max(0.0));
+        let new = (bpm.clamp(20.0, 999.0) * 10.0).round() / 10.0;
+        if (new - current).abs() <= f64::EPSILON {
+            return;
+        }
+        let mut changes = snap.project.tempo_changes.clone();
+        changes.sort_by(|a, b| a.at_secs.total_cmp(&b.at_secs));
+        match changes.iter().rposition(|c| c.at_secs <= pos + 1e-9) {
+            None => self.act(Action::SetTempo(new)),
+            Some(i) => {
+                changes[i].bpm = new;
+                self.act(Action::SetTempoChanges { changes, merge: Some(format!("tempo-bpm:{i}")) });
+            }
+        }
+    }
+
     fn lcd(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
         let (rect, _) = ui.allocate_exact_size(vec2(LCD_W, 40.0), Sense::hover());
         let p = ui.painter();
@@ -2291,26 +2343,20 @@ impl DawApp {
         x = time_rect.right();
         sep(p, x);
 
-        // Tempo (drag to change, Shift for fine).
+        // Tempo (click to type it, drag to change, Shift for fine).
         let tempo_rect = Rect::from_min_size(pos2(x, rect.top()), vec2(70.0, rect.height()));
-        let resp = ui.interact(tempo_rect, ui.make_persistent_id("lcd_tempo"), Sense::drag());
-        // The tempo map's tempo at the playhead; dragging edits that section's tempo.
+        let resp = ui.interact(tempo_rect, ui.make_persistent_id("lcd_tempo"), Sense::click_and_drag());
+        widgets::label(&resp, egui::Role::Button, "Tempo");
+        // The tempo map's tempo at the playhead; editing changes that section's tempo.
         let bpm = map.tempo_at(s.position_secs.max(0.0));
-        let mut changes = snap.project.tempo_changes.clone();
-        changes.sort_by(|a, b| a.at_secs.total_cmp(&b.at_secs));
-        let section = changes.iter().rposition(|c| c.at_secs <= s.position_secs + 1e-9);
+        let section = snap.project.tempo_changes.iter().any(|c| c.at_secs <= s.position_secs + 1e-9);
         if resp.dragged() {
             let fine = ui.input(|i| i.modifiers.shift);
-            let new = ((bpm - resp.drag_delta().y as f64 * if fine { 0.05 } else { 0.5 }).clamp(20.0, 999.0) * 10.0).round() / 10.0;
-            if (new - bpm).abs() > f64::EPSILON {
-                match section {
-                    None => self.act(Action::SetTempo(new)),
-                    Some(i) => {
-                        changes[i].bpm = new;
-                        self.act(Action::SetTempoChanges { changes: changes.clone(), merge: Some(format!("tempo-bpm:{i}")) });
-                    }
-                }
-            }
+            let new = bpm - resp.drag_delta().y as f64 * if fine { 0.05 } else { 0.5 };
+            self.set_tempo_at_playhead(snap, new);
+        }
+        if resp.clicked() && self.tempo_edit.is_none() {
+            self.tempo_edit = Some(format!("{bpm:.1}"));
         }
         // An imported song that didn't adopt its tempo map: show the tempo it plays at;
         // hovering/dragging shows (and edits) the project tempo again.
@@ -2319,19 +2365,74 @@ impl DawApp {
             Some(t) => format!(
                 "Song tempo {t:.1} at the playhead (from the imported score); the project, grid and metronome are at {bpm:.1}.\nClick \"Use song tempo\" in the Tempo row to make them follow the song. Drag here to change the project tempo (Shift = fine)."
             ),
-            None if section.is_some() => "Tempo at the playhead (from the tempo track) — drag to change it (Shift = fine)".to_string(),
-            None => "Drag to change tempo (Shift = fine)".to_string(),
+            None if section => "Tempo at the playhead (from the tempo track) — click to type it, drag to change it (Shift = fine)".to_string(),
+            None => "Click to type a tempo, drag to change it (Shift = fine)".to_string(),
         };
         let resp = resp.on_hover_text(hint);
-        let editing = resp.hovered() || resp.dragged();
+        let editing = resp.hovered() || resp.dragged() || self.tempo_edit.is_some();
         let (value, label, color) = match song {
             Some(t) if !editing => (t, "SONG TEMPO", theme::TEMPO),
             _ => (bpm, "TEMPO", if editing { Color32::WHITE } else { theme::LCD_TEXT }),
         };
+        if let Some(mut text) = self.tempo_edit.take() {
+            let field = Rect::from_center_size(pos2(tempo_rect.center().x, value_y), vec2(tempo_rect.width() - 10.0, 20.0));
+            let id = ui.make_persistent_id("lcd_tempo_edit");
+            let edit = egui::TextEdit::singleline(&mut text)
+                .id(id)
+                .font(FontId::monospace(15.0))
+                .align(egui::Align2::CENTER_CENTER)
+                .text_color(Color32::WHITE)
+                .background_color(Color32::from_gray(28))
+                .char_limit(6)
+                .margin(vec2(2.0, 1.0));
+            // A detached child, so the field doesn't move the transport's layout cursor.
+            let r = ui.new_child(UiBuilder::new().max_rect(field)).put(field, edit);
+            if !r.has_focus() && !r.lost_focus() {
+                // Just opened: select everything so typing replaces it.
+                r.request_focus();
+                if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
+                    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(text.chars().count()))));
+                    state.store(ui.ctx(), id);
+                }
+                self.tempo_edit = Some(text);
+            } else if r.lost_focus() {
+                // Enter or clicking elsewhere sets it; Escape leaves the tempo as it was.
+                if !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    match text.trim().replace(',', ".").parse::<f64>() {
+                        Ok(v) if (20.0..=999.0).contains(&v) => self.set_tempo_at_playhead(snap, v),
+                        _ => self.error(format!("\"{}\" isn't a tempo between 20 and 999 BPM", text.trim())),
+                    }
+                }
+            } else {
+                self.tempo_edit = Some(text);
+            }
+        } else {
+            ui.painter().text(pos2(tempo_rect.center().x, value_y), Align2::CENTER_CENTER, format!("{value:.1}"), FontId::monospace(16.0), color);
+        }
         let p = ui.painter();
-        p.text(pos2(tempo_rect.center().x, value_y), Align2::CENTER_CENTER, format!("{value:.1}"), FontId::monospace(16.0), color);
         p.text(pos2(tempo_rect.center().x, label_y), Align2::CENTER_CENTER, label, small.clone(), if song.is_some() && !editing { theme::with_alpha(theme::TEMPO, 170) } else { theme::LCD_DIM });
         x = tempo_rect.right();
+
+        // Tap tempo: the average beat between the last few taps (a pause starts over).
+        let tap_rect = Rect::from_min_size(pos2(x, rect.top() + 9.0), vec2(34.0, rect.height() - 18.0));
+        let tap = ui.interact(tap_rect, ui.make_persistent_id("lcd_tap"), Sense::click()).on_hover_text("Tap tempo: click in time with the beat");
+        widgets::label(&tap, egui::Role::Button, "Tap Tempo");
+        let now = ui.input(|i| i.time);
+        if tap.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed())
+            && let Some(bpm) = tap_tempo(&mut self.tap_times, now)
+        {
+            self.set_tempo_at_playhead(snap, bpm);
+        }
+        let tapping = self.tap_times.last().is_some_and(|&t| now - t < TAP_RESET_SECS);
+        if tapping {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        let lit = tap.is_pointer_button_down_on();
+        let p = ui.painter();
+        p.rect_filled(tap_rect, 4.0, if lit { theme::with_alpha(theme::TEMPO, 90) } else { Color32::from_gray(24) });
+        let tap_color = if lit || tapping { theme::TEMPO } else if tap.hovered() { Color32::WHITE } else { theme::LCD_DIM };
+        p.text(tap_rect.center(), Align2::CENTER_CENTER, "TAP", FontId::proportional(10.0), tap_color);
+        x = tap_rect.right() + 6.0;
         sep(p, x);
 
         let (n, d) = map.signature_at(s.position_secs.max(0.0));
@@ -2731,7 +2832,23 @@ impl DawApp {
     }
 }
 
-const LCD_W: f32 = 388.0;
+const LCD_W: f32 = 428.0;
+
+/// A pause this long between taps starts tap tempo over.
+const TAP_RESET_SECS: f64 = 2.0;
+
+/// Record a tap at `now` (seconds); the tempo the taps so far give, once there are two.
+fn tap_tempo(taps: &mut Vec<f64>, now: f64) -> Option<f64> {
+    if taps.last().is_some_and(|&t| now - t > TAP_RESET_SECS || now <= t) {
+        taps.clear();
+    }
+    taps.push(now);
+    if taps.len() > 8 {
+        taps.remove(0);
+    }
+    let (first, last) = (*taps.first()?, *taps.last()?);
+    (taps.len() >= 2).then(|| 60.0 * (taps.len() - 1) as f64 / (last - first))
+}
 const TRANSPORT_SEG_W: f32 = 40.0;
 const FX_AREA_H: f32 = 124.0;
 
@@ -2793,6 +2910,7 @@ impl eframe::App for DawApp {
         self.plugin_windows(ui, &snap);
         self.audio_settings_window(ui.ctx(), &snap);
         self.mcp_info_window(ui.ctx());
+        self.about_window(ui.ctx());
         self.plugin_manager_window(ui.ctx(), &snap);
         self.instrument_picker_window(ui.ctx(), &snap);
         self.guitar_pro_window(ui.ctx(), &snap);
@@ -3500,7 +3618,7 @@ mod tests {
     }
 
     #[test]
-    fn double_clicking_a_mixer_slot_opens_its_editor() {
+    fn clicking_a_mixer_slot_opens_its_editor() {
         let (mut harness, engine) = harness_with_track();
         engine.lock().unwrap().insert_plugin(0, "reverb", None).unwrap();
         harness.state_mut().selected_track = Some(0);
@@ -3508,7 +3626,7 @@ mod tests {
         harness.step();
         harness.step();
         let pill = harness.get_all_by_label(opentake_engine::reverb::NAME).next().unwrap().rect().center();
-        double_click_at(&mut harness, pill);
+        click_at(&mut harness, pill);
         assert_eq!(harness.state().open_plugins, vec![(0, SlotRef::Effect(0))], "a built-in opens OpenTake's window");
         assert!(harness.query_by_label("Open Editor").is_none(), "built-ins have no other");
         // Asked for over MCP, it opens the same way.
@@ -4615,6 +4733,90 @@ mod tests {
         harness.step();
         let e = engine.lock().unwrap();
         assert_eq!((e.project().tempo_bpm, e.project().tempo_changes[0].bpm), (120.0, 120.0), "each drag is one undo step");
+    }
+
+    #[test]
+    fn tempo_is_typed_into_the_lcd() {
+        let (mut harness, engine) = harness_with_track();
+        harness.step();
+        click(&mut harness, "Tempo");
+        harness.step();
+        assert_eq!(harness.state().tempo_edit.as_deref(), Some("120.0"));
+        // The whole value is selected, so typing replaces it.
+        harness.event(egui::Event::Text("128.5".into()));
+        harness.step();
+        harness.key_press(egui::Key::Enter);
+        harness.step();
+        harness.step();
+        assert_eq!(engine.lock().unwrap().project().tempo_bpm, 128.5);
+        assert!(harness.state().tempo_edit.is_none());
+
+        // Escape leaves it alone; nonsense is refused.
+        click(&mut harness, "Tempo");
+        harness.step();
+        harness.event(egui::Event::Text("90".into()));
+        harness.key_press(egui::Key::Escape);
+        harness.step();
+        harness.step();
+        assert_eq!(engine.lock().unwrap().project().tempo_bpm, 128.5);
+        click(&mut harness, "Tempo");
+        harness.step();
+        harness.event(egui::Event::Text("5".into()));
+        harness.key_press(egui::Key::Enter);
+        harness.step();
+        harness.step();
+        assert_eq!(engine.lock().unwrap().project().tempo_bpm, 128.5);
+    }
+
+    #[test]
+    fn about_window_shows_the_build_version() {
+        let (mut harness, _engine) = harness_with_track();
+        harness.state_mut().show_about = true;
+        harness.step();
+        harness.step();
+        let version = env!("OPENTAKE_VERSION_LONG");
+        assert!(version.split(['.', ' ']).count() >= 3, "{version}");
+        harness.get_by_label(version);
+    }
+
+    #[test]
+    fn tap_tempo_averages_taps_and_starts_over_after_a_pause() {
+        let mut taps = Vec::new();
+        assert_eq!(tap_tempo(&mut taps, 10.0), None, "one tap is no tempo yet");
+        assert_eq!(tap_tempo(&mut taps, 10.5), Some(120.0));
+        assert_eq!(tap_tempo(&mut taps, 11.0), Some(120.0));
+        let bpm = tap_tempo(&mut taps, 11.6).unwrap();
+        assert!((bpm - 60.0 * 3.0 / 1.6).abs() < 1e-9, "the average of the beats: {bpm}");
+        assert_eq!(tap_tempo(&mut taps, 20.0), None, "a pause starts over");
+        assert_eq!(tap_tempo(&mut taps, 20.25), Some(240.0));
+        for i in 2..20 {
+            tap_tempo(&mut taps, 20.0 + 0.25 * i as f64);
+        }
+        assert_eq!(taps.len(), 8, "only the last few taps count");
+    }
+
+    #[test]
+    fn tap_button_sets_the_tempo() {
+        let (mut harness, engine) = harness_with_track();
+        harness.step();
+        let at = harness.get_by_label("Tap Tempo").rect().center();
+        harness.hover_at(at);
+        // Kittest steps 1/60 s: 26 steps between taps is 60 × 60 / 26 ≈ 138.5 BPM.
+        for _ in 0..3 {
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+                harness.step();
+            }
+            for _ in 0..24 {
+                harness.step();
+            }
+        }
+        let bpm = engine.lock().unwrap().project().tempo_bpm;
+        assert!((bpm - 138.5).abs() < 0.15, "{bpm}");
+        // Each tap merged into one undo step.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+        harness.step();
+        assert_eq!(engine.lock().unwrap().project().tempo_bpm, 120.0);
     }
 
     #[test]

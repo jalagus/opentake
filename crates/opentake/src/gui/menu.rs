@@ -63,6 +63,7 @@ pub enum MenuCommand {
     RescanPlugins,
     PluginManager,
     McpInfo,
+    About,
 }
 
 // Ids and accelerators are only needed by the native (macOS) menu bar.
@@ -130,6 +131,7 @@ impl MenuCommand {
             Self::RescanPlugins => "rescan_plugins",
             Self::PluginManager => "plugin_manager",
             Self::McpInfo => "mcp_info",
+            Self::About => "about",
         }
         .to_string()
     }
@@ -192,6 +194,7 @@ impl MenuCommand {
             Self::RescanPlugins => "Rescan Plug-ins",
             Self::PluginManager => "Plug-in Manager…",
             Self::McpInfo => "Connect an Agent (MCP)…",
+            Self::About => "About OpenTake…",
         }
     }
 
@@ -270,7 +273,7 @@ impl MenuCommand {
         if let Some(i) = id.strip_prefix("open_recent_").and_then(|n| n.parse().ok()) {
             return Some(Self::OpenRecent(i));
         }
-        let extra = [Self::ClearRecent, Self::McpInfo];
+        let extra = [Self::ClearRecent, Self::McpInfo, Self::About];
         MENUS.iter().flat_map(|(_, items)| items.iter()).flatten().copied().chain(extra).find(|c| c.id() == id)
     }
 }
@@ -413,7 +416,7 @@ impl MenuState {
 pub fn egui_menu_bar(ui: &mut egui::Ui, state: &MenuState) -> Option<MenuCommand> {
     let mut chosen = None;
     egui::MenuBar::new().ui(ui, |ui| {
-        let titles = MENUS.iter().copied().chain(std::iter::once(("Help", &[Some(MenuCommand::McpInfo)][..])));
+        let titles = MENUS.iter().copied().chain(std::iter::once(("Help", &[Some(MenuCommand::McpInfo), Some(MenuCommand::About)][..])));
         for (title, items) in titles {
             ui.menu_button(title, |ui| {
                 ui.set_min_width(220.0);
@@ -491,7 +494,7 @@ mod native {
             let menu = Menu::new();
             let about = AboutMetadata {
                 name: Some("OpenTake".into()),
-                version: Some(env!("CARGO_PKG_VERSION").into()),
+                version: Some(env!("OPENTAKE_VERSION_LONG").into()),
                 comments: Some("A small DAW you can drive from an AI agent over MCP.".into()),
                 ..Default::default()
             };
@@ -574,6 +577,9 @@ mod native {
             let mcp = MenuItem::with_id(MenuCommand::McpInfo.id(), MenuCommand::McpInfo.label(), true, None);
             help.append(&mcp)?;
             items.insert(MenuCommand::McpInfo, Item::Normal(mcp));
+            let about = MenuItem::with_id(MenuCommand::About.id(), MenuCommand::About.label(), true, None);
+            help.append(&about)?;
+            items.insert(MenuCommand::About, Item::Normal(about));
             menu.append(&help)?;
             help.set_as_help_menu_for_nsapp();
 

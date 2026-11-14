@@ -2413,7 +2413,7 @@ fn unknown_arguments(schema: &rmcp::model::JsonObject, args: Option<&rmcp::model
 impl ServerHandler for DawServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("opentake", env!("CARGO_PKG_VERSION")).with_title("OpenTake"))
+            .with_server_info(Implementation::new("opentake", env!("OPENTAKE_VERSION")).with_title("OpenTake"))
             .with_instructions(INSTRUCTIONS)
     }
 

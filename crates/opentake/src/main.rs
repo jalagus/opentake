@@ -21,7 +21,7 @@ use tracing_subscriber::EnvFilter;
 use server::DawServer;
 
 #[derive(Parser)]
-#[command(name = "opentake", version, about = "OpenTake — an open-source DAW you can drive with AI agents over MCP")]
+#[command(name = "opentake", version = env!("OPENTAKE_VERSION_LONG"), about = "OpenTake — an open-source DAW you can drive with AI agents over MCP")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -80,6 +80,7 @@ fn main() -> Result<()> {
         .init();
 
     let mut cli = Cli::parse();
+    tracing::info!("OpenTake {}", env!("OPENTAKE_VERSION_LONG"));
     // A project passed as a plain argument opens like --project; other files go to the GUI.
     if let Some(file) = cli.file.take() {
         if cli.project.is_none() && opentake_engine::is_project_path(&file) {

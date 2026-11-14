@@ -57,6 +57,11 @@ Latest build (rebuilt from `main` on every push):
 
 Tagged versions (`v*`) get their own [release](https://github.com/jalagus/opentake/releases).
 
+Every build has its own version number, which grows with each commit (`0.1.40`, `0.1.41`, …,
+followed by the commit it was built from). Find it under **Help → About OpenTake** (on macOS
+also **OpenTake → About OpenTake**) or with `opentake --version`, and include it when you report
+an issue.
+
 The builds aren't signed yet:
 
 - **macOS**: unzip and move `OpenTake.app` to Applications. The first time, right-click it →
@@ -176,9 +181,9 @@ agent.
   The chorus (1–4 voices) shows each voice's sweeping delay, and the phaser (2–12 stages) its
   notches across the swept range.
   Plug-in latency is compensated automatically.
-- **Plug-in editors**: double-click a VST3 or Audio Unit slot in the mixer (or click **Open
-  Editor** in its window's header) to open the plug-in's own editor, in a window of its own
-  floating above OpenTake. Each control you move there is one undo step, and with an
+- **Plug-in editors**: inserting a VST3 or Audio Unit, or clicking its slot in the mixer, opens
+  the plug-in's own editor, in a window of its own floating above OpenTake (⌥-click the slot
+  for OpenTake's generic controls, whose header has **Open Editor** to switch back). Each control you move there is one undo step, and with an
   automation lane in Touch or Latch it's written while playing; automation playback, undo and
   OpenTake's sliders move the plug-in's controls in turn. Closing it brings back OpenTake's
   generic controls if they were open. Built-in effects keep their own editors. An agent can
