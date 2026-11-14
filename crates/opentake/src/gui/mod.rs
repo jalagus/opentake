@@ -3799,6 +3799,35 @@ mod tests {
     }
 
     #[test]
+    fn piano_roll_snap_menu_places_notes_on_triplets() {
+        let (mut harness, engine) = harness_with_piano_roll();
+        // The piano roll has its own Snap menu (the same setting as the arrangement's).
+        let snaps: Vec<egui::Rect> = harness.query_all_by_label("Snap").map(|n| n.rect()).collect();
+        assert_eq!(snaps.len(), 2, "arrangement and piano roll toolbars");
+        let grid = harness.get_by_label("Piano Roll Grid").rect();
+        let piano_snap = snaps.into_iter().find(|r| r.bottom() <= grid.top()).filter(|r| r.top() > 100.0).expect("piano roll snap menu");
+        click_at(&mut harness, piano_snap.center());
+        harness.step();
+        harness.step();
+        let item = harness.get_by_label("1/8T").rect();
+        click_at(&mut harness, item.center());
+        assert_eq!(harness.state().snap_mode, timeline::SnapMode::EighthTriplet);
+
+        // 120 bpm at 400 px/s: a beat is 200 px. 0.7 beats in snaps to the second eighth-note
+        // triplet (2/3), and the new note is one triplet long. Top row: clear of the notes.
+        let spot = egui::pos2(grid.left() + 140.0, grid.top() + 6.0);
+        double_click_at(&mut harness, spot);
+        let notes = engine.lock().unwrap().project().tracks[1].midi_clips[0].notes.clone();
+        let added = notes.iter().find(|n| ![60, 64, 67].contains(&n.pitch)).expect("a new note");
+        assert!((added.start_beats - 2.0 / 3.0).abs() < 1e-9, "on the triplet grid: {}", added.start_beats);
+        assert!((added.length_beats - 1.0 / 3.0).abs() < 1e-9, "one triplet long: {}", added.length_beats);
+        // Smart quantize follows the triplet snap.
+        let map = engine.lock().unwrap().project().tempo_map();
+        let q = harness.state().piano.quantize.resolve(harness.state().snap_mode, &map, 0.0, 400.0);
+        assert_eq!(q.grid, opentake_engine::project::QuantizeGrid::EighthTriplet);
+    }
+
+    #[test]
     fn piano_roll_pencil_draws_a_pitch_bend_curve_as_one_step() {
         use opentake_engine::project::Controller;
         let (mut harness, engine) = harness_with_piano_roll();

@@ -381,6 +381,7 @@ fn toolbar_ui(app: &mut DawApp, ui: &mut egui::Ui, rect: Rect, track: usize, ci:
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             timeline::zoom_controls(app, ui, "piano_zoom", playhead);
+            timeline::snap_menu(app, ui, "piano_snap_mode");
             // The hint only where it fits next to the controls.
             if ui.available_width() > 360.0 {
                 ui.label(RichText::new("Double-click: add note · Drag: move · Edge: resize · Q: quantize · ⌫: delete").size(10.0).color(theme::TEXT_FAINT));

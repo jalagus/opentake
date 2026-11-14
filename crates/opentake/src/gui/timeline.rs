@@ -47,11 +47,25 @@ pub enum SnapMode {
     Eighth,
     Sixteenth,
     ThirtySecond,
+    /// Triplets: three in the time of two.
+    QuarterTriplet,
+    EighthTriplet,
+    SixteenthTriplet,
 }
 
 impl SnapMode {
-    pub const ALL: [SnapMode; 7] =
-        [SnapMode::Off, SnapMode::Smart, SnapMode::Bar, SnapMode::Beat, SnapMode::Eighth, SnapMode::Sixteenth, SnapMode::ThirtySecond];
+    pub const ALL: [SnapMode; 10] = [
+        SnapMode::Off,
+        SnapMode::Smart,
+        SnapMode::Bar,
+        SnapMode::Beat,
+        SnapMode::Eighth,
+        SnapMode::Sixteenth,
+        SnapMode::ThirtySecond,
+        SnapMode::QuarterTriplet,
+        SnapMode::EighthTriplet,
+        SnapMode::SixteenthTriplet,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -62,8 +76,28 @@ impl SnapMode {
             Self::Eighth => "1/8",
             Self::Sixteenth => "1/16",
             Self::ThirtySecond => "1/32",
+            Self::QuarterTriplet => "1/4T",
+            Self::EighthTriplet => "1/8T",
+            Self::SixteenthTriplet => "1/16T",
         }
     }
+}
+
+/// The Snap menu (arrangement and piano roll toolbars share the one setting).
+pub fn snap_menu(app: &mut DawApp, ui: &mut egui::Ui, id: &str) {
+    let text = format!("Snap: {}", app.snap_mode.label());
+    // Tall enough for every value: the piano roll's menu opens near the window bottom, where
+    // the default height would hide the triplets behind a scroll bar.
+    let r = egui::ComboBox::from_id_salt(id).selected_text(RichText::new(text).size(11.0)).width(86.0).height(320.0).show_ui(ui, |ui| {
+        for mode in SnapMode::ALL {
+            if mode == SnapMode::QuarterTriplet {
+                ui.separator();
+            }
+            ui.selectable_value(&mut app.snap_mode, mode, mode.label());
+        }
+    });
+    widgets::label(&r.response, egui::Role::ComboBox, "Snap");
+    r.response.on_hover_text("Snap to grid (⌘G toggles, hold Alt to bypass)");
 }
 
 /// Edit tool (Logic's left-click tool).
@@ -414,6 +448,10 @@ pub fn grid_at(mode: SnapMode, map: &TempoMap, t: f64, px_per_sec: f32) -> Optio
         SnapMode::Eighth => Grid::Quarters(0.5),
         SnapMode::Sixteenth => Grid::Quarters(0.25),
         SnapMode::ThirtySecond => Grid::Quarters(0.125),
+        // The same steps as the triplet quantize grids, so Smart quantize follows them.
+        SnapMode::QuarterTriplet => Grid::Quarters(2.0 / 3.0),
+        SnapMode::EighthTriplet => Grid::Quarters(1.0 / 3.0),
+        SnapMode::SixteenthTriplet => Grid::Quarters(1.0 / 6.0),
         SnapMode::Smart => {
             // Finest musical value that is still at least ~14 px wide.
             let min_q = 14.0 / px_per_sec as f64 * seg.bpm / 60.0;
@@ -711,19 +749,7 @@ fn toolbar(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
             app.tool = tool;
         }
     }
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        let text = if app.snap_mode == SnapMode::Off { "Snap: Off".to_string() } else { format!("Snap: {}", app.snap_mode.label()) };
-        egui::ComboBox::from_id_salt("snap_mode")
-            .selected_text(RichText::new(text).size(11.0))
-            .width(86.0)
-            .show_ui(ui, |ui| {
-                for mode in SnapMode::ALL {
-                    ui.selectable_value(&mut app.snap_mode, mode, mode.label());
-                }
-            })
-            .response
-            .on_hover_text("Snap to grid (⌘G toggles, hold Alt to bypass)");
-    });
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| snap_menu(app, ui, "snap_mode"));
 }
 
 fn handle_zoom_scroll(app: &mut DawApp, ui: &egui::Ui) {
@@ -2468,6 +2494,11 @@ mod tests {
         assert_eq!(grid_at(SnapMode::Beat, &map, 1.0, 50.0), Some(Grid::Quarters(1.0)));
         assert_eq!(grid_at(SnapMode::Beat, &map, 5.0, 50.0), Some(Grid::Quarters(0.5)), "eighth-note beats in 6/8");
         assert_eq!(map.snap(5.6, Grid::Quarters(0.5)), 5.5);
+        // Triplets: three per beat at 1/8T (1/6 s at 120 bpm), aligned to the bar line.
+        let Some(Grid::Quarters(t)) = grid_at(SnapMode::EighthTriplet, &map, 1.0, 50.0) else { panic!() };
+        assert!((map.snap(0.35, Grid::Quarters(t)) - 2.0 / 6.0).abs() < 1e-9);
+        assert_eq!(grid_at(SnapMode::QuarterTriplet, &map, 1.0, 50.0), Some(Grid::Quarters(2.0 / 3.0)));
+        assert_eq!(grid_at(SnapMode::SixteenthTriplet, &map, 1.0, 50.0), Some(Grid::Quarters(1.0 / 6.0)));
         // Smart picks coarser grids when zoomed out.
         assert_eq!(grid_at(SnapMode::Smart, &map, 1.0, 2.0), Some(Grid::Bar));
         assert_eq!(grid_at(SnapMode::Smart, &map, 1.0, 400.0), Some(Grid::Quarters(0.25)));
