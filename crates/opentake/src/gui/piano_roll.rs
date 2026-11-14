@@ -127,6 +127,12 @@ pub struct PianoRoll {
     pub ctrl_sel: Option<usize>,
     ctrl_drag: Option<CtrlDrag>,
     pub quantize: QuantizeSettings,
+    /// Where the editor was drawn last frame, and whether the last click landed in it:
+    /// keyboard commands (⌘A, ⌘C/⌘X/⌘V, arrows) then act on notes instead of regions.
+    pub rect: Option<Rect>,
+    pub focused: bool,
+    /// Copied notes, relative to the earliest one.
+    pub clipboard: Vec<Note>,
     /// Last frame's geometry, so tests can locate notes on screen.
     #[cfg(test)]
     pub(crate) geo: Option<Geo>,
@@ -151,6 +157,9 @@ impl Default for PianoRoll {
             ctrl_sel: None,
             ctrl_drag: None,
             quantize: QuantizeSettings::default(),
+            rect: None,
+            focused: false,
+            clipboard: Vec::new(),
             #[cfg(test)]
             geo: None,
             #[cfg(test)]
@@ -263,6 +272,7 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
     };
     let project = &snap.project;
     let full = ui.available_rect_before_wrap();
+    app.piano.rect = Some(full);
     // The grid shares the arrangement's time axis: it starts where the lanes start, with
     // the keyboard right of the track-header column, so zoom and scroll stay in sync.
     let lanes = app.view.lanes();
@@ -321,6 +331,15 @@ pub fn show(app: &mut DawApp, ui: &mut egui::Ui, snap: &Snapshot) {
     }
     draw_background(ui, &geo, clip, project, app);
     draw_ruler(ui, &app.view, ruler, project);
+    // Click or drag in the ruler to move the playhead, as in the arrangement.
+    let seek = ui.interact(ruler, ui.make_persistent_id(("piano_ruler", track, ci)), Sense::click_and_drag());
+    widgets::label(&seek, egui::Role::Slider, "Piano Roll Ruler");
+    if (seek.clicked() || seek.dragged())
+        && let Some(p) = seek.interact_pointer_pos()
+    {
+        let t = (geo.view_start + ((p.x - ruler.left()) / geo.px_per_sec) as f64).max(0.0);
+        app.act(Action::Seek(timeline::snap_time(app, ui, t, project)));
+    }
     let grid_resp = ui.interact(grid, ui.make_persistent_id(("piano_grid", track, ci)), Sense::click_and_drag());
     widgets::label(&grid_resp, egui::Role::Group, "Piano Roll Grid");
     notes_interaction(app, ui, &geo, &grid_resp, track, ci, clip, project, color);

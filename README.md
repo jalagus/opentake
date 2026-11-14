@@ -248,8 +248,11 @@ agent.
 - **Export**: the mix and stems as WAV or FLAC (File → Export Audio…, ⇧⌘E).
 - **Undo everything**: ⌘Z / ⇧⌘Z, including edits made by an agent.
 
-Projects save as `.otp` (JSON), and the last one reopens on start. Space plays, R records and
-C toggles the cycle; the menus list every other shortcut.
+Projects save as `.otp` (JSON), and the last one reopens on start. Space plays, R (or ⌘R)
+records and C toggles the cycle. Return / End go to the start / end, `,` and `.` step a bar,
+↑ / ↓ pick a track and S solos it, ⌘= / ⌘− zoom. In the piano roll (after clicking in it),
+⌘A, ⌘X / ⌘C / ⌘V and ⌫ work on notes, ↑ / ↓ transpose them (⇧ for an octave), and clicking
+its ruler moves the playhead. The menus list every other shortcut.
 
 ### Connect an agent
 

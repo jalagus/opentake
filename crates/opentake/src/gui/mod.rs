@@ -1174,6 +1174,7 @@ impl DawApp {
         if automation {
             self.toggle_automation(snap);
         }
+        self.navigation_shortcuts(ui, snap);
         // Markers: M creates one at the playhead, ⌥← / ⌥→ jump between them.
         let marker_keys = ui.input(|i| {
             let alt = |k| i.key_pressed(k) && i.modifiers.alt && !i.modifiers.command && !i.modifiers.shift;
@@ -1236,6 +1237,135 @@ impl DawApp {
     fn toggle_automation(&mut self, snap: &Snapshot) {
         let shown = snap.project.tracks.iter().any(|t| t.show_automation);
         self.act(Action::ShowAutomation { track: None, show: !shown });
+    }
+
+    /// The piano roll is open and the last click landed in it.
+    pub(crate) fn piano_focused(&self) -> bool {
+        self.bottom == Some(BottomTab::PianoRoll) && self.piano.region.is_some() && self.piano.focused
+    }
+
+    /// Return / End, , / . (bar back / forward), ↑ / ↓ (track selection, or transpose the
+    /// selected notes in the piano roll, ⇧ for an octave), S (solo), ⌘= / ⌘- (zoom).
+    fn navigation_shortcuts(&mut self, ui: &egui::Ui, snap: &Snapshot) {
+        use egui::Key;
+        let plain = |i: &egui::InputState, k: Key| i.key_pressed(k) && !i.modifiers.any();
+        let arrow = |i: &egui::InputState, k: Key| i.key_pressed(k) && !i.modifiers.command && !i.modifiers.alt;
+        let (enter, end, back, fwd, up, down, shift, solo, zoom_in, zoom_out) = ui.input(|i| {
+            (
+                plain(i, Key::Enter),
+                plain(i, Key::End),
+                plain(i, Key::Comma),
+                plain(i, Key::Period),
+                arrow(i, Key::ArrowUp),
+                arrow(i, Key::ArrowDown),
+                i.modifiers.shift,
+                plain(i, Key::S),
+                i.modifiers.command && (i.key_pressed(Key::Equals) || i.key_pressed(Key::Plus)),
+                i.modifiers.command && i.key_pressed(Key::Minus),
+            )
+        });
+        if enter {
+            self.act(Action::Seek(0.0));
+        }
+        if end {
+            self.go_to_end(snap);
+        }
+        if back || fwd {
+            let map = snap.project.tempo_map();
+            let pos = snap.status.position_secs;
+            let bar = map.bar_at(pos);
+            let to = if fwd {
+                map.secs_of(bar.index + 2, 1.0)
+            } else if pos - bar.secs > 0.05 && !snap.status.playing {
+                bar.secs
+            } else {
+                map.secs_of(bar.index, 1.0)
+            };
+            self.act(Action::Seek(to.max(0.0)));
+        }
+        if up || down {
+            let dir: i32 = if up { 1 } else { -1 };
+            if self.piano_focused() && !self.piano.selected.is_empty() {
+                self.transpose_selected_notes(snap, if shift { 12 * dir } else { dir });
+            } else if !shift && !snap.project.tracks.is_empty() {
+                let last = snap.project.tracks.len() - 1;
+                let t = match self.selected_track {
+                    None => 0,
+                    Some(t) if up => t.saturating_sub(1),
+                    Some(t) => (t + 1).min(last),
+                };
+                self.selected_track = Some(t);
+            }
+        }
+        if solo && let Some(t) = self.selected_track.filter(|&t| t < snap.project.tracks.len()) {
+            let solo = !snap.project.tracks[t].solo;
+            self.act(Action::UpdateTrack(t, TrackUpdate { solo: Some(solo), ..Default::default() }));
+        }
+        if zoom_in {
+            self.run_command(MenuCommand::ZoomIn, ui, snap);
+        }
+        if zoom_out {
+            self.run_command(MenuCommand::ZoomOut, ui, snap);
+        }
+    }
+
+    /// Move the playhead to the end of the last region.
+    fn go_to_end(&mut self, snap: &Snapshot) {
+        let map = snap.project.tempo_map();
+        let end = snap.project.tracks.iter().enumerate().flat_map(|(i, t)| timeline::regions_of(t, i, &map)).map(|v| v.position + v.length).fold(0.0, f64::max);
+        self.act(Action::Seek(end));
+    }
+
+    /// ⌘A: every note of the open region when the piano roll has focus, else every region.
+    fn select_all(&mut self, snap: &Snapshot) {
+        if self.piano_focused()
+            && let Some((t, c)) = self.piano.region
+            && let Some(clip) = snap.project.tracks.get(t).and_then(|tr| tr.midi_clips.get(c))
+        {
+            self.piano.selected = clip.notes.clone();
+            return;
+        }
+        let map = snap.project.tempo_map();
+        self.selection = snap.project.tracks.iter().enumerate().flat_map(|(i, t)| timeline::regions_of(t, i, &map)).map(|v| v.r).collect();
+    }
+
+    fn copy_notes(&mut self) {
+        let start = self.piano.selected.iter().map(|n| n.start_beats).fold(f64::INFINITY, f64::min);
+        self.piano.clipboard = self.piano.selected.iter().map(|n| Note { start_beats: n.start_beats - start, ..*n }).collect();
+    }
+
+    /// Paste copied notes at the playhead (within the open region) and select them.
+    fn paste_notes(&mut self, snap: &Snapshot) {
+        let Some((t, c)) = self.piano.region else { return };
+        let Some(clip) = snap.project.tracks.get(t).and_then(|tr| tr.midi_clips.get(c)) else { return };
+        let at = clip.beats_at(&snap.project.tempo_map(), snap.status.position_secs).max(0.0);
+        let pasted: Vec<Note> = self
+            .piano
+            .clipboard
+            .iter()
+            .map(|n| Note { start_beats: n.start_beats + at, ..*n })
+            .filter(|n| n.start_beats < clip.length_beats)
+            .collect();
+        if pasted.is_empty() {
+            return;
+        }
+        let mut notes = clip.notes.clone();
+        notes.extend(pasted.iter().copied());
+        self.piano.selected = pasted;
+        self.act(Action::SetNotes { track: t, clip: c, notes });
+    }
+
+    /// Move the selected notes by `semis` (all or nothing at the MIDI range's edges).
+    fn transpose_selected_notes(&mut self, snap: &Snapshot, semis: i32) {
+        let Some((t, c)) = self.piano.region else { return };
+        let Some(clip) = snap.project.tracks.get(t).and_then(|tr| tr.midi_clips.get(c)) else { return };
+        if self.piano.selected.iter().any(|n| !(0..=127).contains(&(n.pitch as i32 + semis))) {
+            return;
+        }
+        let shift = |n: &Note| Note { pitch: (n.pitch as i32 + semis) as u8, ..*n };
+        let notes = clip.notes.iter().map(|n| if self.piano.selected.contains(n) { shift(n) } else { *n }).collect();
+        self.piano.selected = self.piano.selected.iter().map(shift).collect();
+        self.act(Action::SetNotes { track: t, clip: c, notes });
     }
 
     /// Delete: a selected automation point, then a selected controller event or notes in the
@@ -1588,7 +1718,13 @@ impl DawApp {
             let key = |k| i.events.iter().any(|e| matches!(e, egui::Event::Key { key, pressed: true, modifiers, .. } if *key == k && modifiers.command));
             let copy = key(egui::Key::C) || i.events.iter().any(|e| matches!(e, egui::Event::Copy));
             let paste = key(egui::Key::V) || i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
-            [(copy, MenuCommand::CopyRegion), (paste, MenuCommand::PasteRegion)].into_iter().filter(|(on, _)| *on).map(|(_, c)| c).collect()
+            let cut = key(egui::Key::X) || i.events.iter().any(|e| matches!(e, egui::Event::Cut));
+            let all = key(egui::Key::A);
+            [(cut, MenuCommand::CutRegion), (copy, MenuCommand::CopyRegion), (paste, MenuCommand::PasteRegion), (all, MenuCommand::SelectAll)]
+                .into_iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, c)| c)
+                .collect()
         })
     }
 
@@ -1603,6 +1739,7 @@ impl DawApp {
             (Modifiers::COMMAND, Key::S, MenuCommand::Save),
             (Modifiers::COMMAND | Modifiers::SHIFT, Key::I, MenuCommand::ImportAudio),
             (Modifiers::COMMAND | Modifiers::SHIFT, Key::E, MenuCommand::ExportAudio),
+            (Modifiers::COMMAND, Key::R, MenuCommand::Record),
             (Modifiers::COMMAND | Modifiers::ALT, Key::N, MenuCommand::NewTrack),
             (Modifiers::COMMAND, Key::Comma, MenuCommand::AudioSettings),
             (Modifiers::COMMAND, Key::T, MenuCommand::SplitAtPlayhead),
@@ -1747,7 +1884,20 @@ impl DawApp {
                 }
             }
             MenuCommand::SplitAtPlayhead => self.split_at_playhead(snap),
+            MenuCommand::CopyRegion if self.piano_focused() && !self.piano.selected.is_empty() => self.copy_notes(),
             MenuCommand::CopyRegion => self.copy_selection(&snap.project),
+            MenuCommand::CutRegion if self.piano_focused() && !self.piano.selected.is_empty() => {
+                self.copy_notes();
+                self.delete_selection(snap);
+            }
+            MenuCommand::CutRegion => {
+                if !self.selection.is_empty() {
+                    self.copy_selection(&snap.project);
+                    self.act(Action::RemoveRegions(self.selection.clone()));
+                }
+            }
+            MenuCommand::SelectAll => self.select_all(snap),
+            MenuCommand::PasteRegion if self.piano_focused() && !self.piano.clipboard.is_empty() => self.paste_notes(snap),
             MenuCommand::PasteRegion => {
                 if self.clipboard.is_some() {
                     let track = self.selected_track.or(self.selection.first().map(|r| r.track)).unwrap_or(0);
@@ -1794,6 +1944,7 @@ impl DawApp {
             MenuCommand::PlayStop => self.act(if snap.status.playing { Action::Stop } else { Action::Play }),
             MenuCommand::Record => self.act(if snap.status.recording { Action::Stop } else { Action::Record }),
             MenuCommand::GoToStart => self.act(Action::Seek(0.0)),
+            MenuCommand::GoToEnd => self.go_to_end(snap),
             MenuCommand::CreateMarker | MenuCommand::DeleteMarker | MenuCommand::PreviousMarker | MenuCommand::NextMarker => self.run_marker_command(cmd, snap),
             MenuCommand::ToggleMetronome => {
                 self.act(Action::SetMetronome { enabled: Some(!snap.project.metronome_enabled), volume: None })
@@ -2593,6 +2744,11 @@ impl eframe::App for DawApp {
         self.selection.retain(|r| timeline::region_view(&snap.project, *r).is_some());
         self.track_recent(&snap);
         self.save_midi_inputs(&snap);
+        // The piano roll has keyboard focus while the last click landed inside it.
+        if let Some(p) = ui.input(|i| i.pointer.any_pressed().then(|| i.pointer.interact_pos()).flatten()) {
+            self.piano.focused = self.piano.rect.is_some_and(|r| r.contains(p));
+        }
+        self.piano.rect = None;
         self.handle_shortcuts(ui, &snap);
         self.handle_dropped_files(ui, &snap);
         self.handle_open_requests(&snap);
@@ -3825,6 +3981,74 @@ mod tests {
         let map = engine.lock().unwrap().project().tempo_map();
         let q = harness.state().piano.quantize.resolve(harness.state().snap_mode, &map, 0.0, 400.0);
         assert_eq!(q.grid, opentake_engine::project::QuantizeGrid::EighthTriplet);
+    }
+
+    #[test]
+    fn piano_roll_ruler_seeks_and_keyboard_edits_notes() {
+        let (mut harness, engine) = harness_with_piano_roll();
+        let pos = |engine: &SharedEngine| engine.lock().unwrap().status().position_secs;
+        let pitches = |engine: &SharedEngine| {
+            let mut p: Vec<u8> = engine.lock().unwrap().project().tracks[1].midi_clips[0].notes.iter().map(|n| n.pitch).collect();
+            p.sort();
+            p
+        };
+        // Clicking the piano roll's ruler moves the playhead (1 s = 2 beats into the region).
+        let ruler = harness.get_by_label("Piano Roll Ruler").rect();
+        let x = piano_roll::tests::x_of(harness.state(), 2.0);
+        click_at(&mut harness, egui::pos2(x, ruler.center().y));
+        assert!((pos(&engine) - 1.0).abs() < 0.01, "ruler click seeks: {}", pos(&engine));
+        assert!(harness.state().piano_focused(), "the click gave the piano roll focus");
+
+        // . and , step a bar (2 s at 120 bpm) forward and back.
+        harness.key_press(egui::Key::Period);
+        harness.step();
+        assert!((pos(&engine) - 2.0).abs() < 1e-6, "next bar: {}", pos(&engine));
+        harness.key_press(egui::Key::Comma);
+        harness.step();
+        assert!(pos(&engine).abs() < 1e-6);
+
+        // ⌘A selects every note; ↑ transposes a semitone, ⇧↑ an octave, in one step each.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.step();
+        assert_eq!(harness.state().piano.selected.len(), 3);
+        harness.key_press(egui::Key::ArrowUp);
+        harness.step();
+        assert_eq!(pitches(&engine), [61, 65, 68]);
+        harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowDown);
+        harness.step();
+        assert_eq!(pitches(&engine), [49, 53, 56]);
+
+        // ⌘X cuts the notes, ⌘V pastes them at the playhead.
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::X);
+        harness.step();
+        assert!(pitches(&engine).is_empty());
+        engine.lock().unwrap().seek(0.5).unwrap();
+        harness.step();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::V);
+        harness.step();
+        let notes = engine.lock().unwrap().project().tracks[1].midi_clips[0].notes.clone();
+        assert_eq!(notes.len(), 3);
+        assert!((notes.iter().map(|n| n.start_beats).fold(f64::INFINITY, f64::min) - 1.0).abs() < 1e-6, "pasted at the playhead");
+
+        // Outside the piano roll, ⌘A selects regions and ↑/↓ move the track selection.
+        harness.state_mut().piano.focused = false;
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.step();
+        assert!(harness.state().selection.contains(&RegionRef::midi(1, 0)));
+        harness.state_mut().selected_track = Some(1);
+        harness.key_press(egui::Key::ArrowUp);
+        harness.step();
+        assert_eq!(harness.state().selected_track, Some(0));
+        // S solos the selected track; End goes to the end of the song.
+        harness.key_press(egui::Key::S);
+        harness.step();
+        assert!(engine.lock().unwrap().project().tracks[0].solo);
+        harness.key_press(egui::Key::End);
+        harness.step();
+        assert!(pos(&engine) > 0.5);
+        harness.key_press(egui::Key::Enter);
+        harness.step();
+        assert_eq!(pos(&engine), 0.0);
     }
 
     #[test]
