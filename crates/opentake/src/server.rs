@@ -729,6 +729,22 @@ pub struct EnabledArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct DuplicateTrackArgs {
+    pub track: usize,
+    /// Copy the audio and MIDI regions (default true).
+    pub regions: Option<bool>,
+    /// Copy the effect plug-ins, each a new instance with the original's current state
+    /// (default true). An instrument track's instrument is always copied.
+    pub plugins: Option<bool>,
+    /// Copy the automation lanes (default true).
+    pub automation: Option<bool>,
+    /// Copy the sends to buses (default true).
+    pub sends: Option<bool>,
+    /// Copy volume, pan, mute, output routing, input channel and monitoring (default true).
+    pub mixer: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct MoveTrackArgs {
     pub track: usize,
     /// Its new index (past the end = last).
@@ -1747,6 +1763,19 @@ impl DawServer {
     #[tool(description = "Add a track. Returns its index.")]
     async fn add_track(&self, Parameters(a): Parameters<NameArgs>) -> ToolResult {
         self.with_engine(move |e| e.add_track(&a.name).map(|i| json!({ "track": i }))).await
+    }
+
+    #[tool(description = "Duplicate a track to a new track right below it (later indices shift up by one), choosing what comes along: regions, plug-ins (new instances with the original's state), automation, sends and mixer settings, all by default. The copy is never armed or soloed. One undo step. Returns the new track's index and warnings for plug-ins that couldn't be copied.")]
+    async fn duplicate_track(&self, Parameters(a): Parameters<DuplicateTrackArgs>) -> ToolResult {
+        let d = opentake_engine::DuplicateTrack::default();
+        let what = opentake_engine::DuplicateTrack {
+            regions: a.regions.unwrap_or(d.regions),
+            plugins: a.plugins.unwrap_or(d.plugins),
+            automation: a.automation.unwrap_or(d.automation),
+            sends: a.sends.unwrap_or(d.sends),
+            mixer: a.mixer.unwrap_or(d.mixer),
+        };
+        self.with_engine(move |e| e.duplicate_track(a.track, what)).await
     }
 
     #[tool(description = "Move a track to another position in the track list (indices of the tracks in between shift). Undoable.")]

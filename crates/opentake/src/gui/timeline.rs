@@ -2093,10 +2093,39 @@ fn track_context_menu(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, track: &Tr
         ui.close();
     }
     ui.separator();
+    duplicate_track_menu(app, ui, ti, track);
     if ui.button("Delete Track").clicked() {
         app.act(Action::RemoveTrack(ti));
         ui.close();
     }
+}
+
+/// "Duplicate Track": copy everything at once, or pick what the copy takes along (the
+/// checkboxes stay open while ticked, and are remembered for next time).
+pub(crate) fn duplicate_track_menu(app: &mut DawApp, ui: &mut egui::Ui, ti: usize, track: &Track) {
+    use egui::containers::menu::{MenuConfig, SubMenuButton};
+    let config = MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+    SubMenuButton::new("Duplicate Track").config(config).ui(ui, |ui| {
+        let what = &mut app.duplicate;
+        if !track.bus {
+            ui.checkbox(&mut what.regions, "Regions");
+        }
+        let plugins = if track.is_instrument() { "Effect Plug-ins (instrument always)" } else { "Plug-ins" };
+        ui.checkbox(&mut what.plugins, plugins);
+        ui.checkbox(&mut what.automation, "Automation");
+        ui.checkbox(&mut what.sends, "Sends");
+        ui.checkbox(&mut what.mixer, "Volume, Pan, Mute & Routing");
+        ui.separator();
+        let what = app.duplicate;
+        if ui.button("Duplicate").clicked() {
+            app.act(Action::DuplicateTrack(ti, what));
+            ui.close();
+        }
+        if ui.button("Duplicate Settings Only").on_hover_text("Plug-ins, sends and mixer settings: no regions or automation").clicked() {
+            app.act(Action::DuplicateTrack(ti, opentake_engine::DuplicateTrack::SETTINGS_ONLY));
+            ui.close();
+        }
+    });
 }
 
 /// The row above the master's automation lanes: its name and a button to hide them.

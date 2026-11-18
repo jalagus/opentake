@@ -9,6 +9,7 @@ mod au;
 mod automation;
 mod calibration;
 mod comp;
+mod duplicate;
 mod editors;
 mod export;
 mod fades;
@@ -25,6 +26,7 @@ mod recording;
 mod region_loop;
 mod regions;
 mod routing;
+mod save;
 mod sends;
 mod sidechain;
 
@@ -52,6 +54,8 @@ pub use analysis::{LevelReport, MixJob, MixReport};
 pub use au::AudioUnitInfo;
 pub use automation::{AutomationParam, LaneOwner};
 pub use calibration::LatencyReport;
+pub use duplicate::{DuplicateTrack, Duplicated};
+pub use save::{SaveJob, Saved};
 pub use editors::PluginEditor;
 pub use export::{AudioFormat, ExportOptions, ExportReport, ExportedFile, SAMPLE_RATES};
 pub use fades::{CROSSFADE_SECS, FadeUpdate, JOIN_SECS};
@@ -284,6 +288,9 @@ impl Drop for GarbageCollector {
 pub struct Engine {
     project: Project,
     project_path: Option<PathBuf>,
+    /// Counts projects opened (or started) this session, so a save that finishes after
+    /// another project was opened doesn't move that one (see `save.rs`).
+    opened: u64,
     next_id: u64,
     shared: Arc<SharedState>,
     audio: Option<AudioRuntime>,
@@ -336,6 +343,7 @@ impl Engine {
         Self {
             project: Project::default(),
             project_path: None,
+            opened: 0,
             next_id: 1,
             shared: Arc::new(SharedState::new()),
             audio: None,
@@ -1183,32 +1191,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Save as Reaper `.rpp`, DAWproject or native `.otp`/`.json`, chosen by extension.
-    pub fn save_project(&mut self, path: Option<&Path>) -> Result<PathBuf> {
-        let mut path = match path {
-            Some(p) => std::path::absolute(p)?,
-            None => self.project_path.clone().ok_or_else(|| anyhow!("project has never been saved; give a path"))?,
-        };
-        if path.extension().is_none() {
-            path.set_extension(PROJECT_EXTENSION);
-        }
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        // Files refer to buses by track index (ids are per session).
-        let mut file = self.project_with_plugin_state();
-        file.outputs_to_indices();
-        if is_rpp(&path) {
-            opentake_project::rpp::save(&file, &path)?;
-        } else if is_ext(&path, "dawproject") {
-            opentake_project::dawproject::save(&file, &path)?;
-        } else {
-            std::fs::write(&path, serde_json::to_string_pretty(&file)?)?;
-        }
-        self.project_path = Some(path.clone());
-        Ok(path)
-    }
-
     /// Load a project (`.otp`/`.json`, `.rpp`, or another DAW's: see `import`). Returns
     /// warnings (missing media/plugins, what an import couldn't carry over).
     pub fn load_project(&mut self, path: &Path) -> Result<Vec<String>> {
@@ -1286,6 +1268,7 @@ impl Engine {
 
         self.project = project;
         self.project_path = path;
+        self.opened += 1;
         self.writing.clear();
         self.media.clear();
         self.flexed.clear();

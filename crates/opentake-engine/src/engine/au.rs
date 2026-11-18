@@ -127,7 +127,7 @@ mod mac {
         STANDARD.encode(state).as_bytes().chunks(128).map(|c| String::from_utf8_lossy(c).into_owned()).collect()
     }
 
-    /// A unit's current state, as its slot stores it (see `Engine::project_with_plugin_state`).
+    /// A unit's current state, as its slot stores it (see `Engine::prepare_save`).
     pub(in crate::engine) fn capture_state(plugin: &AuPlugin) -> Result<Vec<String>> {
         Ok(encode_state(&plugin.get_state()?))
     }

@@ -6,13 +6,31 @@
 //! the event loop, and Quit (⌘Q, the Dock, logging out) goes through
 //! `-[NSApplication terminate:]`, which calls `exit()` without returning. Both end here.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::server::SharedEngine;
 
 static ENGINE: OnceLock<SharedEngine> = OnceLock::new();
 static DONE: AtomicBool = AtomicBool::new(false);
+/// Files being written in the background (saves): quitting waits for them.
+static WRITING: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Keep the process alive for `writer` when quitting.
+pub fn wait_for(writer: JoinHandle<()>) {
+    let mut writing = WRITING.lock().unwrap_or_else(|p| p.into_inner());
+    writing.retain(|w| !w.is_finished());
+    writing.push(writer);
+}
+
+/// Wait until background writes are done.
+pub fn finish_writing() {
+    let writing = std::mem::take(&mut *WRITING.lock().unwrap_or_else(|p| p.into_inner()));
+    for w in writing {
+        let _ = w.join();
+    }
+}
 
 /// Shut the engine down when the app terminates (call on the main thread, once the GUI runs).
 pub fn install(engine: &SharedEngine) {
@@ -23,6 +41,7 @@ pub fn install(engine: &SharedEngine) {
 
 /// Release audio and plug-ins (once; later calls do nothing). Main thread.
 pub fn run() {
+    finish_writing();
     if DONE.swap(true, Ordering::SeqCst) {
         return;
     }

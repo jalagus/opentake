@@ -126,6 +126,9 @@ agent.
 
 - **Record and arrange**: audio and instrument tracks; move, trim, split, copy and loop regions
   with snapping; tempo and time-signature changes; a metronome with count-in.
+- **Duplicate tracks**: right-click a track → **Duplicate Track** and tick what the copy takes
+  along — regions, plug-ins (new instances with the same settings), automation, sends, and
+  volume/pan/routing — or **Duplicate Settings Only** for an empty track with the same channel.
 - **Markers**: the Marker track under the ruler shows named, coloured flags (and faint lines
   through the arrangement). **M** (Transport → Create Marker, or the track's **+**) adds one at
   the playhead — at the nearest bar when snapping — and double-clicking empty marker space adds
@@ -293,7 +296,7 @@ of the tool calls behind them):
 `get_project`, `get_midi_notes`, `analyze_mix`, `export_audio`, `new_project`, `load_project`, `save_project`, `set_tempo`, `set_tempo_map`, `get_tempo_map`, `convert_time`,
 `set_master_volume`, `set_metronome`, `set_auto_input_monitoring`, `set_count_in`, `set_loop`,
 `list_markers`, `add_marker`, `update_marker`, `remove_marker`, `goto_marker`, `cycle_marker`,
-`add_track`, `add_bus`, `add_send`, `update_send`, `remove_send`, `move_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `set_clip_gain`, `normalize_clip`, `set_clip_pitch_stretch`, `set_clip_fades`, `crossfade_clips`, `merge_clips`, `set_clip_loop`, `remove_clip`,
+`add_track`, `add_bus`, `add_send`, `update_send`, `remove_send`, `move_track`, `duplicate_track`, `remove_track`, `update_track`, `add_clip`, `move_clip`, `copy_clip`, `split_clip`, `trim_clip`, `set_clip_gain`, `normalize_clip`, `set_clip_pitch_stretch`, `set_clip_fades`, `crossfade_clips`, `merge_clips`, `set_clip_loop`, `remove_clip`,
 `select_take`, `delete_take`, `comp_take`, `clear_comp`, `flatten_comp`,
 `play`, `stop`, `seek`, `record`, `list_midi_inputs`, `set_midi_inputs`,
 `scan_plugins`, `insert_plugin`, `remove_plugin`, `insert_master_plugin`, `remove_master_plugin`, `set_plugin_bypass`, `open_plugin_editor`,

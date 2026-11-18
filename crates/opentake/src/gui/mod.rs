@@ -19,7 +19,7 @@ mod widgets;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use opentake_engine::project::{AutomationLane, AutomationMode, AutomationTarget, Curve, Note, Project};
@@ -182,6 +182,8 @@ pub(crate) enum Action {
     /// names it "Reverb" and puts the built-in reverb on it.
     SendToNewBus { track: usize, send: Option<usize>, reverb: bool },
     RemoveTrack(usize),
+    /// Copy a track (with what's chosen) to a new track below it.
+    DuplicateTrack(usize, opentake_engine::DuplicateTrack),
     UpdateTrack(usize, TrackUpdate),
     AddClip { track: Option<usize>, file: PathBuf, position: f64 },
     RemoveRegions(Vec<RegionRef>),
@@ -297,6 +299,8 @@ pub(crate) struct DawApp {
     editors: Vec<NativeEditor>,
     /// Track being dragged to a new place (lane headers or mixer strips).
     pub track_drag: Option<usize>,
+    /// What "Duplicate Track" copies (the checkboxes in the track menu; kept between uses).
+    pub duplicate: opentake_engine::DuplicateTrack,
     devices: Option<DeviceList>,
     /// MIDI inputs as last scanned (or why they couldn't be), the choice last saved in the
     /// settings, and the note count last seen with when it changed (the activity light).
@@ -318,6 +322,8 @@ pub(crate) struct DawApp {
     /// Open "Export Audio" dialog, and the export running in the background.
     pub export_dialog: Option<export_view::ExportDialog>,
     export_task: Option<export_view::ExportTask>,
+    /// A save being written in the background (the plug-in state is collected first, here).
+    saving: Option<mpsc::Receiver<anyhow::Result<opentake_engine::Saved>>>,
     /// A region pitch/stretch render running in the background.
     flex_task: Option<flex_view::FlexTask>,
     /// Where settings are saved; `None` disables persistence (tests).
@@ -403,6 +409,7 @@ impl DawApp {
             open_plugins: Vec::new(),
             editors: Vec::new(),
             track_drag: None,
+            duplicate: opentake_engine::DuplicateTrack::default(),
             devices: None,
             midi_ports: None,
             midi_saved: MidiSelection::All,
@@ -418,6 +425,7 @@ impl DawApp {
             midi_import: None,
             export_dialog: None,
             export_task: None,
+            saving: None,
             flex_task: None,
             settings_path: None,
             recent: Vec::new(),
@@ -489,6 +497,48 @@ impl DawApp {
         }
         if let Some((t, _)) = &mut self.piano.region {
             *t = map(*t);
+        }
+    }
+
+    /// Report a background save once it's written (with `wait`, wait for it).
+    fn finish_save(&mut self, e: &mut Engine, wait: bool) {
+        let Some(rx) = &self.saving else { return };
+        let result = if wait {
+            rx.recv().ok()
+        } else {
+            match rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        self.saving = None;
+        let saved = match result {
+            Some(Ok(saved)) => saved,
+            Some(Err(err)) => return self.error(format!("Save failed: {err:#}")),
+            None => return self.error("Save failed"),
+        };
+        e.saved_as(&saved);
+        let p = e.project();
+        let rpp = saved.path.extension().is_some_and(|x| x.eq_ignore_ascii_case("rpp"));
+        let has_params = p.tracks.iter().flat_map(|t| t.instrument.iter().chain(&t.plugins)).any(|s| !s.params.is_empty());
+        let has_midi = p.tracks.iter().any(|t| !t.midi_clips.is_empty());
+        if rpp && (has_params || has_midi) {
+            self.error(format!(
+                "Saved {} — note: .rpp files don't store {}; save as .json to keep everything",
+                saved.path.display(),
+                if has_midi { "MIDI regions or plug-in parameter values" } else { "plug-in parameter values" }
+            ));
+        } else {
+            self.info(format!("Saved {}", saved.path.display()));
+        }
+    }
+
+    fn poll_save(&mut self) {
+        if self.saving.is_some() {
+            let engine = self.engine.clone();
+            let mut e = engine.lock().unwrap_or_else(|p| p.into_inner());
+            self.finish_save(&mut e, false);
         }
     }
 
@@ -727,20 +777,15 @@ impl DawApp {
                 }
             }
             Action::SaveProject(path) => {
-                let saved = e.save_project(path.as_deref())?;
-                let p = e.project();
-                let rpp = saved.extension().is_some_and(|x| x.eq_ignore_ascii_case("rpp"));
-                let has_params = p.tracks.iter().flat_map(|t| t.instrument.iter().chain(&t.plugins)).any(|s| !s.params.is_empty());
-                let has_midi = p.tracks.iter().any(|t| !t.midi_clips.is_empty());
-                if rpp && (has_params || has_midi) {
-                    self.error(format!(
-                        "Saved {} — note: .rpp files don't store {}; save as .json to keep everything",
-                        saved.display(),
-                        if has_midi { "MIDI regions or plug-in parameter values" } else { "plug-in parameter values" }
-                    ));
-                } else {
-                    self.info(format!("Saved {}", saved.display()));
-                }
+                // One at a time, in order.
+                self.finish_save(e, true);
+                let job = e.prepare_save(path.as_deref())?;
+                let (tx, rx) = mpsc::channel();
+                let writer = std::thread::Builder::new().name("save".into()).spawn(move || {
+                    let _ = tx.send(job.write());
+                })?;
+                crate::shutdown::wait_for(writer);
+                self.saving = Some(rx);
             }
             Action::Undo => match e.undo()? {
                 Some(label) => {
@@ -789,6 +834,15 @@ impl DawApp {
             Action::RemoveTrack(t) => {
                 e.remove_track(t)?;
                 self.reset_selection(None);
+            }
+            Action::DuplicateTrack(t, what) => {
+                let d = e.duplicate_track(t, what)?;
+                // The copy lands below the original: later tracks shift down one.
+                self.track_moved(e.project().tracks.len() - 1, d.track);
+                self.selected_track = Some(d.track);
+                if !d.warnings.is_empty() {
+                    self.error(d.warnings.join("; "));
+                }
             }
             Action::UpdateTrack(t, u) => {
                 e.update_track(t, u)?;
@@ -2920,6 +2974,7 @@ impl eframe::App for DawApp {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
         self.poll_flex(ui.ctx());
+        self.poll_save();
         self.apply_actions();
         // Keep meters, playhead and agent-made changes live.
         ui.request_repaint_after(Duration::from_millis(33));
@@ -3015,6 +3070,76 @@ mod tests {
         harness.get_by_label(label).click();
         harness.step();
         harness.step();
+    }
+
+    #[test]
+    fn saving_writes_in_the_background_and_reports_it() {
+        let (mut harness, engine) = harness_with_track();
+        let dir = std::env::temp_dir().join(format!("opentake-gui-save-{}", std::process::id()));
+        let path = dir.join("song.otp");
+        harness.state_mut().act(Action::SaveProject(Some(path.clone())));
+        for _ in 0..50 {
+            harness.step();
+            if harness.state().saving.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(harness.state().saving.is_none(), "the save finished");
+        assert!(path.exists());
+        assert_eq!(engine.lock().unwrap().project_path(), Some(path.as_path()));
+        let msg = harness.state().message.as_ref().map(|m| m.0.clone()).unwrap_or_default();
+        assert!(msg.starts_with("Saved "), "{msg}");
+        // A second save right after the first waits for it, then writes again.
+        harness.state_mut().act(Action::SaveProject(None));
+        harness.state_mut().act(Action::SaveProject(None));
+        harness.step();
+        crate::shutdown::finish_writing();
+        harness.step();
+        assert!(harness.state().saving.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn duplicate_track_from_the_context_menu() {
+        let (mut harness, engine) = harness_with_track();
+        {
+            let mut e = engine.lock().unwrap();
+            e.insert_plugin(0, "comp", None).unwrap();
+            e.add_track("Bass").unwrap();
+        }
+        harness.step();
+        let open_menu = |harness: &mut Harness<'static, DawApp>| {
+            let at = harness.get_by_label("Guitar").rect().center();
+            harness.hover_at(at);
+            harness.step();
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE });
+            }
+            harness.step();
+            harness.step();
+            let sub = harness.get_by_label("Duplicate Track").rect().center();
+            harness.hover_at(sub);
+            harness.step();
+            harness.step();
+        };
+        open_menu(&mut harness);
+        // Unticking a box keeps the menu open.
+        click(&mut harness, "Volume, Pan, Mute & Routing");
+        assert!(!harness.state().duplicate.mixer);
+        assert!(harness.query_by_label("Duplicate").is_some(), "the menu stays open while choosing");
+        click(&mut harness, "Duplicate");
+        {
+            let e = engine.lock().unwrap();
+            let names: Vec<_> = e.project().tracks.iter().map(|t| t.name.clone()).collect();
+            assert_eq!(names, ["Guitar", "Guitar copy", "Bass"]);
+            assert_eq!(e.project().tracks[1].plugins.len(), 1, "plug-ins come along");
+        }
+        assert_eq!(harness.state().selected_track, Some(1));
+        assert!(harness.query_by_label("Duplicate").is_none(), "closed after duplicating");
+        // The choice is remembered.
+        open_menu(&mut harness);
+        assert!(!harness.state().duplicate.mixer);
     }
 
     #[test]

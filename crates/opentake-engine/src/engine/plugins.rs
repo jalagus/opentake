@@ -6,7 +6,7 @@
 //!
 //! A hosted plug-in's state beyond its parameters (a VST3's component and controller
 //! chunks, an AU's ClassInfo) lives in the instance while the project is open: it's written
-//! into the slots when saving ([`Engine::project_with_plugin_state`]) and given to each new
+//! into the slots when saving ([`Engine::prepare_save`]) and given to each new
 //! instance made from a slot (loading, offline rendering). A slot's saved parameter values
 //! are applied on top of a restored state: they're the values set here (automation's base
 //! line), which a state saved during automation playback needn't hold.
@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use opentake_project::{Controller, PluginFormat, PluginSlot, Project, VstPreset};
+use opentake_project::{Controller, PluginFormat, PluginSlot, VstPreset};
 use opentake_vst3::{ClassInfo, Module, NoteEvent, PluginState, ScannedPlugin, Vst3Plugin, Vst3Processor};
 
 use super::{Engine, ParamView, display_name};
@@ -389,21 +389,6 @@ impl Engine {
             Loaded::Au(plugin) => Some(super::au::capture_state(plugin)),
             _ => None,
         }
-    }
-
-    /// The project with every loaded plug-in's current state written into its slot. A state
-    /// that can't be had keeps what the slot had (with a warning in the log).
-    pub(super) fn project_with_plugin_state(&self) -> Project {
-        let mut project = self.project.clone();
-        let slots = project.tracks.iter_mut().flat_map(|t| t.instrument.iter_mut().chain(t.plugins.iter_mut())).chain(project.master_plugins.iter_mut());
-        for slot in slots {
-            match self.capture_state(slot) {
-                Some(Ok(state)) => slot.state = state,
-                Some(Err(e)) => tracing::warn!("'{}': state not saved: {e:#}", slot.name),
-                None => {}
-            }
-        }
-        project
     }
 
     /// Save a VST3 slot's current state as a `.vstpreset` file (what VST3 hosts load as a
@@ -977,6 +962,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentake_project::Project;
 
     #[test]
     fn controllers_map_to_vst3_controller_numbers() {
